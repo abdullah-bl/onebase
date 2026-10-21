@@ -21,8 +21,8 @@ In your own project:
 
 ```
 my-app/
-  convex/schema.ts
-  convex/messages.ts
+  onebase/schema.ts
+  onebase/messages.ts
   public/index.html     optional frontend, served at /
 ```
 
@@ -32,7 +32,7 @@ onebase doctor       # check for mistakes
 onebase serve        # production
 ```
 
-See [docs/writing-functions.md](docs/writing-functions.md) for the full API. It is also the guide to give an LLM.
+**Website and docs:** https://abdullah-bl.github.io/onebase/ (source in [docs/](docs/)). The [LLM guide](docs/llm-guide.md) is a one-page summary of the API to give an AI assistant.
 
 ## Deploying as a single file
 
@@ -45,7 +45,7 @@ bun run build:binary                 # → dist/onebase
 ```
 server/
   onebase                          # the binary
-  convex/                            # your .ts functions, loaded at startup
+  onebase/                           # your .ts functions, loaded at startup
   public/                            # optional frontend
   onebase_data/db.sqlite                # created automatically
 ```
@@ -96,7 +96,7 @@ S3 credentials come from `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` / `S3_ENDPO
 | `POST /api/storage/upload?token=…` / `GET /api/storage/<id>` | file upload (via `generateUploadUrl`) and download |
 | your `http.ts` routes | webhooks etc. |
 
-Send `Authorization: Bearer <token>` for auth. Tokens are checked by the providers in `convex/auth.config.ts`.
+Send `Authorization: Bearer <token>` for auth. Tokens are checked by the providers in `onebase/auth.config.ts`.
 
 ## How it works
 
@@ -117,4 +117,5 @@ TEST_POSTGRES_URL=postgres://… TEST_LIBSQL_URL=http://127.0.0.1:8080 \
 TEST_S3_URL="s3://bucket/prefix?endpoint=http://127.0.0.1:9000" S3_ACCESS_KEY_ID=… S3_SECRET_ACCESS_KEY=… bun test
 bun run typecheck      # includes type-level tests in tests/types.ts
 bun run build:client   # rebuild the embedded browser client after editing src/client
+bun run site           # build the website into site/dist
 ```

@@ -1,4 +1,4 @@
-// Loads a functions directory (default ./convex) from disk.
+// Loads a functions directory (default ./onebase) from disk.
 
 import { plugin } from "bun";
 import { existsSync } from "node:fs";
@@ -80,7 +80,7 @@ export async function loadProject(dirInput: string, onError?: (err: ProjectLoadE
   registerVirtualModules();
   const dir = resolve(dirInput);
   if (!existsSync(dir)) {
-    throw new Error(`Functions directory not found: ${dir}\nCreate it (e.g. mkdir convex) or pass --dir <path>.`);
+    throw new Error(`Functions directory not found: ${dir}\nCreate it (e.g. mkdir onebase) or pass --dir <path>.`);
   }
   const project: Project = { dir, schema: null, modules: {}, http: null, crons: null, authenticate: null, sources: {} };
   for (const file of await listSourceFiles(dir)) {

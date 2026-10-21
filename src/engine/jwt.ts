@@ -72,7 +72,7 @@ export class JwtVerifier {
       if (p.type === "customJwt") {
         if (!p.issuer || !p.jwks) throw new Error(`auth.config.ts: customJwt providers need "issuer" and "jwks" URLs.`);
       } else if (!p.domain) {
-        throw new Error(`auth.config.ts: providers need a "domain" (the token issuer URL), e.g. { domain: "https://your-app.clerk.accounts.dev", applicationID: "convex" }.`);
+        throw new Error(`auth.config.ts: providers need a "domain" (the token issuer URL), e.g. { domain: "https://your-app.clerk.accounts.dev", applicationID: "onebase" }.`);
       }
     }
   }

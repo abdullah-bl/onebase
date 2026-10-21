@@ -10,6 +10,7 @@ import { codegen } from "./codegen";
 import { doctor, printFindings } from "./doctor";
 import { SqliteDriver } from "./engine/driver";
 import { LocalBlobs } from "./engine/files";
+import { parseRateLimit } from "./engine/http";
 import { createAuthenticate, type AuthConfig } from "./engine/jwt";
 import type { Modules } from "./engine/runtime";
 import { listSourceFiles, loadProject, modulePathFor } from "./project";
@@ -39,7 +40,7 @@ Usage:
   onebase restore  Restore the newest snapshot (or --at <time>) into --data
 
 Options:
-  --dir <path>      Functions directory (default: ./convex)
+  --dir <path>      Functions directory (default: ./onebase; a ported ./convex folder also works)
   --data <path>     Data directory (default: ./onebase_data)
   --public <path>   Static frontend directory (default: ./public if it exists)
   --port <n>        Port (default: 8090, or $PORT)
@@ -51,6 +52,9 @@ Options:
   --backup <s3url>  Back up SQLite to s3://bucket/prefix ($ONEBASE_BACKUP)
   --backup-every <d>  Backup interval, e.g. 15m, 1h, 1d (default: 1h)
   --backup-keep <n>   Snapshots to keep (default: 24)
+  --cors <origins>  Browser origins allowed to call the API, comma-separated (default: any; $ONEBASE_CORS)
+  --rate-limit <r>  Per-IP limit on function calls, e.g. 100/10s or 600/m (default: off; $ONEBASE_RATE_LIMIT)
+  --trust-proxy     Take the client IP from X-Forwarded-For (when behind a reverse proxy)
   --at <time>       restore: snapshot to use, e.g. 20261022T0300 (default: newest)
   --force           restore: overwrite an existing database
   --out <file>      Output file for build (default: ./app)
@@ -66,7 +70,7 @@ function options(argv: string[]) {
     args: argv,
     allowPositionals: true,
     options: {
-      dir: { type: "string", default: "./convex" },
+      dir: { type: "string" },
       data: { type: "string", default: "./onebase_data" },
       public: { type: "string" },
       port: { type: "string", default: process.env.PORT ?? "8090" },
@@ -77,6 +81,9 @@ function options(argv: string[]) {
       backup: { type: "string", default: process.env.ONEBASE_BACKUP },
       "backup-every": { type: "string", default: "1h" },
       "backup-keep": { type: "string", default: "24" },
+      cors: { type: "string", default: process.env.ONEBASE_CORS },
+      "rate-limit": { type: "string", default: process.env.ONEBASE_RATE_LIMIT },
+      "trust-proxy": { type: "boolean", default: false },
       at: { type: "string" },
       force: { type: "boolean", default: false },
       out: { type: "string", default: "./app" },
@@ -87,7 +94,9 @@ function options(argv: string[]) {
   });
   const port = Number(values.port);
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error(`--port must be a number, got "${values.port}"`);
-  return { ...values, port, command: positionals[0] };
+  // Default to ./onebase, but pick up ./convex in a project ported from Convex.
+  const dir = values.dir ?? (!existsSync("./onebase") && existsSync("./convex") ? "./convex" : "./onebase");
+  return { ...values, dir, port, command: positionals[0] };
 }
 
 function duration(text: string): number {
@@ -96,14 +105,17 @@ function duration(text: string): number {
   return Number(m[1]) * { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 }[m[2] as "s" | "m" | "h" | "d"];
 }
 
-/** Database, file storage and backup settings shared by `serve` and embedded binaries. */
-function storageOptions(opts: ReturnType<typeof options>) {
+/** Database, storage, backup and HTTP settings shared by `serve` and embedded binaries. */
+function serverOptions(opts: ReturnType<typeof options>) {
   const keep = Number(opts["backup-keep"]);
   if (!Number.isInteger(keep) || keep < 1) throw new Error(`--backup-keep must be a positive integer.`);
   return {
     db: opts.db,
     files: opts.files,
     backup: opts.backup ? { url: opts.backup, everyMs: duration(opts["backup-every"]), keep } : undefined,
+    cors: opts.cors ? opts.cors.split(",").map((o) => o.trim()).filter(Boolean) : undefined,
+    rateLimit: opts["rate-limit"] ? parseRateLimit(opts["rate-limit"]) : null,
+    trustProxy: opts["trust-proxy"],
   };
 }
 
@@ -154,7 +166,7 @@ async function serveCommand(opts: ReturnType<typeof options>) {
     authenticate: project.authenticate,
     crons: project.crons,
     dataDir: opts.data,
-    ...storageOptions(opts),
+    ...serverOptions(opts),
     port: opts.port,
     hostname: opts.host,
     siteUrl: opts.url,
@@ -270,7 +282,7 @@ export async function runEmbedded(project: EmbeddedProject, argv = process.argv.
     authenticate: project.authConfig ? createAuthenticate(project.authConfig) : null,
     crons: project.crons,
     dataDir: opts.data,
-    ...storageOptions(opts),
+    ...serverOptions(opts),
     port: opts.port,
     hostname: opts.host,
     siteUrl: opts.url,

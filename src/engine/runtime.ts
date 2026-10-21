@@ -4,12 +4,13 @@ import { join } from "node:path";
 import { getFunctionName, type FunctionLike, type FunctionType } from "../api";
 import type { SchemaDefinition } from "../schema";
 import { isRegisteredFunction, type CronJob, type HttpRouter, type RegisteredFunction, type UserIdentity } from "../server";
-import { ConvexError, describeValue, isPlainObject, validate } from "../values";
+import { ConvexError, describeValue, isPlainObject, validate, type AnyValidator } from "../values";
 import { CronRunner } from "./crons";
 import { applySchema, DatabaseImpl, OnebaseError, readerView, writerView, type ReadSet, type Write } from "./database";
 import { newId } from "./dialect";
 import { savepoint, SerialQueue, type Driver, type Exec } from "./driver";
 import { FileStore, LocalBlobs, type BlobBackend } from "./files";
+import { currentFunction, installGuards } from "./guard";
 
 export type Modules = Record<string, Record<string, unknown>>;
 export type Authenticate = (token: string) => Promise<UserIdentity | null> | UserIdentity | null;
@@ -84,6 +85,7 @@ export class Runtime {
   private stopped = false;
 
   constructor(opts: RuntimeOptions) {
+    installGuards();
     this.driver = opts.driver;
     this.schema = opts.schema;
     this.http = opts.http ?? null;
@@ -100,16 +102,71 @@ export class Runtime {
     }
   }
 
-  /** Creates system tables and schema indexes, and starts listening to other instances. */
+  /** Creates system tables and schema indexes, checks existing data, and starts listening to other instances. */
   async init(): Promise<{ created: string[]; dropped: string[] }> {
     await this.driver.init();
     const result = await this.driver.write((tx) => applySchema(tx, this.driver.dialect, this.schema));
+    await this.checkExistingDocuments();
     const row = await this.driver.read((tx) => tx.get("SELECT MAX(ct) AS ct FROM documents"));
     this.lastCreationTime = Math.max(this.lastCreationTime, Number(row?.ct ?? 0));
     if (this.driver.shared && this.driver.subscribe) {
       await this.driver.subscribe((message) => void this.onRemoteCommit(message));
     }
     return result;
+  }
+
+  /**
+   * When schema.ts changes, every stored document is checked against it, like a Convex deploy.
+   * The schema's fingerprint is saved once the data matches, so unchanged schemas cost nothing.
+   */
+  private async checkExistingDocuments() {
+    const schema = this.schema;
+    if (!schema?.schemaValidation) {
+      // Writes aren't validated now, so check everything again once validation is turned back on.
+      if (schema) await this.driver.write((tx) => tx.run("DELETE FROM _meta WHERE key = 'schema'"));
+      return;
+    }
+    const tables = Object.entries(schema.tables) as [string, { validator: AnyValidator }][];
+    const fingerprint = new Bun.CryptoHasher("sha256").update(JSON.stringify(tables.map(([t, d]) => [t, d.validator]))).digest("hex");
+    const stored = await this.driver.read((tx) => tx.get("SELECT value FROM _meta WHERE key = 'schema'"));
+    if (stored?.value === fingerprint) return;
+
+    const d = this.driver.dialect;
+    const examples: string[] = [];
+    let invalid = 0;
+    for (const [table, def] of tables) {
+      let after: [number, string] = [-1, ""];
+      for (;;) {
+        const rows = await this.driver.read((tx) =>
+          tx.all(`SELECT id, ct, doc FROM documents WHERE tbl = ? AND (ct, id) > (${d.placeholder("ct")}, ${d.placeholder("id")}) ORDER BY ct, id LIMIT 500`, [
+            table,
+            ...after,
+          ]),
+        );
+        for (const row of rows) {
+          const errors = validate(def.validator, d.parseDoc(row.doc), "document");
+          if (!errors.length) continue;
+          invalid++;
+          if (examples.length < 5) examples.push(`${table} ${row.id}: ${errors.slice(0, 3).join("; ")}`);
+        }
+        if (rows.length < 500) break;
+        after = [Number(rows[rows.length - 1]!.ct), rows[rows.length - 1]!.id];
+      }
+    }
+    if (invalid) {
+      throw new OnebaseError(
+        `schema.ts doesn't match ${invalid} existing document${invalid === 1 ? "" : "s"}:\n  - ${examples.join("\n  - ")}` +
+          (invalid > examples.length ? `\n  - … and ${invalid - examples.length} more` : "") +
+          `\nMake the schema accept the data (v.optional(...), v.union(...)), or fix the data: start with ` +
+          `defineSchema({ ... }, { schemaValidation: false }), update the documents in a mutation (or the dashboard), then turn validation back on.`,
+      );
+    }
+    const known = new Set(tables.map(([t]) => t));
+    const orphans = (await this.driver.read((tx) => tx.all("SELECT DISTINCT tbl FROM documents"))).map((r) => r.tbl as string).filter((t) => !known.has(t));
+    for (const t of orphans) this.log.warn(`Table "${t}" has documents but isn't in schema.ts, so functions can't read them. Add it back to keep using them.`);
+    await this.driver.write((tx) =>
+      tx.run("INSERT INTO _meta (key, value) VALUES ('schema', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [fingerprint]),
+    );
   }
 
   /** Strictly increasing creation times keep ordering and cursors unambiguous. */
@@ -365,8 +422,14 @@ export class Runtime {
 
   private async invoke(name: string, fn: RegisteredFunction, ctx: unknown, args: unknown) {
     const checked = this.checkArgs(name, fn, args);
-    const result = await fn.handler(ctx, checked);
+    const result = await currentFunction.run({ type: fn.type, name }, () => fn.handler(ctx, checked));
     return this.checkReturn(name, fn, result);
+  }
+
+  /** Runs an http.ts route handler. */
+  async runHttpAction(handler: (ctx: any, request: Request) => Promise<Response> | Response, request: Request, identity: UserIdentity | null) {
+    const name = `${request.method} ${new URL(request.url).pathname}`;
+    return currentFunction.run({ type: "action", name }, () => handler(this.actionCtx(identity), request));
   }
 
   // ---- Entry points ----

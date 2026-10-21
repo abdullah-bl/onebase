@@ -20,6 +20,11 @@ export interface Dialect {
   /** Decodes a selected document field / key value. */
   decode(value: unknown, kind: ValueKind): unknown;
   isNull(expr: string, kind: ValueKind): string;
+  /**
+   * Orders two values the way the database orders them in an index, or returns null when
+   * that can't be decided in JS (callers then assume the worst).
+   */
+  compare(a: unknown, b: unknown, kind: ValueKind): number | null;
   boolLiteral(b: boolean): string;
   parseDoc(raw: unknown): Record<string, unknown>;
   docPlaceholder: string;
@@ -48,6 +53,59 @@ function sqliteEncode(value: unknown): unknown {
   return value;
 }
 
+const sign = (n: number) => (n < 0 ? -1 : n > 0 ? 1 : 0);
+
+/** Compares by Unicode code point, which matches SQLite's binary collation on UTF-8 text. */
+function compareCodePoints(a: string, b: string): number {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    const ca = a.codePointAt(i)!;
+    const cb = b.codePointAt(i)!;
+    if (ca !== cb) return ca < cb ? -1 : 1;
+    if (ca > 0xffff) i++;
+  }
+  return sign(a.length - b.length);
+}
+
+function compareSystem(a: unknown, b: unknown, kind: ValueKind): number | null | undefined {
+  if (kind === "ct") return typeof a === "number" && typeof b === "number" ? sign(a - b) : null;
+  if (kind === "id") return typeof a === "string" && typeof b === "string" ? compareCodePoints(a, b) : null;
+  return undefined;
+}
+
+/** SQLite orders NULL < numbers (booleans are 0/1) < text. Objects and arrays are left undecided. */
+function sqliteCompare(a: unknown, b: unknown, kind: ValueKind): number | null {
+  const sys = compareSystem(a, b, kind);
+  if (sys !== undefined) return sys;
+  const norm = (v: unknown) => (v === undefined ? null : typeof v === "boolean" ? Number(v) : v);
+  const rank = (v: unknown) => (v === null ? 0 : typeof v === "number" ? 1 : typeof v === "string" ? 2 : null);
+  const x = norm(a);
+  const y = norm(b);
+  const rx = rank(x);
+  const ry = rank(y);
+  if (rx === null || ry === null) return null;
+  if (rx !== ry) return sign(rx - ry);
+  if (rx === 1) return sign((x as number) - (y as number));
+  if (rx === 2) return compareCodePoints(x as string, y as string);
+  return 0;
+}
+
+/**
+ * jsonb orders string < number < boolean. Strings follow the database collation, so only
+ * equal strings are decided; nulls (JSON null vs a missing field) are left undecided too.
+ */
+function postgresCompare(a: unknown, b: unknown, kind: ValueKind): number | null {
+  const sys = compareSystem(a, b, kind);
+  if (sys !== undefined) return sys;
+  const rank = (v: unknown) => (typeof v === "string" ? 1 : typeof v === "number" ? 2 : typeof v === "boolean" ? 3 : null);
+  const rx = rank(a);
+  const ry = rank(b);
+  if (rx === null || ry === null) return null;
+  if (rx !== ry) return sign(rx - ry);
+  if (rx === 1) return a === b ? 0 : null;
+  return sign(Number(a) - Number(b));
+}
+
 export const sqliteDialect: Dialect = {
   name: "sqlite",
   field: (path) => SYSTEM[path] ?? `json_extract(doc, '$.${checkPath(path)}')`,
@@ -56,6 +114,7 @@ export const sqliteDialect: Dialect = {
   encode: (value) => sqliteEncode(value),
   decode: (value) => value,
   isNull: (expr) => `${expr} IS NULL`,
+  compare: sqliteCompare,
   boolLiteral: (b) => (b ? "1" : "0"),
   parseDoc: (raw) => JSON.parse(raw as string),
   docPlaceholder: "?",
@@ -68,6 +127,7 @@ export const sqliteDialect: Dialect = {
     "CREATE TABLE IF NOT EXISTS _crons (name TEXT PRIMARY KEY, spec TEXT NOT NULL, next_run REAL NOT NULL, last_run REAL, last_error TEXT)",
     "CREATE TABLE IF NOT EXISTS _storage (id TEXT PRIMARY KEY, ct REAL NOT NULL, sha256 TEXT NOT NULL, size INTEGER NOT NULL, content_type TEXT)",
     "CREATE TABLE IF NOT EXISTS _upload_tokens (token TEXT PRIMARY KEY, expires REAL NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
   ],
   createIndex: (name, table, columns) =>
     `CREATE INDEX "${name}" ON documents(${columns.join(", ")}) WHERE tbl = ${tableLiteral(table)}`,
@@ -89,6 +149,7 @@ export const postgresDialect: Dialect = {
   decode: (value) => value,
   // A JSON null is a jsonb value, not SQL NULL; treat both (and a missing field) as null.
   isNull: (expr, kind) => (kind === "json" ? `(${expr} IS NULL OR ${expr} = 'null'::jsonb)` : `${expr} IS NULL`),
+  compare: postgresCompare,
   boolLiteral: (b) => (b ? "TRUE" : "FALSE"),
   parseDoc: (raw) => (typeof raw === "string" ? JSON.parse(raw) : (raw as Record<string, unknown>)),
   docPlaceholder: "?::text::jsonb",
@@ -101,6 +162,7 @@ export const postgresDialect: Dialect = {
     "CREATE TABLE IF NOT EXISTS _crons (name TEXT PRIMARY KEY, spec TEXT NOT NULL, next_run DOUBLE PRECISION NOT NULL, last_run DOUBLE PRECISION, last_error TEXT)",
     "CREATE TABLE IF NOT EXISTS _storage (id TEXT PRIMARY KEY, ct DOUBLE PRECISION NOT NULL, sha256 TEXT NOT NULL, size BIGINT NOT NULL, content_type TEXT)",
     "CREATE TABLE IF NOT EXISTS _upload_tokens (token TEXT PRIMARY KEY, expires DOUBLE PRECISION NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
   ],
   createIndex: (name, table, columns) =>
     `CREATE INDEX "${name}" ON documents(${columns.join(", ")}) WHERE tbl = ${tableLiteral(table)}`,

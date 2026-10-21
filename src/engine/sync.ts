@@ -104,7 +104,8 @@ export class SubscriptionManager {
     if (rs.ranges.length === 0 && rs.ids.size === 0) return true;
     // Only table names are known (a large commit from another instance): re-run anything that read them.
     if (event.tables) return rs.ids.size > 0 || rs.ranges.some((r) => event.tables.includes(r.table));
-    return event.writes.some((w) => rs.ids.has(w.id) || rs.ranges.some((r) => writeAffects(r, w)));
+    const dialect = this.runtime.driver.dialect;
+    return event.writes.some((w) => rs.ids.has(w.id) || rs.ranges.some((r) => writeAffects(r, w, dialect)));
   }
 
   /** Re-runs affected queries; resolves once their new results have been delivered. */

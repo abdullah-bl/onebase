@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: onebase
+          POSTGRES_DB: onebase
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 20
+      libsql:
+        image: ghcr.io/tursodatabase/libsql-server:latest
+        ports: ["8080:8080"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun test
+        env:
+          TEST_POSTGRES_URL: postgres://postgres:onebase@127.0.0.1:5432/onebase
+          TEST_LIBSQL_URL: http://127.0.0.1:8080
+      - name: Doctor on the example
+        run: cd example && bun ../src/cli.ts doctor
+      - name: Site builds
+        run: bun site/build.ts

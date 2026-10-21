@@ -20,13 +20,15 @@
     "typecheck": "tsc --noEmit",
     "build:client": "bun scripts/build-client.ts",
     "build:binary": "bun scripts/build-client.ts && bun build --compile --minify src/cli.ts --outfile dist/onebase",
-    "example": "cd example && bun ../src/cli.ts dev"
+    "example": "cd example && bun ../src/cli.ts dev",
+    "site": "bun site/build.ts"
   },
   "private": true,
   "devDependencies": {
     "@types/bun": "latest",
     "@types/react": "19",
-    "react": "19"
+    "react": "19",
+    "shiki": "^4.5.0"
   },
   "peerDependencies": {
     "typescript": "^7",
@@ -38,7 +40,6 @@
     }
   },
   "dependencies": {
-    "@libsql/client": "^0.18.0",
-    "convex": "^1.47.0"
+    "@libsql/client": "^0.18.0"
   }
 }

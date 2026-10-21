@@ -2,9 +2,9 @@
 
 import { OnebaseClient } from "../src/client/index";
 import { useQuery } from "../src/client/react";
-import { api } from "../example/convex/_generated/api";
-import type { Doc, Id } from "../example/convex/_generated/dataModel";
-import { query } from "../example/convex/_generated/server";
+import { api } from "../example/onebase/_generated/api";
+import type { Doc, Id } from "../example/onebase/_generated/dataModel";
+import { query } from "../example/onebase/_generated/server";
 import { v } from "../src/values";
 
 declare const client: OnebaseClient;

@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+<!--HEAD-->
+</head>
+<body>
+<!--HEADER-->
+
+<main>
+  <section class="hero">
+    <div class="wrap hero-inner">
+      <span class="eyebrow">v<!--VERSION--> · self-hosted · Convex-style API</span>
+      <h1>The reactive backend<br>in <em>one file</em>.</h1>
+      <p class="lede">TypeScript functions, a typed document database and live queries, running as a single binary on SQLite, Postgres or Turso. Copy it to a server and run it.</p>
+      <div class="hero-ctas">
+        <a class="btn primary" href="docs/getting-started.html">Get started <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8h10M9 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
+        <a class="btn" href="<!--REPO-->" target="_blank" rel="noopener"><svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
+      </div>
+      <div class="install"><span class="prompt">$</span><code>bun add github:abdullah-bl/onebase</code><button type="button" data-copy="bun add github:abdullah-bl/onebase">Copy</button></div>
+
+      <div class="terminal" aria-label="Example server output">
+        <div class="terminal-bar"><i></i><i></i><i></i><span>~/my-app</span></div>
+<pre><span class="t-acc">$</span> <span class="t-cmd">./onebase serve --backup s3://my-bucket/backups</span>
+<span class="t-b">onebase</span> v<!--VERSION-->
+  <span class="t-dim">functions</span>  9 (channels:list, messages:list, messages:send, …)
+  <span class="t-dim">crons</span>      prune old messages
+  <span class="t-dim">database</span>   onebase_data/db.sqlite
+  <span class="t-dim">files</span>      onebase_data/files
+  <span class="t-dim">backups</span>    s3://my-bucket/backups every 60 min, keep 24
+  <span class="t-dim">http</span>       <span class="t-acc">http://localhost:8090</span>
+  <span class="t-dim">sync</span>       ws://localhost:8090/api/sync</pre>
+      </div>
+    </div>
+  </section>
+
+  <div class="wrap">
+    <div class="stats">
+      <div class="stat"><b>~33 MB</b><span>memory at startup</span></div>
+      <div class="stat"><b>8.6 ms</b><span>per mutation, pushed to 100 live clients</span></div>
+      <div class="stat"><b>1 file</b><span>to deploy: the binary, optionally with your app inside</span></div>
+      <div class="stat"><b>5 KB</b><span>browser client, served by the server</span></div>
+    </div>
+    <p class="stats-note">Measured on Linux arm64, Bun 1.4.2, SQLite, with the example chat app.</p>
+  </div>
+
+  <section class="section">
+    <div class="wrap">
+      <div class="section-head">
+        <span class="eyebrow">Live queries</span>
+        <h2>Every client stays up to date. You don't write any sync code.</h2>
+        <p>Clients subscribe to queries. When a mutation commits, onebase re-runs only the queries whose data changed and pushes the new results over WebSocket. Try it:</p>
+      </div>
+      <div class="demo" data-demo>
+        <div class="demo-window">
+          <div class="demo-head"><b>Alice</b><span>connected</span></div>
+          <ul class="demo-list" data-list></ul>
+          <form class="demo-form" data-form data-author="Alice"><input placeholder="Message as Alice…" maxlength="60" aria-label="Message as Alice"><button>Send</button></form>
+        </div>
+        <div class="demo-window">
+          <div class="demo-head"><b>Bob</b><span>connected</span></div>
+          <ul class="demo-list" data-list></ul>
+          <form class="demo-form" data-form data-author="Bob"><input placeholder="Message as Bob…" maxlength="60" aria-label="Message as Bob"><button>Send</button></form>
+        </div>
+        <p class="demo-log" data-log aria-live="polite">Simulated in your browser. Waiting for a mutation…</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <div class="section-head">
+        <span class="eyebrow">Write the backend in TypeScript</span>
+        <h2>A schema, some functions, and a hook. That's the whole backend.</h2>
+        <p>The API follows Convex: <code>query</code>, <code>mutation</code>, <code>action</code>, <code>v.*</code> validators, <code>ctx.db</code>. Everything is typed, from the schema to the React component.</p>
+      </div>
+      <div class="showcase">
+        <div class="code-card">
+          <header><span>onebase/messages.ts</span><span>server</span></header>
+<pre data-lang="ts">
+import { v } from "onebase/values";
+import { mutation, query } from "./_generated/server";
+
+export const list = query({
+  args: { channel: v.id("channels") },
+  handler: (ctx, { channel }) =>
+    ctx.db
+      .query("messages")
+      .withIndex("by_channel", (q) =&gt; q.eq("channel", channel))
+      .collect(),
+});
+
+export const send = mutation({
+  args: { channel: v.id("channels"), body: v.string() },
+  handler: async (ctx, args) =&gt; {
+    const user = await ctx.auth.getUserIdentity();
+    const author = user?.name ?? "anonymous";
+    return ctx.db.insert("messages", { ...args, author });
+  },
+});
+</pre>
+        </div>
+        <div class="code-card">
+          <header><span>app/Chat.tsx</span><span>client</span></header>
+<pre data-lang="tsx">
+import { useMutation, useQuery } from "onebase/react";
+import { api } from "../onebase/_generated/api";
+
+export function Chat({ channel }) {
+  // Re-renders whenever anyone sends a message.
+  const messages = useQuery(api.messages.list, { channel });
+  const send = useMutation(api.messages.send);
+
+  return (
+    &lt;&gt;
+      {messages?.map((m) =&gt; (
+        &lt;p key={m._id}&gt;&lt;b&gt;{m.author}&lt;/b&gt; {m.body}&lt;/p&gt;
+      ))}
+      &lt;button onClick={() =&gt; send({ channel, body: "hi" })}&gt;
+        Say hi
+      &lt;/button&gt;
+    &lt;/&gt;
+  );
+}
+</pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <div class="section-head">
+        <span class="eyebrow">Batteries included</span>
+        <h2>The parts every app ends up needing.</h2>
+      </div>
+      <div class="features">
+        <div class="feature">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2.5"/><path d="M7.8 7.8a6 6 0 0 0 0 8.4M16.2 7.8a6 6 0 0 1 0 8.4M5 5a10 10 0 0 0 0 14M19 5a10 10 0 0 1 0 14"/></svg>
+          <h3>Fine-grained live queries</h3>
+          <p>A new message in channel A never re-runs the query for channel B. Identical subscriptions share a single execution.</p>
+        </div>
+        <div class="feature">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+          <h3>Real transactions</h3>
+          <p>Mutations are atomic and serializable. Throw an error and none of the writes happen, even across several servers.</p>
+        </div>
+        <div class="feature">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/><path d="M4 7.5 12 12l8-4.5M12 12v9"/></svg>
+          <h3>Node and npm everywhere</h3>
+          <p>Every function runs in Bun. Import any package from a query, a mutation or an action. There's no <code>"use node"</code>.</p>
+        </div>
+        <div class="feature">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6 3 12l5 6M16 6l5 6-5 6M14 4l-4 16"/></svg>
+          <h3>Typed end to end</h3>
+          <p>The types flow from the schema to <code>ctx.db</code>, to <code>api.*</code>, to <code>useQuery</code>. Arguments are validated at runtime too.</p>
+        </div>
+        <div class="feature">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2.5M9 2h6"/></svg>
+          <h3>Scheduler and crons</h3>
+          <p><code>runAfter</code>, <code>runAt</code> and cron jobs survive restarts. Each run happens exactly once, even with several instances.</p>
+        </div>
+        <div class="feature">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3M12 4v12M7 9l5-5 5 5"/></svg>
+          <h3>File storage</h3>
+          <p>Uploads stream to disk or to S3, R2 or MinIO, so big files never sit in memory. Downloads come from presigned URLs.</p>
+        </div>
+        <div class="feature">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>
+          <h3>Auth that plugs in</h3>
+          <p>Clerk, Auth0, WorkOS or any OIDC issuer, in the same config format as Convex. Tokens are verified with WebCrypto.</p>
+        </div>
+        <div class="feature">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5.5" rx="8" ry="2.5"/><path d="M4 5.5v13c0 1.4 3.6 2.5 8 2.5s8-1.1 8-2.5v-13M4 12c0 1.4 3.6 2.5 8 2.5s8-1.1 8-2.5"/></svg>
+          <h3>SQLite, Postgres or Turso</h3>
+          <p>Start on SQLite. Switch with <code>--db</code> when you need more servers, and your functions don't change.</p>
+        </div>
+        <div class="feature">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v4h-4"/></svg>
+          <h3>Backups to S3</h3>
+          <p>Consistent SQLite snapshots, gzipped and uploaded on a schedule. <code>onebase restore</code> brings them back.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap split">
+      <div class="section-head" style="margin:0">
+        <span class="eyebrow">Hard to get wrong</span>
+        <h2>Made for code written by people and by LLMs.</h2>
+        <p>The API is the one models already know from Convex. It forgives the usual mistakes, and when something is wrong it says how to fix it.</p>
+        <ul>
+          <li><span><code>.filter({ done: false })</code> works, and it uses an index when one exists.</span></li>
+          <li><span>Every error names the problem and the fix: the wrong field, a missing index, an argument that doesn't match.</span></li>
+          <li><span><code>onebase doctor</code> checks a project in one command, and the docs come as <a href="llms-full.txt">llms-full.txt</a> to give your assistant.</span></li>
+        </ul>
+      </div>
+<pre class="error-card"><span class="d">$ onebase doctor</span>
+<span class="e">✗ error</span> posts.ts:2: Imports from the convex package
+         instead of onebase.
+         <span class="f">fix:</span> Use "./_generated/server" and "onebase/values".
+<span class="e">✗ error</span> posts.ts:4: .filter() on a query gets a filter
+         builder, not a document.
+         <span class="f">fix:</span> .filter(q =&gt; q.eq(q.field("x"), v)) or .filter({ x: v })
+<span class="e">✗ error</span> schema.ts › posts.index("by_athor"):
+         Field "athor" doesn't exist on "posts".
+         <span class="f">fix:</span> Known fields: title, author
+<span class="w">⚠ warn </span> Query on "posts" reads every document to apply
+         .filter(). Add .index("by_author", ["author"])
+         and it will be used automatically.</pre>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <div class="section-head">
+        <span class="eyebrow">Deploy</span>
+        <h2>From a $5 VPS to a fleet of servers.</h2>
+        <p>One binary. Pick the database that fits your setup today, and change it later without touching your functions.</p>
+      </div>
+      <div class="deploy">
+        <div class="deploy-card">
+          <span class="tag">one server</span>
+          <h3>SQLite + S3 backups</h3>
+          <p>The default. Reads take microseconds, there's no database to run, and hourly snapshots go to any S3-compatible storage.</p>
+          <pre>./onebase serve \
+  --backup s3://bucket/backups</pre>
+        </div>
+        <div class="deploy-card">
+          <span class="tag">many servers</span>
+          <h3>Postgres</h3>
+          <p>Run as many instances as you need behind a load balancer. Live queries are shared through LISTEN/NOTIFY, and mutations are serializable.</p>
+          <pre>./onebase serve \
+  --db postgres://…/app \
+  --files s3://bucket/files</pre>
+        </div>
+        <div class="deploy-card">
+          <span class="tag">managed SQLite</span>
+          <h3>Turso</h3>
+          <p>SQLite semantics without running a database yourself, and still as many instances as you like.</p>
+          <pre>TURSO_AUTH_TOKEN=… ./onebase serve \
+  --db libsql://my-db.turso.io</pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="wrap">
+      <div class="section-head">
+        <span class="eyebrow">Compared to Convex</span>
+        <h2>Same model. Different trade-offs.</h2>
+        <p>Convex is a polished managed platform. onebase is for when you want to own the whole stack.</p>
+      </div>
+      <div class="compare-wrap">
+        <table class="compare">
+          <thead><tr><th></th><th>Convex</th><th class="us">onebase</th></tr></thead>
+          <tbody>
+            <tr><th>Hosting</th><td>Managed cloud, or a self-hosted backend</td><td>One binary you run anywhere</td></tr>
+            <tr><th>Runtime</th><td>V8 isolates; Node only in actions</td><td>Bun in every function</td></tr>
+            <tr><th>Database</th><td>Convex's own</td><td>SQLite, Postgres or Turso</td></tr>
+            <tr><th>.filter()</th><td>Builder; scans the documents</td><td>Builder or object; uses indexes</td></tr>
+            <tr><th>Search, vector, dashboard</th><td>Included</td><td>Not yet</td></tr>
+            <tr><th>Porting</th><td>n/a</td><td>Change the imports; <code>onebase doctor</code> lists them</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <div class="wrap">
+    <section class="cta">
+      <h2>Start with one file.</h2>
+      <p>Clone the example chat app and have a live, typed backend running in a minute.</p>
+      <div class="hero-ctas" style="margin:0">
+        <a class="btn primary" href="docs/getting-started.html">Read the quick start</a>
+        <a class="btn" href="docs/index.html">Browse the docs</a>
+      </div>
+    </section>
+  </div>
+</main>
+
+<footer class="footer">
+  <div class="wrap">
+    <a class="brand" href="index.html"><svg class="logo-mark" viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="5" fill="currentColor"/><circle cx="16" cy="16" r="10.5" fill="none" stroke="currentColor" stroke-width="2" opacity=".55"/><circle cx="16" cy="16" r="15" fill="none" stroke="currentColor" stroke-width="1.5" opacity=".22"/></svg><span>onebase</span></a>
+    <a href="docs/index.html">Docs</a>
+    <a href="<!--REPO-->" target="_blank" rel="noopener">GitHub</a>
+    <a href="<!--REPO-->/releases" target="_blank" rel="noopener">Releases</a>
+    <a href="llms.txt">llms.txt</a>
+  </div>
+</footer>
+
+<script src="assets/site.js" defer></script>
+<script src="assets/landing.js" defer></script>
+</body>
+</html>

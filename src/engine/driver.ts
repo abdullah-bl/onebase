@@ -5,6 +5,7 @@ import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { newId, postgresDialect, sqliteDialect, type Dialect } from "./dialect";
+import { unguardedFetch } from "./guard";
 
 export type Row = Record<string, any>;
 
@@ -270,7 +271,8 @@ export class LibsqlDriver implements Driver {
 
   async init() {
     const { createClient } = await import("@libsql/client/web");
-    this.client = createClient({ url: this.url, authToken: this.authToken });
+    // Queries run inside mutations, where user code may not call fetch().
+    this.client = createClient({ url: this.url, authToken: this.authToken, fetch: unguardedFetch });
     await this.client.batch(
       [...this.dialect.ddl, "CREATE TABLE IF NOT EXISTS _commits (id TEXT PRIMARY KEY, at REAL NOT NULL, payload TEXT NOT NULL)"],
       "write",

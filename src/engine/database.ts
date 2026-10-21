@@ -6,8 +6,16 @@ import type { Exec } from "./driver";
 
 export type Doc = Record<string, unknown> & { _id: string; _creationTime: number };
 
-/** Equality conditions a query is restricted to; used to decide which writes affect it. */
-export type ReadRange = { table: string; eq: [path: string, value: unknown][] };
+/** What one query read; used to decide which writes affect it. */
+export type ReadRange = {
+  table: string;
+  /** Equality conditions every matching document satisfies. */
+  eq: [path: string, value: unknown][];
+  /** Index range conditions (gt/gte/lt/lte). */
+  bounds?: { field: string; op: "gt" | "gte" | "lt" | "lte"; value: unknown }[];
+  /** The slice of index order that was scanned: keys after `after`, up to and including `until`. */
+  window?: { keys: string[]; order: "asc" | "desc"; after?: unknown[]; until?: unknown[] };
+};
 export type ReadSet = { ids: Set<string>; ranges: ReadRange[] };
 export type Write = { table: string; id: string; before: Doc | null; after: Doc | null };
 
@@ -49,11 +57,45 @@ function sameValue(a: unknown, b: unknown): boolean {
   return false;
 }
 
-/** Does this write possibly change the result of a query restricted to `range`? */
-export function writeAffects(range: ReadRange, write: Write): boolean {
+const BOUND_OK = { gt: (c: number) => c > 0, gte: (c: number) => c >= 0, lt: (c: number) => c < 0, lte: (c: number) => c <= 0 };
+
+/** Lexicographic comparison of index keys; null when the dialect can't decide. */
+function compareKeys(a: unknown[], b: unknown[], paths: string[], d: Dialect): number | null {
+  for (let i = 0; i < paths.length; i++) {
+    const c = d.compare(a[i], b[i], systemKind(paths[i]!) ?? "json");
+    if (c !== 0) return c;
+  }
+  return 0;
+}
+
+/** Could `doc` be part of what the query read? Anything undecidable counts as yes. */
+function inRange(range: ReadRange, doc: Doc | null, d: Dialect): boolean {
+  if (!doc) return false;
+  if (!range.eq.every(([p, v]) => sameValue(getPath(doc, p), v))) return false;
+  for (const b of range.bounds ?? []) {
+    const c = d.compare(getPath(doc, b.field), b.value, systemKind(b.field) ?? "json");
+    if (c !== null && !BOUND_OK[b.op](c)) return false;
+  }
+  const w = range.window;
+  if (w && (w.after || w.until)) {
+    const key = w.keys.map((k) => getPath(doc, k));
+    const dir = w.order === "asc" ? 1 : -1;
+    if (w.after) {
+      const c = compareKeys(key, w.after, w.keys, d);
+      if (c !== null && c * dir <= 0) return false;
+    }
+    if (w.until) {
+      const c = compareKeys(key, w.until, w.keys, d);
+      if (c !== null && c * dir > 0) return false;
+    }
+  }
+  return true;
+}
+
+/** Does this write possibly change the result of a query that read `range`? */
+export function writeAffects(range: ReadRange, write: Write, dialect: Dialect): boolean {
   if (range.table !== write.table) return false;
-  const matches = (doc: Doc | null) => doc !== null && range.eq.every(([p, v]) => sameValue(getPath(doc, p), v));
-  return matches(write.before) || matches(write.after);
+  return inRange(range, write.before, dialect) || inRange(range, write.after, dialect);
 }
 
 /** Rejects values that cannot round-trip through JSON, with a hint on how to store them. */
@@ -366,19 +408,32 @@ class QueryImpl {
       sql += ` LIMIT ${Math.floor(opts.limit)}`;
     }
 
-    this.recordRead();
     await this.db.checkPlan(sql, params, this.table, this.filters);
-    const rows = await this.db.tx.all(sql, params);
-    return rows.map((row) => ({
+    const rows = (await this.db.tx.all(sql, params)).map((row) => ({
       doc: { _id: row.id, _creationTime: Number(row.ct), ...d.parseDoc(row.doc) } as Doc,
       key: keys.map((k, i) => (k.kind === "ct" ? Number(row[`k${i}`]) : d.decode(row[`k${i}`], k.kind))),
     }));
+    // The scan covered keys after the cursor, up to the end cursor or the last row of a full page.
+    const full = opts.limit !== undefined && rows.length > 0 && rows.length === opts.limit;
+    this.recordRead({
+      after: opts.cursor ? decodeCursor(opts.cursor) : undefined,
+      until: opts.endCursor ? decodeCursor(opts.endCursor) : full ? rows[rows.length - 1]!.key : undefined,
+    });
+    return rows;
   }
 
-  private recordRead() {
+  private recordRead(scanned: { after?: unknown[]; until?: unknown[] }) {
+    if (!this.db.readSet) return;
     const eq: [string, unknown][] = this.rangeConds.filter((c) => c.op === "eq").map((c) => [c.field, c.value]);
     for (const f of this.filters) eq.push(...equalityConditions(f));
-    this.db.readSet?.ranges.push({ table: this.table, eq });
+    const bounds = this.rangeConds.filter((c) => c.op !== "eq") as NonNullable<ReadRange["bounds"]>;
+    const fields = this.indexFields.filter((f) => f !== "_creationTime");
+    this.db.readSet.ranges.push({
+      table: this.table,
+      eq,
+      bounds,
+      window: { keys: [...fields, "_creationTime", "_id"], order: this.direction, ...scanned },
+    });
   }
 
   async collect(): Promise<Doc[]> {

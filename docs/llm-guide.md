@@ -1,3 +1,8 @@
+---
+title: LLM guide
+description: A compact, complete guide to give an AI assistant that writes onebase code.
+---
+
 # Writing onebase functions
 
 A short, complete guide for writing a onebase backend. Give it to an LLM (e.g. copy it into your app's `AGENTS.md`). The API follows Convex, so Convex knowledge applies, with the differences listed at the end.
@@ -5,7 +10,7 @@ A short, complete guide for writing a onebase backend. Give it to an LLM (e.g. c
 ## Files
 
 ```
-convex/
+onebase/
   schema.ts          tables, fields, indexes
   <module>.ts        queries, mutations, actions (file name = module name)
   http.ts            optional HTTP routes (webhooks)
@@ -112,7 +117,7 @@ Actions have no `ctx.db`: read through `ctx.runQuery` and write through `ctx.run
 ## Cron jobs
 
 ```ts
-// convex/crons.ts
+// onebase/crons.ts
 import { cronJobs } from "onebase/server";
 import { internal } from "./_generated/api";
 
@@ -154,10 +159,10 @@ Files are kept in `<data>/files`, or in S3 with `--files s3://bucket/prefix`. Se
 ## Auth
 
 ```ts
-// convex/auth.config.ts. Same provider format as Convex: works with Clerk, Auth0, WorkOS, any OIDC issuer.
+// onebase/auth.config.ts. Same provider format as Convex: works with Clerk, Auth0, WorkOS, any OIDC issuer.
 export default {
   providers: [
-    { domain: "https://your-app.clerk.accounts.dev", applicationID: "convex" },
+    { domain: "https://your-app.clerk.accounts.dev", applicationID: "onebase" },
     // Without OIDC discovery: { type: "customJwt", issuer: "https://...", jwks: "https://.../jwks.json", algorithm: "RS256" },
   ],
   // Optional, for anything that isn't a JWT from those issuers (API keys, sessions...):
@@ -172,7 +177,7 @@ On the client: `client.setAuth(async () => await getToken())`. In functions, `aw
 ```ts
 import { OnebaseClient } from "onebase/browser";               // or a React app:
 import { OnebaseProvider, useQuery, useMutation } from "onebase/react";
-import { api } from "../convex/_generated/api";
+import { api } from "../onebase/_generated/api";
 
 const client = new OnebaseClient("http://localhost:8090");
 client.onUpdate(api.posts.byAuthor, { author }, (posts) => render(posts));

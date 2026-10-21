@@ -2,7 +2,7 @@
 
 import { existsSync, statSync } from "node:fs";
 import { extname, join, resolve, sep } from "node:path";
-import { serve, type AssetResolver } from "./engine/http";
+import { RateLimiter, serve, type AssetResolver, type RateLimit } from "./engine/http";
 import { startBackups, type BackupOptions } from "./backup";
 import { createDriver } from "./engine/driver";
 import { LocalBlobs, parseS3Url, S3Blobs } from "./engine/files";
@@ -32,6 +32,11 @@ export type AppOptions = {
   hostname: string;
   dev: boolean;
   assets?: AssetResolver | null;
+  /** Origins allowed to call the API from a browser (default: any). */
+  cors?: string[];
+  /** Per-IP limit on function calls, subscriptions and uploads. */
+  rateLimit?: RateLimit | null;
+  trustProxy?: boolean;
   quiet?: boolean;
 };
 
@@ -73,7 +78,16 @@ export async function startApp(opts: AppOptions) {
     log: consoleLogger,
   });
   const { created, dropped } = await runtime.init();
-  const server = serve({ runtime, port: opts.port, hostname: opts.hostname, assets: opts.assets, clientBundle });
+  const server = serve({
+    runtime,
+    port: opts.port,
+    hostname: opts.hostname,
+    assets: opts.assets,
+    clientBundle,
+    cors: opts.cors,
+    rateLimit: opts.rateLimit,
+    trustProxy: opts.trustProxy,
+  });
   const host = opts.hostname === "0.0.0.0" ? "localhost" : opts.hostname;
   runtime.siteUrl = (opts.siteUrl ?? `http://${host}:${server.port}`).replace(/\/$/, "");
   await runtime.startScheduler();
@@ -88,6 +102,8 @@ export async function startApp(opts: AppOptions) {
     console.log(`  database   ${driver.description}`);
     console.log(`  files      ${blobs.description}`);
     if (opts.backup) console.log(`  backups    ${opts.backup.url} every ${Math.round(opts.backup.everyMs / 60_000)} min, keep ${opts.backup.keep}`);
+    if (opts.cors?.length && !opts.cors.includes("*")) console.log(`  cors       ${opts.cors.join(", ")}`);
+    if (opts.rateLimit) console.log(`  rate limit ${new RateLimiter(opts.rateLimit).describe()} per IP${opts.trustProxy ? " (X-Forwarded-For)" : ""}`);
     console.log(`  http       http://${host}:${server.port}`);
     console.log(`  sync       ws://${host}:${server.port}/api/sync`);
   }

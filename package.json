@@ -1,0 +1,44 @@
+{
+  "name": "onebase",
+  "version": "0.1.0",
+  "description": "A lightweight, Convex-style reactive backend on Bun + SQLite that ships as a single binary.",
+  "type": "module",
+  "module": "src/server.ts",
+  "bin": {
+    "onebase": "./src/cli.ts"
+  },
+  "exports": {
+    ".": "./src/server.ts",
+    "./server": "./src/server.ts",
+    "./values": "./src/values.ts",
+    "./browser": "./src/client/index.ts",
+    "./react": "./src/client/react.ts"
+  },
+  "scripts": {
+    "dev": "bun src/cli.ts dev",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "build:client": "bun scripts/build-client.ts",
+    "build:binary": "bun scripts/build-client.ts && bun build --compile --minify src/cli.ts --outfile dist/onebase",
+    "example": "cd example && bun ../src/cli.ts dev"
+  },
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/react": "19",
+    "react": "19"
+  },
+  "peerDependencies": {
+    "typescript": "^7",
+    "react": ">=18"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "@libsql/client": "^0.18.0",
+    "convex": "^1.47.0"
+  }
+}

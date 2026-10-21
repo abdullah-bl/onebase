@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>onebase chat</title>
+    <style>
+      :root { color-scheme: light dark; --bg: #fafafa; --fg: #1a1a1a; --muted: #777; --line: #e3e3e3; --accent: #3b5bdb; --card: #fff; }
+      @media (prefers-color-scheme: dark) { :root { --bg: #141414; --fg: #eee; --muted: #999; --line: #2c2c2c; --accent: #748ffc; --card: #1d1d1d; } }
+      * { box-sizing: border-box; }
+      body { margin: 0; font: 15px/1.45 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+      main { max-width: 640px; margin: 0 auto; padding: 16px; display: flex; flex-direction: column; height: 100dvh; }
+      header { display: flex; gap: 8px; align-items: center; justify-content: space-between; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+      h1 { font-size: 17px; margin: 0; }
+      #status { font-size: 12px; color: var(--muted); }
+      #status.open::before { content: "● "; color: #2b8a3e; }
+      #status.connecting::before { content: "● "; color: #e67700; }
+      #channels { display: flex; gap: 6px; padding: 10px 0; flex-wrap: wrap; }
+      #channels button { border: 1px solid var(--line); background: var(--card); color: var(--fg); border-radius: 999px; padding: 3px 12px; cursor: pointer; }
+      #channels button.active { border-color: var(--accent); color: var(--accent); }
+      #messages { flex: 1; overflow-y: auto; list-style: none; margin: 0; padding: 0; }
+      #messages li { padding: 8px 10px; margin: 6px 0; background: var(--card); border: 1px solid var(--line); border-radius: 8px; display: flex; gap: 8px; align-items: baseline; }
+      #messages .author { font-weight: 600; }
+      #messages .body { flex: 1; overflow-wrap: anywhere; }
+      #messages img { display: block; max-width: 220px; max-height: 160px; margin-top: 6px; border-radius: 6px; }
+      #attach { background: var(--card); color: var(--fg); border: 1px solid var(--line); }
+      #attach.has-file { border-color: var(--accent); color: var(--accent); }
+      #messages .like { border: 0; background: none; color: var(--muted); cursor: pointer; font-size: 13px; }
+      form { display: flex; gap: 8px; padding-top: 12px; border-top: 1px solid var(--line); }
+      input { flex: 1; min-width: 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--fg); font: inherit; }
+      #name { flex: 0 0 110px; }
+      form button { padding: 8px 14px; border: 0; border-radius: 8px; background: var(--accent); color: #fff; font: inherit; cursor: pointer; }
+      #error { color: #e03131; font-size: 13px; min-height: 1.2em; }
+      .hint { color: var(--muted); font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>onebase chat</h1>
+        <span id="status" class="connecting">connecting</span>
+      </header>
+      <div id="channels"></div>
+      <ul id="messages"></ul>
+      <div id="error"></div>
+      <form id="form">
+        <input id="name" placeholder="name" required />
+        <input id="body" placeholder="Message (start with /tmp to self-destruct in 5s)" autocomplete="off" />
+        <input id="file" type="file" accept="image/*" hidden />
+        <button type="button" id="attach" title="Attach an image">📎</button>
+        <button>Send</button>
+      </form>
+      <p class="hint">Open this page in two windows to see live updates.</p>
+    </main>
+    <script type="module">
+      import { OnebaseClient, anyApi as api } from "/_onebase/client.js";
+
+      const client = new OnebaseClient();
+      const $ = (id) => document.getElementById(id);
+      const status = $("status");
+      client.onConnectionChange((s) => { status.textContent = s; status.className = s; });
+
+      $("name").value = localStorage.getItem("name") || "guest" + Math.floor(Math.random() * 1000);
+      let current = null;
+      let stopMessages = () => {};
+
+      const names = ["general", "random"];
+      const ids = Object.fromEntries(await Promise.all(names.map(async (n) => [n, await client.mutation(api.channels.getOrCreate, { name: n })])));
+
+      function select(name) {
+        current = ids[name];
+        for (const b of $("channels").children) b.classList.toggle("active", b.textContent === "#" + name);
+        stopMessages();
+        stopMessages = client.onUpdate(api.messages.list, { channel: current }, render, (e) => ($("error").textContent = e.message));
+      }
+
+      for (const n of names) {
+        const b = document.createElement("button");
+        b.textContent = "#" + n;
+        b.onclick = () => select(n);
+        $("channels").append(b);
+      }
+
+      function render(messages) {
+        const list = $("messages");
+        const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 40;
+        list.replaceChildren(...messages.map((m) => {
+          const li = document.createElement("li");
+          const author = Object.assign(document.createElement("span"), { className: "author", textContent: m.author });
+          const body = Object.assign(document.createElement("span"), { className: "body", textContent: m.body });
+          if (m.imageUrl) body.append(Object.assign(document.createElement("img"), { src: m.imageUrl, alt: "" }));
+          const like = Object.assign(document.createElement("button"), { className: "like", textContent: "♥ " + (m.likes ?? 0) });
+          like.onclick = () => client.mutation(api.messages.like, { id: m._id });
+          li.append(author, body, like);
+          return li;
+        }));
+        if (atBottom) list.scrollTop = list.scrollHeight;
+      }
+
+      $("attach").onclick = () => $("file").click();
+      $("file").onchange = () => $("attach").classList.toggle("has-file", $("file").files.length > 0);
+
+      $("form").onsubmit = async (e) => {
+        e.preventDefault();
+        $("error").textContent = "";
+        localStorage.setItem("name", $("name").value);
+        try {
+          let image;
+          const file = $("file").files[0];
+          if (file) {
+            // Upload straight to the server, then attach the returned storage id to the message.
+            const uploadUrl = await client.mutation(api.messages.generateUploadUrl);
+            const res = await fetch(uploadUrl, { method: "POST", headers: { "Content-Type": file.type }, body: file });
+            ({ storageId: image } = await res.json());
+          }
+          await client.mutation(api.messages.send, { channel: current, author: $("name").value, body: $("body").value, image });
+          $("body").value = "";
+          $("file").value = "";
+          $("attach").classList.remove("has-file");
+        } catch (err) {
+          $("error").textContent = err.message;
+        }
+      };
+
+      select("general");
+    </script>
+  </body>
+</html>

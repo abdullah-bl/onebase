@@ -123,3 +123,7 @@ bun run typecheck      # includes type-level tests in tests/types.ts
 bun run build:assets   # rebuild the embedded browser client and dashboard (src/client, src/dashboard)
 bun run site           # build the website into site/dist
 ```
+
+## License
+
+[MIT](LICENSE)

@@ -30,7 +30,7 @@ const messages = useQuery(api.messages.list, { channel });
 
 onebase follows [Convex](https://convex.dev)'s programming model and API, and makes different trade-offs:
 
-- **Small.** One Bun process with SQLite. It uses about 33 MB of memory at startup and needs no separate database server.
+- **Small.** One Bun process with SQLite. It uses about 40 MB of memory at startup and needs no separate database server.
 - **Node and npm everywhere.** Queries, mutations and actions all run in Bun, so any npm package works in any function. There is no `"use node"` split.
 - **One file to deploy.** Copy the binary to a server and run it. The functions can sit next to it in a folder, or be compiled into it along with your frontend.
 - **Hard to misuse.** Errors explain how to fix the problem, `.filter()` picks indexes automatically, and `onebase doctor` catches common mistakes. This matters when an LLM writes the code.
@@ -50,9 +50,10 @@ onebase follows [Convex](https://convex.dev)'s programming model and API, and ma
 | [HTTP actions](./http-actions.md) | Webhooks and custom HTTP endpoints |
 | [Databases](./databases.md) | SQLite, Postgres or Turso, including multiple instances |
 | [Backups](./backups.md) | SQLite snapshots to S3, with restore |
+| [Dashboard](./dashboard.md) | Browse and edit data, run functions, and watch logs, jobs and files at `/_admin` |
 
 ## When to use something else
 
-onebase is a young project. Use Convex if you want a managed service with a dashboard, search and vector indexes, and a team supporting it. Use onebase if you want to own the whole stack, run it on a small VPS or your own hardware, or need full Node.js in every function.
+onebase is a young project. Use Convex if you want a managed service, search and vector indexes, and a team supporting it. Use onebase if you want to own the whole stack, run it on a small VPS or your own hardware, or need full Node.js in every function.
 
 Next: [Quick start](./getting-started.md).

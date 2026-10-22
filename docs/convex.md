@@ -31,7 +31,7 @@ onebase uses Convex's programming model and most of its API. If you know Convex,
 | Imports | `convex/server`, `convex/values` | `onebase/server`, `onebase/values` (builders still come from `./_generated/server`) |
 | Functions folder | `convex/` | `onebase/` (a `convex/` folder also works) |
 | Search & vector indexes | ✓ | Not yet |
-| Dashboard | ✓ | Not yet |
+| Dashboard | ✓ | ✓ (built in, at `/_admin`) |
 
 ## Porting a project
 

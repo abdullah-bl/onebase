@@ -57,6 +57,7 @@ Options:
   --trust-proxy     Take the client IP from X-Forwarded-For (when behind a reverse proxy)
   --at <time>       restore: snapshot to use, e.g. 20261022T0300 (default: newest)
   --force           restore: overwrite an existing database
+  --no-dashboard    Don't serve the dashboard at /_admin ($ONEBASE_DASHBOARD=off)
   --out <file>      Output file for build (default: ./app)
   --target <t>      Build target, e.g. bun-linux-x64, bun-linux-arm64, bun-darwin-arm64, bun-windows-x64
 
@@ -86,6 +87,7 @@ function options(argv: string[]) {
       "trust-proxy": { type: "boolean", default: false },
       at: { type: "string" },
       force: { type: "boolean", default: false },
+      "no-dashboard": { type: "boolean", default: process.env.ONEBASE_DASHBOARD === "off" },
       out: { type: "string", default: "./app" },
       target: { type: "string" },
       dev: { type: "boolean", default: false },
@@ -116,6 +118,7 @@ function serverOptions(opts: ReturnType<typeof options>) {
     cors: opts.cors ? opts.cors.split(",").map((o) => o.trim()).filter(Boolean) : undefined,
     rateLimit: opts["rate-limit"] ? parseRateLimit(opts["rate-limit"]) : null,
     trustProxy: opts["trust-proxy"],
+    dashboard: !opts["no-dashboard"],
   };
 }
 

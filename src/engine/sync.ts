@@ -38,6 +38,7 @@ export class SubscriptionManager {
 
   constructor(private readonly runtime: Runtime) {
     runtime.onCommit((event) => this.invalidate(event));
+    runtime.stats.subscriptions = () => this.size;
   }
 
   get size() {
@@ -81,7 +82,7 @@ export class SubscriptionManager {
   private async execute(entry: Entry) {
     let update: QueryUpdate;
     try {
-      const { value, readSet } = await this.runtime.runQuery(entry.name, entry.args, { identity: entry.identity });
+      const { value, readSet } = await this.runtime.runQuery(entry.name, entry.args, { identity: entry.identity, source: "subscription" });
       entry.readSet = readSet;
       update = { ok: true, value };
     } catch (err) {

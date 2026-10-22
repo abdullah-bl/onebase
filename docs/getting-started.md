@@ -16,7 +16,7 @@ curl -fsSL -o onebase https://github.com/abdullah-bl/onebase/releases/latest/dow
 ```
 
 ```bash
-chmod +x onebase && ./onebase --help
+sudo install onebase /usr/local/bin/onebase && rm onebase && onebase --help
 ```
 
 Replace `linux-x64` with `linux-arm64`, `darwin-arm64`, `darwin-x64` or `windows-x64.exe` for your platform.

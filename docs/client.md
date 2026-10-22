@@ -16,6 +16,19 @@ await client.mutation(api.tasks.add, { text: "Hi" }); // args and return type ar
 
 Without the generated types you can use `anyApi` (untyped) or plain strings like `"tasks:add"`.
 
+## Connecting to your backend
+
+When onebase serves your frontend (from `public/`), the client connects to the same address and you don't pass a URL. When the frontend is hosted somewhere else (Vercel, Netlify, a CDN, a mobile app), pass the backend's URL:
+
+```ts
+const client = new OnebaseClient("https://api.example.com");
+```
+
+- **WebSocket:** derived automatically (`https://api.example.com` → `wss://api.example.com/api/sync`).
+- **Per environment:** keep the URL in an environment variable, e.g. `new OnebaseClient(import.meta.env.VITE_ONEBASE_URL)`.
+- **CORS:** any origin can call the API by default. Restrict it with `--cors https://app.example.com` (comma-separate several origins).
+- **File URLs:** start the server with `--url https://api.example.com`, so `ctx.storage.getUrl()` returns public addresses instead of `localhost`.
+
 ## Browser
 
 ```ts

@@ -9,18 +9,23 @@ There are two ways to ship, and both produce a single executable.
 
 ## 1. Generic binary + functions folder
 
-Like PocketBase with `pb_hooks`: one `onebase` binary loads your functions from a folder next to it at startup.
+Like PocketBase with `pb_hooks`: one `onebase` binary loads your functions from the `onebase/` folder of the directory you run it in.
+
+Put the binary on your PATH, from the [releases](https://github.com/abdullah-bl/onebase/releases) or from `bun run build:binary`. It can't sit next to the `onebase/` folder, because they'd have the same name.
+
+```bash
+sudo install onebase-linux-x64 /usr/local/bin/onebase
+```
 
 ```
 server/
-  onebase              the binary (from releases, or `bun run build:binary`)
   onebase/             your .ts functions (schema.ts, messages.ts, …)
   public/              optional frontend
-  onebase_data/        created automatically: db.sqlite, files/
+  onebase_data/        created automatically: db.sqlite, files/, admin.key
 ```
 
 ```bash
-./onebase serve --port 8090 --url https://api.example.com
+cd server && onebase serve --port 8090 --url https://api.example.com
 ```
 
 You update functions by copying files and restarting, with no rebuild. Functions can import npm packages from a `node_modules` folder next to them.
@@ -58,6 +63,11 @@ Every flag also has an environment variable:
 | `--db` | `ONEBASE_DB`, `DATABASE_URL` | `<data>/db.sqlite` (see [Databases](./databases.md)) |
 | `--files` | `ONEBASE_FILES` | `<data>/files` (see [File storage](./file-storage.md)) |
 | `--backup` | `ONEBASE_BACKUP` | none (see [Backups](./backups.md)) |
+| `--cors` | `ONEBASE_CORS` | any origin; comma-separated list of allowed browser origins |
+| `--rate-limit` | `ONEBASE_RATE_LIMIT` | off; per-IP limit on calls, e.g. `100/10s` or `600/m` |
+| `--trust-proxy` | | off; read the client IP from `X-Forwarded-For` (set it behind a proxy) |
+| `--no-dashboard` | `ONEBASE_DASHBOARD=off` | dashboard on at `/_admin` (see [Dashboard](./dashboard.md)) |
+| | `ONEBASE_ADMIN_KEY` | generated into `<data>/admin.key` |
 
 ## Behind a reverse proxy
 
@@ -92,7 +102,7 @@ After=network.target
 
 [Service]
 WorkingDirectory=/srv/app
-ExecStart=/srv/app/onebase serve --port 8090 --url https://api.example.com
+ExecStart=/usr/local/bin/onebase serve --port 8090 --url https://api.example.com
 Environment=ONEBASE_BACKUP=s3://my-bucket/backups
 EnvironmentFile=-/srv/app/.env
 Restart=always
@@ -111,12 +121,12 @@ sudo systemctl enable --now onebase
 ```dockerfile
 FROM debian:bookworm-slim
 WORKDIR /app
-COPY onebase ./onebase
+COPY onebase-linux-x64 /usr/local/bin/onebase
 COPY onebase/ ./onebase/
 COPY public/ ./public/
 VOLUME /app/onebase_data
 EXPOSE 8090
-CMD ["./onebase", "serve"]
+CMD ["onebase", "serve"]
 ```
 
 ## Production checklist
@@ -124,5 +134,7 @@ CMD ["./onebase", "serve"]
 - **Public URL:** set `--url`, so file URLs point at your public domain.
 - **Durable data:** keep `onebase_data` on persistent disk, and add `--backup` (or use Postgres or Turso).
 - **Before deploying:** run `onebase doctor`.
+- **Behind a proxy:** pass `--trust-proxy` so `--rate-limit` counts real client IPs.
+- **Dashboard:** keep the admin key secret, or block `/_admin` at the proxy (see [Dashboard](./dashboard.md)).
 - **Errors:** in production (no `--dev`), unexpected errors reach clients as `Server Error`. Use `ConvexError` for messages users should see.
-- **Memory:** expect about 33 MB at startup with SQLite, and about 45 MB with Postgres.
+- **Memory:** expect about 40 MB at startup with SQLite; Postgres adds a few MB for its connection pool.

@@ -38,6 +38,10 @@ onebase <command> [flags]
 | `--backup-keep <n>` | `24` | Snapshots to keep |
 | `--at <time>` | newest | `restore`: pick a snapshot |
 | `--force` | | `restore`: overwrite an existing database |
+| `--cors <origins>` | any / `$ONEBASE_CORS` | Browser origins allowed to call the API, comma-separated |
+| `--rate-limit <r>` | off / `$ONEBASE_RATE_LIMIT` | Per-IP limit on calls, subscriptions and uploads, e.g. `100/10s`, `600/m` |
+| `--trust-proxy` | off | Take the client IP from `X-Forwarded-For` |
+| `--no-dashboard` | dashboard on / `$ONEBASE_DASHBOARD=off` | Don't serve the dashboard at `/_admin` |
 | `--out <file>` | `./app` | `build`: output file |
 | `--target <t>` | current platform | `build`: `bun-linux-x64`, `bun-linux-arm64`, `bun-darwin-arm64`, `bun-darwin-x64`, `bun-windows-x64` |
 
@@ -47,6 +51,7 @@ onebase <command> [flags]
 |---|---|
 | `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_ENDPOINT`, `S3_REGION` | S3 credentials for `--files` and `--backup` (`AWS_*` equivalents also work) |
 | `TURSO_AUTH_TOKEN` / `LIBSQL_AUTH_TOKEN` | Token for `--db libsql://…` |
+| `ONEBASE_ADMIN_KEY` | Dashboard key (default: generated into `<data>/admin.key`) |
 
 ## doctor
 

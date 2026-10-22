@@ -47,7 +47,7 @@
   const script = [
     ["Alice", "shipped the new schema 🚀"],
     ["Bob", "seeing it already, no refresh"],
-    ["Alice", "one binary, 33 MB of RAM"],
+    ["Alice", "one binary, ~40 MB of RAM"],
     ["Bob", "type something in either window →"],
   ];
   let step = 0;

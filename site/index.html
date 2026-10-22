@@ -20,7 +20,7 @@
 
       <div class="terminal" aria-label="Example server output">
         <div class="terminal-bar"><i></i><i></i><i></i><span>~/my-app</span></div>
-<pre><span class="t-acc">$</span> <span class="t-cmd">./onebase serve --backup s3://my-bucket/backups</span>
+<pre><span class="t-acc">$</span> <span class="t-cmd">onebase serve --backup s3://my-bucket/backups</span>
 <span class="t-b">onebase</span> v<!--VERSION-->
   <span class="t-dim">functions</span>  9 (channels:list, messages:list, messages:send, …)
   <span class="t-dim">crons</span>      prune old messages
@@ -35,7 +35,7 @@
 
   <div class="wrap">
     <div class="stats">
-      <div class="stat"><b>~33 MB</b><span>memory at startup</span></div>
+      <div class="stat"><b>~40 MB</b><span>memory at startup, dashboard included</span></div>
       <div class="stat"><b>8.6 ms</b><span>per mutation, pushed to 100 live clients</span></div>
       <div class="stat"><b>1 file</b><span>to deploy: the binary, optionally with your app inside</span></div>
       <div class="stat"><b>5 KB</b><span>browser client, served by the server</span></div>
@@ -223,14 +223,14 @@ export function Chat({ channel }) {
           <span class="tag">one server</span>
           <h3>SQLite + S3 backups</h3>
           <p>The default. Reads take microseconds, there's no database to run, and hourly snapshots go to any S3-compatible storage.</p>
-          <pre>./onebase serve \
+          <pre>onebase serve \
   --backup s3://bucket/backups</pre>
         </div>
         <div class="deploy-card">
           <span class="tag">many servers</span>
           <h3>Postgres</h3>
           <p>Run as many instances as you need behind a load balancer. Live queries are shared through LISTEN/NOTIFY, and mutations are serializable.</p>
-          <pre>./onebase serve \
+          <pre>onebase serve \
   --db postgres://…/app \
   --files s3://bucket/files</pre>
         </div>
@@ -238,7 +238,7 @@ export function Chat({ channel }) {
           <span class="tag">managed SQLite</span>
           <h3>Turso</h3>
           <p>SQLite semantics without running a database yourself, and still as many instances as you like.</p>
-          <pre>TURSO_AUTH_TOKEN=… ./onebase serve \
+          <pre>TURSO_AUTH_TOKEN=… onebase serve \
   --db libsql://my-db.turso.io</pre>
         </div>
       </div>
@@ -260,7 +260,8 @@ export function Chat({ channel }) {
             <tr><th>Runtime</th><td>V8 isolates; Node only in actions</td><td>Bun in every function</td></tr>
             <tr><th>Database</th><td>Convex's own</td><td>SQLite, Postgres or Turso</td></tr>
             <tr><th>.filter()</th><td>Builder; scans the documents</td><td>Builder or object; uses indexes</td></tr>
-            <tr><th>Search, vector, dashboard</th><td>Included</td><td>Not yet</td></tr>
+            <tr><th>Dashboard</th><td>Included</td><td>Included, at <code>/_admin</code> in the binary</td></tr>
+            <tr><th>Search, vector indexes</th><td>Included</td><td>Not yet</td></tr>
             <tr><th>Porting</th><td>n/a</td><td>Change the imports; <code>onebase doctor</code> lists them</td></tr>
           </tbody>
         </table>

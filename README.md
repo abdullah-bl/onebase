@@ -2,11 +2,12 @@
 
 A lightweight, Convex-style reactive backend: TypeScript functions, a typed document database and live queries. It runs as one Bun process on SQLite and ships as a single executable.
 
-- **Small:** about 33 MB RSS on startup. One process with no isolates and no separate database server.
+- **Small:** about 40 MB RSS on startup, dashboard included. One process with no isolates and no separate database server.
 - **Full Node/npm everywhere:** queries, mutations and actions all run in Bun. There is no `"use node"` split.
 - **Convex-shaped API:** `query`, `mutation`, `action`, `v.*`, `ctx.db`, `api.module.fn`, `useQuery`. Code and LLM knowledge carry over.
 - **Forgiving and explicit:** errors say how to fix the problem, indexes are picked automatically for filters, and `onebase doctor` checks your project.
 - **Batteries included:** scheduler, cron jobs, file storage, JWT auth (Clerk, Auth0, any OIDC), HTTP routes and pagination.
+- **Dashboard built in** at `/_admin`: browse and edit data, run functions, live logs, jobs and files.
 - **Your choice of database:** SQLite by default; Postgres or Turso (libSQL) when you need several instances. Files on disk or in S3/R2/MinIO, and SQLite backups to S3.
 - **Single file deploy**, PocketBase style.
 
@@ -42,16 +43,19 @@ onebase serve        # production
 bun run build:binary                 # → dist/onebase
 ```
 
+```bash
+sudo install dist/onebase /usr/local/bin/onebase   # the binary goes on your PATH
+```
+
 ```
 server/
-  onebase                          # the binary
-  onebase/                           # your .ts functions, loaded at startup
-  public/                            # optional frontend
-  onebase_data/db.sqlite                # created automatically
+  onebase/              # your .ts functions, loaded at startup
+  public/               # optional frontend
+  onebase_data/         # created automatically: db.sqlite, files/, admin.key
 ```
 
 ```bash
-./onebase serve --port 8090
+cd server && onebase serve --port 8090
 ```
 
 Functions can import npm packages from a `node_modules` folder next to them.
@@ -116,6 +120,6 @@ bun test               # engine + end-to-end tests (SQLite, local files)
 TEST_POSTGRES_URL=postgres://… TEST_LIBSQL_URL=http://127.0.0.1:8080 \
 TEST_S3_URL="s3://bucket/prefix?endpoint=http://127.0.0.1:9000" S3_ACCESS_KEY_ID=… S3_SECRET_ACCESS_KEY=… bun test
 bun run typecheck      # includes type-level tests in tests/types.ts
-bun run build:client   # rebuild the embedded browser client after editing src/client
+bun run build:assets   # rebuild the embedded browser client and dashboard (src/client, src/dashboard)
 bun run site           # build the website into site/dist
 ```

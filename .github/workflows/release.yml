@@ -19,7 +19,7 @@ jobs:
           bun-version: 1.4.2
       - run: bun install --frozen-lockfile
       - run: bun test
-      - run: bun scripts/build-client.ts
+      - run: bun run build:assets
       - name: Build binaries
         run: |
           mkdir -p release

@@ -93,7 +93,7 @@ export class CronRunner {
     state.running = true;
     let error: string | null = null;
     try {
-      await this.runtime.call(state.job.fn, state.job.args, { allowInternal: true });
+      await this.runtime.call(state.job.fn, state.job.args, { allowInternal: true, source: "cron" });
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
       this.runtime.log.error(`Cron "${state.job.name}" (${state.job.fn}) failed: ${error}`);

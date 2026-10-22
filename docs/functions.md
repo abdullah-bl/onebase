@@ -74,7 +74,7 @@ export const summarize = action({
 });
 ```
 
-Every function runs in Bun, so `fetch`, `node:*` modules and npm packages work in queries and mutations too. Keep queries and mutations deterministic, though. Side effects belong in actions, because a mutation may be retried when it conflicts with another instance (see [Databases](./databases.md)).
+Every function runs in Bun, so `node:*` modules and npm packages work in queries and mutations too. **`fetch()` is the exception: only actions can call it.** A query re-runs whenever its data changes, and a mutation holds the write lock and may be retried when it conflicts with another instance (see [Databases](./databases.md)), so outside calls belong in actions. Calling `fetch()` from a query or mutation fails with an error that says so.
 
 ## Internal functions
 

@@ -10,6 +10,7 @@ import { applySchema, DatabaseImpl, OnebaseError, readerView, writerView, type R
 import { newId } from "./dialect";
 import { savepoint, SerialQueue, type Driver, type Exec } from "./driver";
 import { FileStore, LocalBlobs, type BlobBackend } from "./files";
+import { CallLog, type CallSource } from "./calllog";
 import { currentFunction, installGuards } from "./guard";
 
 export type Modules = Record<string, Record<string, unknown>>;
@@ -32,7 +33,12 @@ export type RuntimeOptions = {
   log?: Logger;
 };
 
-export type CallOptions = { identity?: UserIdentity | null; allowInternal?: boolean };
+export type CallOptions = {
+  identity?: UserIdentity | null;
+  allowInternal?: boolean;
+  /** Where the call came from, for the dashboard's call log (default: "function"). */
+  source?: CallSource;
+};
 
 /** What changed in a commit: exact writes, or (when too large to broadcast) just the tables. */
 export type CommitEvent = { writes: Write[]; tables?: undefined } | { tables: string[]; writes?: undefined };
@@ -71,6 +77,10 @@ export class Runtime {
   readonly log: Logger;
   readonly files: FileStore;
   readonly instanceId = newId();
+  readonly calls = new CallLog();
+  readonly startedAt = Date.now();
+  /** Live counts reported by the HTTP layer, for the dashboard. */
+  readonly stats = { connections: 0, subscriptions: () => 0 };
   siteUrl: string;
   private readonly authenticate: Authenticate | null;
   private readonly crons: CronJob[];
@@ -185,8 +195,16 @@ export class Runtime {
     return this.driver.read(fn);
   }
 
-  onCommit(listener: (event: CommitEvent) => Promise<void>) {
+  /** Calls `listener` after every commit (local or from another instance); returns an unsubscribe function. */
+  onCommit(listener: (event: CommitEvent) => Promise<void>): () => void {
     this.commitListeners.push(listener);
+    return () => {
+      this.commitListeners = this.commitListeners.filter((l) => l !== listener);
+    };
+  }
+
+  get cronJobs(): readonly CronJob[] {
+    return this.crons;
   }
 
   private async notifyCommit(event: CommitEvent) {
@@ -429,7 +447,7 @@ export class Runtime {
   /** Runs an http.ts route handler. */
   async runHttpAction(handler: (ctx: any, request: Request) => Promise<Response> | Response, request: Request, identity: UserIdentity | null) {
     const name = `${request.method} ${new URL(request.url).pathname}`;
-    return currentFunction.run({ type: "action", name }, () => handler(this.actionCtx(identity), request));
+    return this.calls.track(name, "http", "http", () => currentFunction.run({ type: "action", name }, async () => handler(this.actionCtx(identity), request)));
   }
 
   // ---- Entry points ----
@@ -437,12 +455,14 @@ export class Runtime {
   /** Runs a query against a committed snapshot and reports what it read. */
   async runQuery(ref: FunctionLike, args: unknown, opts: CallOptions = {}): Promise<{ value: unknown; readSet: ReadSet }> {
     const { name, fn } = this.resolve(ref, "query", opts.allowInternal ?? false);
-    return this.driver.read(async (tx) => {
-      const readSet: ReadSet = { ids: new Set(), ranges: [] };
-      const db = this.newDb(tx, { readSet });
-      const value = await this.invoke(name, fn, this.queryCtx(db, opts.identity ?? null), args);
-      return { value, readSet };
-    });
+    return this.calls.track(name, "query", opts.source ?? "function", () =>
+      this.driver.read(async (tx) => {
+        const readSet: ReadSet = { ids: new Set(), ranges: [] };
+        const db = this.newDb(tx, { readSet });
+        const value = await this.invoke(name, fn, this.queryCtx(db, opts.identity ?? null), args);
+        return { value, readSet };
+      }),
+    );
   }
 
   async runMutation(
@@ -451,13 +471,26 @@ export class Runtime {
     opts: CallOptions & { inTransaction?: (tx: Exec) => Promise<unknown> } = {},
   ): Promise<unknown> {
     const { name, fn } = this.resolve(ref, "mutation", opts.allowInternal ?? false);
+    return this.calls.track(name, "mutation", opts.source ?? "function", () =>
+      this.transact(async (state) => {
+        const value = await this.invoke(name, fn, this.mutationCtx(state, opts.identity ?? null), args);
+        await opts.inTransaction?.(state.tx);
+        return value;
+      }),
+    );
+  }
+
+  /**
+   * Runs `body` in a write transaction with everything a mutation gets: commit broadcast,
+   * post-commit hooks, scheduler wake-up and live-query invalidation.
+   */
+  private async transact<T>(body: (state: TxState) => Promise<T>): Promise<T> {
     const { value, writes, scheduled, afterCommit } = await this.mutations.run(() =>
       // The driver may run this more than once if another instance conflicts; each attempt starts fresh.
       this.driver.write(async (tx) => {
         const state: TxState = { tx, db: undefined as any, writes: [], scheduled: false, afterCommit: [] };
         state.db = this.newDb(tx, { writes: state.writes });
-        const value = await this.invoke(name, fn, this.mutationCtx(state, opts.identity ?? null), args);
-        await opts.inTransaction?.(tx);
+        const value = await body(state);
         if (this.driver.shared && this.driver.publish && (state.writes.length || state.scheduled)) {
           await this.driver.publish(tx, this.broadcastMessage(state));
         }
@@ -470,6 +503,28 @@ export class Runtime {
     return value;
   }
 
+  /**
+   * Dashboard edits: a schema-validated write that live queries see like any mutation.
+   * `db` can read and write any table, including ones no longer in schema.ts.
+   */
+  adminWrite<T>(body: (db: DatabaseImpl, state: { tx: Exec; deleteFileAfterCommit(id: string): void }) => Promise<T>): Promise<T> {
+    return this.calls.track("dashboard edit", "mutation", "dashboard", () =>
+      this.transact((state) =>
+        body(state.db, { tx: state.tx, deleteFileAfterCommit: (id) => state.afterCommit.push(() => this.files.backend.remove(id)) }),
+      ),
+    );
+  }
+
+  /** Dashboard reads: a snapshot `db` that isn't limited to schema.ts tables. */
+  adminRead<T>(body: (db: DatabaseImpl, tx: Exec) => Promise<T>): Promise<T> {
+    return this.driver.read((tx) =>
+      body(
+        new DatabaseImpl({ tx, dialect: this.driver.dialect, schema: null, nextCreationTime: () => this.nextCreationTime() }),
+        tx,
+      ),
+    );
+  }
+
   private broadcastMessage(state: TxState): string {
     const full = JSON.stringify({ o: this.instanceId, w: state.writes, s: state.scheduled || undefined });
     if (full.length <= MAX_BROADCAST) return full;
@@ -478,7 +533,7 @@ export class Runtime {
 
   async runAction(ref: FunctionLike, args: unknown, opts: CallOptions = {}): Promise<unknown> {
     const { name, fn } = this.resolve(ref, "action", opts.allowInternal ?? false);
-    return this.invoke(name, fn, this.actionCtx(opts.identity ?? null), args);
+    return this.calls.track(name, "action", opts.source ?? "function", () => this.invoke(name, fn, this.actionCtx(opts.identity ?? null), args));
   }
 
   /** Runs any function by name, whatever its type. */
@@ -545,9 +600,9 @@ export class Runtime {
       const fn = this.functions.get(job.fn);
       if (fn?.type === "mutation") {
         // Exactly once: the job is marked done in the mutation's own transaction.
-        await this.runMutation(job.fn, args, { allowInternal: true, inTransaction: (tx) => setState(tx, "done") });
+        await this.runMutation(job.fn, args, { allowInternal: true, source: "scheduler", inTransaction: (tx) => setState(tx, "done") });
       } else {
-        await this.call(job.fn, args, { allowInternal: true });
+        await this.call(job.fn, args, { allowInternal: true, source: "scheduler" });
         await this.withWriter((tx) => setState(tx, "done"));
       }
     } catch (err) {

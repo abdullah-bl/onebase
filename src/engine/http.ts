@@ -177,7 +177,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
       const limit = limited(ws.data.ip);
       if (limit) return send(ws, { type: "result", requestId: msg.requestId, ok: false, error: limit.message });
       try {
-        const opts = { identity: ws.data.identity };
+        const opts = { identity: ws.data.identity, source: "client" as const };
         const value =
           msg.kind === "query"
             ? (await runtime.runQuery(msg.path, msg.args, opts)).value
@@ -202,7 +202,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
     }
     try {
       const identity = await identityFromRequest(req);
-      const opts = { identity };
+      const opts = { identity, source: "http" as const };
       const value =
         kind === "query"
           ? (await runtime.runQuery(body.path, body.args, opts)).value
@@ -280,6 +280,9 @@ export function serve(opts: ServeOptions): Server<SocketData> {
     },
     websocket: {
       idleTimeout: 120,
+      open() {
+        runtime.stats.connections++;
+      },
       message(ws, raw) {
         let msg: ClientMessage;
         try {
@@ -290,6 +293,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
         void handleMessage(ws, msg);
       },
       close(ws) {
+        runtime.stats.connections--;
         for (const sub of ws.data.subs.values()) sub.unsubscribe();
         ws.data.subs.clear();
       },

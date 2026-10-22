@@ -105,7 +105,7 @@ export const summarize = action({
 });
 ```
 
-Actions have no `ctx.db`: read through `ctx.runQuery` and write through `ctx.runMutation`. Any npm package or `node:*` module works in every kind of function, so no `"use node"` is needed.
+Actions have no `ctx.db`: read through `ctx.runQuery` and write through `ctx.runMutation`. Any npm package or `node:*` module works in every kind of function, so no `"use node"` is needed. Only actions may call `fetch()`; in a query or mutation it throws.
 
 ## Internal functions, scheduling, pagination, HTTP
 

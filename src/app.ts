@@ -10,10 +10,14 @@ import { consoleLogger, Runtime, type Authenticate, type Modules } from "./engin
 import type { SchemaDefinition } from "./schema";
 import type { Crons, HttpRouter } from "./server";
 import { clientBundle } from "./client/bundle.generated";
+import { dashboardAssets } from "./dashboard/bundle.generated";
+import { createAdmin, loadAdminKey } from "./engine/admin";
 
 export const VERSION = "0.1.0";
 
 export type AppOptions = {
+  /** Serve the dashboard at /_admin (default true). */
+  dashboard?: boolean;
   schema: SchemaDefinition<any> | null;
   modules: Modules;
   http?: HttpRouter | null;
@@ -78,6 +82,7 @@ export async function startApp(opts: AppOptions) {
     log: consoleLogger,
   });
   const { created, dropped } = await runtime.init();
+  const adminKey = opts.dashboard === false ? null : loadAdminKey(opts.dataDir);
   const server = serve({
     runtime,
     port: opts.port,
@@ -87,6 +92,7 @@ export async function startApp(opts: AppOptions) {
     cors: opts.cors,
     rateLimit: opts.rateLimit,
     trustProxy: opts.trustProxy,
+    admin: adminKey ? createAdmin({ runtime, key: adminKey.key, assets: dashboardAssets, version: VERSION }) : null,
   });
   const host = opts.hostname === "0.0.0.0" ? "localhost" : opts.hostname;
   runtime.siteUrl = (opts.siteUrl ?? `http://${host}:${server.port}`).replace(/\/$/, "");
@@ -106,6 +112,11 @@ export async function startApp(opts: AppOptions) {
     if (opts.rateLimit) console.log(`  rate limit ${new RateLimiter(opts.rateLimit).describe()} per IP${opts.trustProxy ? " (X-Forwarded-For)" : ""}`);
     console.log(`  http       http://${host}:${server.port}`);
     console.log(`  sync       ws://${host}:${server.port}/api/sync`);
+    if (adminKey) {
+      // In dev the key goes in the link (the #fragment never leaves the browser); otherwise say where it is.
+      const link = `http://${host}:${server.port}/_admin`;
+      console.log(`  dashboard  ${opts.dev ? `${link}#key=${adminKey.key}` : `${link} (admin key: ${adminKey.source})`}`);
+    }
   }
 
   const close = async () => {

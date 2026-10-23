@@ -40,6 +40,11 @@ const modules = {
       args: {},
       handler: async (ctx) => titles(await ctx.db.query("posts").withIndex("by_author", (q) => q.gte("author", "m")).collect()),
     }),
+    recentBy: query({
+      args: { author: v.string(), since: v.number() },
+      handler: async (ctx, { author, since }) =>
+        titles(await ctx.db.query("posts").withIndex("by_author", (q) => q.eq("author", author).gt("_creationTime", since)).collect()),
+    }),
     page: query({
       args: { paginationOpts: paginationOptsValidator },
       handler: (ctx, { paginationOpts }) => ctx.db.query("posts").order("desc").paginate(paginationOpts),
@@ -121,6 +126,22 @@ for (const D of DRIVERS) describe(`${D.name}: precise live query invalidation`, 
     expect(runs[key]).toBe(before);
     await edit(ids[2]!, { title: "p2 edited" });
     expect(titles(value().page)).toEqual(["p3", "p2 edited"]);
+  });
+
+  test("_creationTime can follow an index's equality fields, like in Convex", async () => {
+    const old = await add("old", { author: "zoe" });
+    const since = Date.now();
+    await Bun.sleep(2);
+    await add("new", { author: "zoe" });
+    await add("other author", { author: "ann" });
+    const args = { author: "zoe", since };
+    const value = await watch("posts:recentBy", args);
+    expect(value()).toEqual(["new"]);
+    const key = `posts:recentBy${JSON.stringify(args)}`;
+    await edit(old, { title: "old edited" }); // created before `since`: outside the range
+    expect(runs[key]).toBe(1);
+    await add("newer", { author: "zoe" });
+    expect(value()).toEqual(["new", "newer"]);
   });
 
   test("string ranges stay correct whether or not the database's ordering can be decided in JS", async () => {

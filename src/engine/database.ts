@@ -323,7 +323,8 @@ class QueryImpl {
   }
 
   private checkRange(conds: Cond[]) {
-    const fields = this.indexFields;
+    // Like Convex, every index ends with _creationTime, so it can follow the declared fields.
+    const fields = this.indexFields.at(-1) === "_creationTime" ? this.indexFields : [...this.indexFields, "_creationTime"];
     const where = `index "${this.indexName}" on "${this.table}" (fields: ${fields.join(", ")})`;
     let pos = 0;
     let i = 0;

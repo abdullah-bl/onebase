@@ -124,13 +124,16 @@ export type AnyDataModel = {
   [table: string]: { document: any; indexes: Record<string, string[]>; searchIndexes: Record<string, SearchIndexConfig> };
 };
 
+/** Every index implicitly ends with _creationTime (documents with equal fields are in creation order). */
+type WithCreationTime<I> = { [K in keyof I]: I[K] extends string[] ? [...I[K], "_creationTime"] : I[K] };
+
 export type DataModelFromSchema<S> =
   S extends SchemaDefinition<infer Tables>
     ? {
         [T in keyof Tables & string]: Tables[T] extends TableDefinition<infer D, infer I, infer SI>
           ? {
               document: Expand<D & SystemFields<T>>;
-              indexes: Expand<I & { by_creation_time: ["_creationTime"] }>;
+              indexes: Expand<WithCreationTime<I> & { by_creation_time: ["_creationTime"] }>;
               searchIndexes: Expand<SI>;
             }
           : never;

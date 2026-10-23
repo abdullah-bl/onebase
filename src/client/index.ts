@@ -32,6 +32,8 @@ type Sub = {
   id: number;
   path: string;
   args: unknown;
+  /** Sent on the current connection. */
+  sent: boolean;
   listeners: Set<Watcher>;
   /** What the server last sent. */
   server: QueryResult | null;
@@ -105,6 +107,14 @@ export class OnebaseClient {
   private retryMs = 100;
   private closed = false;
   private fetchToken: TokenFetcher | null = null;
+  /**
+   * False while connecting or fetching a token. Calls and new subscriptions wait meanwhile, so
+   * nothing reaches the server ahead of the auth message and runs as a signed-out user.
+   */
+  private ready = false;
+  /** The current connection has an auth token set on the server. */
+  private authSent = false;
+  private authRun = 0;
   private stateListeners = new Set<(s: ConnectionState) => void>();
   private _state: ConnectionState = "connecting";
   private readonly url: string;
@@ -135,22 +145,17 @@ export class OnebaseClient {
     this.setState("connecting");
     const ws = new this.WS(this.url);
     this.ws = ws;
-    ws.onopen = async () => {
+    ws.onopen = () => {
       this.retryMs = 100;
-      if (this.fetchToken) this.raw({ type: "auth", token: (await this.fetchToken()) ?? null });
-      for (const sub of this.subs.values()) this.raw({ type: "sub", id: sub.id, path: sub.path, args: sub.args });
-      for (const p of this.pending.values()) {
-        if (!p.sent) {
-          this.ws!.send(p.message);
-          p.sent = true;
-        }
-      }
-      this.setState("open");
+      this.authSent = false;
+      for (const sub of this.subs.values()) sub.sent = false;
+      void this.authenticate();
     };
     ws.onmessage = (event) => this.handle(JSON.parse(String(event.data)));
     ws.onclose = () => {
       if (this.ws !== ws) return;
       this.ws = null;
+      this.ready = false;
       // A call that was sent but not answered may or may not have run; don't silently retry it.
       const lost: Pending[] = [];
       for (const [requestId, p] of this.pending) {
@@ -173,6 +178,40 @@ export class OnebaseClient {
 
   private raw(msg: unknown) {
     if (this.ws?.readyState === 1) this.ws.send(JSON.stringify(msg));
+  }
+
+  /**
+   * Sends the current token, then the subscriptions and calls that were waiting for it. Runs on
+   * every (re)connect and on setAuth(); if setAuth() is called again meanwhile, the newer run wins.
+   */
+  private async authenticate() {
+    const run = ++this.authRun;
+    this.ready = false;
+    let token: string | null = null;
+    if (this.fetchToken) {
+      try {
+        token = (await this.fetchToken()) ?? null;
+      } catch (err) {
+        console.warn("onebase: fetching the auth token failed; continuing signed out.", err);
+      }
+    }
+    if (run !== this.authRun || this.ws?.readyState !== 1) return;
+    if (token !== null || this.authSent) this.raw({ type: "auth", token });
+    this.authSent = token !== null;
+    for (const sub of this.subs.values()) {
+      if (!sub.sent) {
+        this.raw({ type: "sub", id: sub.id, path: sub.path, args: sub.args });
+        sub.sent = true;
+      }
+    }
+    for (const p of this.pending.values()) {
+      if (!p.sent) {
+        this.ws.send(p.message);
+        p.sent = true;
+      }
+    }
+    this.ready = true;
+    if (this._state !== "open") this.setState("open");
   }
 
   private handle(msg: any) {
@@ -221,7 +260,8 @@ export class OnebaseClient {
   /** Sets a token (or a function returning one) sent with every request; re-runs subscriptions as that user. */
   setAuth(token: string | TokenFetcher | null) {
     this.fetchToken = token === null ? null : typeof token === "function" ? token : () => token;
-    void (async () => this.raw({ type: "auth", token: this.fetchToken ? ((await this.fetchToken()) ?? null) : null }))();
+    // Not connected yet: the next connection authenticates first anyway.
+    if (this.ws?.readyState === 1) void this.authenticate();
   }
 
   clearAuth() {
@@ -291,10 +331,13 @@ export class OnebaseClient {
     const key = subKey(path, args);
     let sub = this.subs.get(key);
     if (!sub) {
-      sub = { id: this.nextId++, path, args: args ?? {}, listeners: new Set(), server: null, last: null };
+      sub = { id: this.nextId++, path, args: args ?? {}, sent: false, listeners: new Set(), server: null, last: null };
       this.subs.set(key, sub);
       this.subsById.set(sub.id, sub);
-      this.raw({ type: "sub", id: sub.id, path, args: sub.args });
+      if (this.ready) {
+        this.raw({ type: "sub", id: sub.id, path, args: sub.args });
+        sub.sent = true;
+      }
     }
     sub.listeners.add(listener);
     const s = sub;
@@ -305,7 +348,7 @@ export class OnebaseClient {
       if (s.listeners.size === 0) {
         this.subs.delete(key);
         this.subsById.delete(s.id);
-        this.raw({ type: "unsub", id: s.id });
+        if (s.sent) this.raw({ type: "unsub", id: s.id });
       }
     };
   }
@@ -321,7 +364,7 @@ export class OnebaseClient {
     return new Promise((resolve, reject) => {
       const p: Pending = { resolve, reject, message, sent: false, layer };
       this.pending.set(requestId, p);
-      if (this.ws?.readyState === 1) {
+      if (this.ready && this.ws?.readyState === 1) {
         this.ws.send(message);
         p.sent = true;
       }

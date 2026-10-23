@@ -15,6 +15,7 @@ export async function clientTypes() {
   const first: Doc<"messages"> | undefined = messages[0];
   const body: string | undefined = first?.body;
   const likes: number | undefined = first?.likes;
+  const image: Id<"_storage"> | undefined = first?.image;
 
   // @ts-expect-error wrong arg type
   await client.query(api.messages.list, { channel: 123 });
@@ -28,7 +29,7 @@ export async function clientTypes() {
   const id: Id<"channels"> = await client.mutation(api.channels.getOrCreate, { name: "x" });
   // @ts-expect-error ids are table-specific
   const wrong: Id<"messages"> = id;
-  return [body, likes, wrong];
+  return [body, likes, image, wrong];
 }
 
 export const typedDb = query({
@@ -44,6 +45,8 @@ export const typedDb = query({
     ctx.db.query("messages").withIndex("by_author");
     // @ts-expect-error field not in the index
     ctx.db.query("messages").withIndex("by_channel", (q) => q.eq("author", "x"));
+    // Every index ends with _creationTime.
+    ctx.db.query("messages").withIndex("by_channel", (q) => q.eq("channel", args.channel).gt("_creationTime", 0));
     // @ts-expect-error queries can't write
     ctx.db.insert("messages", {});
     const chan = await ctx.db.get(args.channel);

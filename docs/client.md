@@ -90,7 +90,7 @@ function Tasks() {
 | `useQuery(ref, args \| "skip")` | live result; `undefined` while loading; errors throw to the nearest error boundary |
 | `useMutation(ref)` | returns `(args) => Promise` |
 | `useAction(ref)` | returns `(args) => Promise` |
-| `usePaginatedQuery(ref, args, { initialNumItems })` | `{ results, status, isLoading, loadMore(n) }`; every loaded page stays live |
+| `usePaginatedQuery(ref, args, { initialNumItems })` | `{ results, status, isLoading, loadMore(n) }`; every loaded page stays live; errors throw to the nearest error boundary |
 | `useConnectionState()` | `"connecting" \| "open" \| "closed"` |
 
 **Porting from Convex:** the aliases `ConvexProvider` and `ConvexReactClient` are exported too, so code written for Convex works after changing the import path.

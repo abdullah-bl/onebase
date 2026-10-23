@@ -85,10 +85,31 @@ export function useConnectionState() {
 
 type PaginatedItem<Q> = FunctionReturnType<Q> extends { page: (infer T)[] } ? T : never;
 type PaginationStatus = "LoadingFirstPage" | "CanLoadMore" | "LoadingMore" | "Exhausted";
+type PageResult = { page: unknown[]; isDone: boolean; continueCursor: string };
+
+/**
+ * Combines the latest result of each page: the items so far, the status, and the first error
+ * (which usePaginatedQuery throws, like useQuery). Exported for tests.
+ */
+export function combinePages(pageCount: number, results: Record<number, QueryResult>) {
+  const loaded = Array.from({ length: pageCount }, (_, i) => results[i]);
+  const error = loaded.find((r) => r && !r.ok);
+  const pages = loaded.map((r) => (r?.ok ? (r.value as PageResult) : undefined));
+  const last = pages[pages.length - 1];
+  const status: PaginationStatus =
+    pageCount === 0 || !pages[0] ? "LoadingFirstPage" : !last ? "LoadingMore" : last.isDone ? "Exhausted" : "CanLoadMore";
+  return {
+    items: pages.flatMap((p) => p?.page ?? []),
+    status,
+    last,
+    error: error && !error.ok ? error.error : null,
+  };
+}
 
 /**
  * Live paginated list. The query must take `paginationOpts` and return `.paginate(...)`.
  * Each loaded page stays reactive; earlier pages are pinned to their end cursor so pages never overlap.
+ * Errors throw to the nearest error boundary, like useQuery.
  */
 export function usePaginatedQuery<Q extends FunctionReference<"query">>(
   query: Q | string,
@@ -100,7 +121,7 @@ export function usePaginatedQuery<Q extends FunctionReference<"query">>(
   const argsKey = args === "skip" ? "skip" : JSON.stringify(args);
   type Page = { cursor: string | null; numItems: number; endCursor?: string };
   const [pages, setPages] = useState<Page[]>([]);
-  const [results, setResults] = useState<Record<number, { page: unknown[]; isDone: boolean; continueCursor: string }>>({});
+  const [results, setResults] = useState<Record<number, QueryResult>>({});
 
   // Reset when the query or its args change.
   useEffect(() => {
@@ -112,35 +133,32 @@ export function usePaginatedQuery<Q extends FunctionReference<"query">>(
     if (argsKey === "skip") return;
     const base = JSON.parse(argsKey);
     const unsubs = pages.map((p, i) =>
-      client.subscribe(path, { ...base, paginationOpts: { numItems: p.numItems, cursor: p.cursor, endCursor: p.endCursor } }, (r) => {
-        if (!r.ok) return console.error(r.error);
-        setResults((prev) => ({ ...prev, [i]: r.value as any }));
-      }),
+      client.subscribe(path, { ...base, paginationOpts: { numItems: p.numItems, cursor: p.cursor, endCursor: p.endCursor } }, (r) =>
+        setResults((prev) => ({ ...prev, [i]: r })),
+      ),
     );
     return () => unsubs.forEach((u) => u());
   }, [client, path, argsKey, JSON.stringify(pages)]);
 
-  const loaded = pages.map((_, i) => results[i]);
-  const last = loaded[loaded.length - 1];
-  const status: PaginationStatus =
-    pages.length === 0 || !loaded[0] ? "LoadingFirstPage" : !last ? "LoadingMore" : last.isDone ? "Exhausted" : "CanLoadMore";
+  const combined = useMemo(() => combinePages(pages.length, results), [pages, results]);
 
   const loadMore = useCallback(
     (numItems: number) => {
       const lastIndex = pages.length - 1;
-      const lastResult = results[lastIndex];
-      if (!lastResult || lastResult.isDone) return;
+      const last = combined.last;
+      if (!last || last.isDone) return;
       setPages((prev) => [
         ...prev.slice(0, lastIndex),
-        { ...prev[lastIndex]!, endCursor: lastResult.continueCursor },
-        { cursor: lastResult.continueCursor, numItems },
+        { ...prev[lastIndex]!, endCursor: last.continueCursor },
+        { cursor: last.continueCursor, numItems },
       ]);
     },
-    [pages, results],
+    [pages, combined],
   );
 
-  const flat = useMemo(() => loaded.flatMap((r) => (r ? r.page : [])) as PaginatedItem<Q>[], [results, pages]);
-  return { results: flat, status, isLoading: status === "LoadingFirstPage" || status === "LoadingMore", loadMore };
+  if (combined.error) throw combined.error;
+  const { status } = combined;
+  return { results: combined.items as PaginatedItem<Q>[], status, isLoading: status === "LoadingFirstPage" || status === "LoadingMore", loadMore };
 }
 
 /** Aliases so code written for Convex ports by changing the import path. */

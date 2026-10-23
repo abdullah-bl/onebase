@@ -46,6 +46,27 @@ export class SerialQueue {
   }
 }
 
+/** Runs at most `limit` tasks at once; the rest wait in order. */
+class Semaphore {
+  private active = 0;
+  private readonly waiting: (() => void)[] = [];
+
+  constructor(readonly limit: number) {}
+
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.active < this.limit) this.active++;
+    else await new Promise<void>((resolve) => this.waiting.push(resolve));
+    try {
+      return await fn();
+    } finally {
+      // Hand the slot straight to the next waiter, so a new caller can't take it first.
+      const next = this.waiting.shift();
+      if (next) next();
+      else this.active--;
+    }
+  }
+}
+
 /** Runs `fn` in a savepoint: its writes are undone if it throws. Works on every driver. */
 export async function savepoint<T>(tx: Exec, fn: () => Promise<T>): Promise<T> {
   const name = `sp_${newId()}`;
@@ -237,6 +258,21 @@ export class PostgresDriver implements Driver {
 
 const COMMIT_POLL_MS = 200;
 const COMMIT_RETENTION_MS = 60_000;
+// sqld answers HTTP 429 once more than --max-concurrent-requests (128 by default) are in
+// flight, and Turso rate-limits too. An open transaction sends one request at a time, so
+// bursts (say, hundreds of subscriptions running for the first time) queue here instead.
+const MAX_TRANSACTIONS = 32;
+
+/** The server didn't run the transaction (another writer holds the lock, or it's shedding load), so it can be retried. */
+function libsqlRetryable(err: any): boolean {
+  if (/SQLITE_BUSY|database is locked/i.test(String(err?.code ?? err?.message))) return true;
+  // Only the client's own errors: a mutation may throw anything.
+  if (err?.name !== "LibsqlError" && err?.name !== "LibsqlBatchError") return false;
+  for (let e = err, depth = 0; e && depth < 4; e = e.cause, depth++) {
+    if (e.status === 429 || /too many requests/i.test(e.message)) return true;
+  }
+  return false;
+}
 
 /**
  * Remote libSQL (Turso, sqld). Other instances learn about commits by polling a small
@@ -248,6 +284,7 @@ export class LibsqlDriver implements Driver {
   readonly shared = true;
   private client: any;
   private polling: ReturnType<typeof setInterval> | null = null;
+  private readonly open = new Semaphore(MAX_TRANSACTIONS);
 
   constructor(
     private readonly url: string,
@@ -293,15 +330,13 @@ export class LibsqlDriver implements Driver {
     }
   }
 
+  // A retry gives up its slot while it backs off.
   read<T>(fn: (tx: Exec) => Promise<T>): Promise<T> {
-    return this.transaction("read", fn);
+    return retrying(() => this.open.run(() => this.transaction("read", fn)), libsqlRetryable);
   }
 
   write<T>(fn: (tx: Exec) => Promise<T>): Promise<T> {
-    return retrying(
-      () => this.transaction("write", fn),
-      (err: any) => /SQLITE_BUSY|database is locked/i.test(String(err?.code ?? err?.message)),
-    );
+    return retrying(() => this.open.run(() => this.transaction("write", fn)), libsqlRetryable);
   }
 
   async publish(tx: Exec, message: string) {

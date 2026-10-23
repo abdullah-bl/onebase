@@ -31,6 +31,17 @@ export const page = query({
   },
 });
 
+/** Full-text search within a channel, best matches first. Live like any query. */
+export const search = query({
+  args: { channel: v.id("channels"), text: v.string() },
+  handler: async (ctx, { channel, text }) => {
+    return await ctx.db
+      .query("messages")
+      .withSearchIndex("search_body", (q) => q.search("body", text).eq("channel", channel))
+      .take(20);
+  },
+});
+
 export const generateUploadUrl = mutation({
   args: {},
   handler: async (ctx) => await ctx.storage.generateUploadUrl(),

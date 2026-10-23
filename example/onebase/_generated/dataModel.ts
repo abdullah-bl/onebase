@@ -8,5 +8,5 @@ export type DataModel = DataModelFromSchema<typeof schema>;
 export type TableNames = keyof DataModel & string;
 /** A document from `table`, including _id and _creationTime. */
 export type Doc<T extends TableNames> = DataModel[T]["document"];
-/** The id of a document in `table`. */
-export type Id<T extends TableNames> = GenericId<T>;
+/** The id of a document in `table`, or of a stored file (`Id<"_storage">`). */
+export type Id<T extends TableNames | "_storage"> = GenericId<T>;

@@ -15,6 +15,7 @@ export async function clientTypes() {
   const first: Doc<"messages"> | undefined = messages[0];
   const body: string | undefined = first?.body;
   const likes: number | undefined = first?.likes;
+  const image: Id<"_storage"> | undefined = first?.image;
 
   // @ts-expect-error wrong arg type
   await client.query(api.messages.list, { channel: 123 });
@@ -28,7 +29,7 @@ export async function clientTypes() {
   const id: Id<"channels"> = await client.mutation(api.channels.getOrCreate, { name: "x" });
   // @ts-expect-error ids are table-specific
   const wrong: Id<"messages"> = id;
-  return [body, likes, wrong];
+  return [body, likes, image, wrong];
 }
 
 export const typedDb = query({
@@ -44,10 +45,32 @@ export const typedDb = query({
     ctx.db.query("messages").withIndex("by_author");
     // @ts-expect-error field not in the index
     ctx.db.query("messages").withIndex("by_channel", (q) => q.eq("author", "x"));
+    // Every index ends with _creationTime.
+    ctx.db.query("messages").withIndex("by_channel", (q) => q.eq("channel", args.channel).gt("_creationTime", 0));
     // @ts-expect-error queries can't write
     ctx.db.insert("messages", {});
     const chan = await ctx.db.get(args.channel);
     return { count: msgs.length, name: chan?.name };
+  },
+});
+
+export const typedSearch = query({
+  args: { channel: v.id("channels") },
+  handler: async (ctx, args) => {
+    const hits = await ctx.db
+      .query("messages")
+      .withSearchIndex("search_body", (q) => q.search("body", "hello").eq("channel", args.channel))
+      .take(5);
+    const body: string | undefined = hits[0]?.body;
+    // @ts-expect-error unknown search index
+    ctx.db.query("messages").withSearchIndex("by_body", (q) => q.search("body", "x"));
+    // @ts-expect-error not the index's search field
+    ctx.db.query("messages").withSearchIndex("search_body", (q) => q.search("author", "x"));
+    // @ts-expect-error not one of the index's filter fields
+    ctx.db.query("messages").withSearchIndex("search_body", (q) => q.search("body", "x").eq("author", "a"));
+    // @ts-expect-error search results are ordered by relevance
+    ctx.db.query("messages").withSearchIndex("search_body", (q) => q.search("body", "x")).order("desc");
+    return body;
   },
 });
 

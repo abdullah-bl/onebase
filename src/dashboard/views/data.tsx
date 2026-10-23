@@ -3,7 +3,15 @@ import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { call, on } from "../api";
 import { Empty, ago, errorText, fullTime, preview, sample, toast, typeText } from "../ui";
 
-type Table = { name: string; count: number; inSchema: boolean; fields: string[]; validator: any; indexes: { name: string; fields: string[] }[] };
+type Table = {
+  name: string;
+  count: number;
+  inSchema: boolean;
+  fields: string[];
+  validator: any;
+  indexes: { name: string; fields: string[] }[];
+  searchIndexes: { name: string; searchField: string }[];
+};
 type Doc = Record<string, unknown> & { _id: string; _creationTime: number };
 type Page = { page: Doc[]; isDone: boolean; continueCursor: string };
 
@@ -217,7 +225,10 @@ export function DataView({ table: selected, go }: { table?: string; go: (route: 
                   {table.name} <span class={`count ${flash ? "flash" : ""}`}>{table.count.toLocaleString()}</span>
                 </h1>
                 <p class="muted">
-                  {table.inSchema ? `Indexes: ${table.indexes.map((i) => i.name).join(", ")}` : "This table has documents but isn't in schema.ts."}
+                  {table.inSchema
+                    ? `Indexes: ${table.indexes.map((i) => i.name).join(", ")}` +
+                      (table.searchIndexes.length ? ` · Search: ${table.searchIndexes.map((i) => `${i.name} (${i.searchField})`).join(", ")}` : "")
+                    : "This table has documents but isn't in schema.ts."}
                 </p>
               </div>
               <div class="toolbar">

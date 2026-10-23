@@ -6,7 +6,7 @@ A lightweight, Convex-style reactive backend: TypeScript functions, a typed docu
 - **Full Node/npm everywhere:** queries, mutations and actions all run in Bun. There is no `"use node"` split.
 - **Convex-shaped API:** `query`, `mutation`, `action`, `v.*`, `ctx.db`, `api.module.fn`, `useQuery`. Code and LLM knowledge carry over.
 - **Forgiving and explicit:** errors say how to fix the problem, indexes are picked automatically for filters, and `onebase doctor` checks your project.
-- **Batteries included:** scheduler, cron jobs, file storage, JWT auth (Clerk, Auth0, any OIDC), HTTP routes and pagination.
+- **Batteries included:** full-text search, optimistic updates, scheduler, cron jobs, file storage, JWT auth (Clerk, Auth0, any OIDC), HTTP routes and pagination.
 - **Dashboard built in** at `/_admin`: browse and edit data, run functions, live logs, jobs and files.
 - **Your choice of database:** SQLite by default; Postgres or Turso (libSQL) when you need several instances. Files on disk or in S3/R2/MinIO, and SQLite backups to S3.
 - **Single file deploy**, PocketBase style.
@@ -107,7 +107,8 @@ Send `Authorization: Bearer <token>` for auth. Tokens are checked by the provide
 - **Storage:** all documents live in one `documents` table (JSON in SQLite, `jsonb` in Postgres). Each schema index becomes a partial expression index, so the database's planner chooses indexes for both `withIndex` and `filter`.
 - **Drivers:** the engine talks to a small async driver interface (`read`, `write`, `publish`, `subscribe`) with SQLite (`bun:sqlite`), Postgres (`Bun.SQL`) and libSQL implementations. The same tests run against all three.
 - **Transactions:** mutations from one process run one at a time in a serializable transaction. Queries read a consistent snapshot (a separate WAL reader on SQLite; `REPEATABLE READ` on Postgres).
-- **Reactivity:** each query records the documents and equality ranges it read (for example `messages where channel = X`). After a commit, only subscriptions whose reads overlap the writes re-run. Identical subscriptions share one execution, and results are pushed only when they change.
+- **Reactivity:** each query records the documents, equality ranges, index bounds and the slice of rows it read (for example `messages where channel = X`, the latest 50). After a commit, only subscriptions whose reads overlap the writes re-run. Identical subscriptions share one execution, and results are pushed only when they change.
+- **Search:** SQLite and Turso keep an FTS5 table per search index; Postgres uses a GIN `tsvector` index on the documents table.
 - **Scheduler and crons:** jobs and cron schedules are stored in SQLite, so they survive restarts. Scheduled mutations run exactly once.
 - **Files:** stored on disk in `<data>/files`, with metadata in SQLite. Deletes inside a mutation only take effect if it commits.
 - **Auth:** JWTs are verified with WebCrypto (RS256/384/512, PS256, ES256/384, EdDSA). Keys come from OIDC discovery or a JWKS URL, are cached, and are refetched when they rotate.

@@ -43,6 +43,7 @@ onebase follows [Convex](https://convex.dev)'s programming model and API, and ma
 | [Schema](./schema.md) | Tables, validators, indexes, and checks on every write |
 | [Functions](./functions.md) | Queries, mutations, actions and internal functions, with argument validation |
 | [Database](./database.md) | `ctx.db`, indexes, filters, ordering and pagination |
+| [Search](./search.md) | Full-text search indexes, live like any query |
 | [Live queries](./client.md) | WebSocket subscriptions that update only when relevant data changes |
 | [Scheduling](./scheduling.md) | `runAfter` / `runAt`, plus cron jobs that survive restarts |
 | [File storage](./file-storage.md) | Uploads and downloads, on local disk or in S3 / R2 / MinIO |
@@ -54,6 +55,6 @@ onebase follows [Convex](https://convex.dev)'s programming model and API, and ma
 
 ## When to use something else
 
-onebase is a young project. Use Convex if you want a managed service, search and vector indexes, and a team supporting it. Use onebase if you want to own the whole stack, run it on a small VPS or your own hardware, or need full Node.js in every function.
+onebase is a young project. Use Convex if you want a managed service, vector search, and a team supporting it. Use onebase if you want to own the whole stack, run it on a small VPS or your own hardware, or need full Node.js in every function.
 
 Next: [Quick start](./getting-started.md).

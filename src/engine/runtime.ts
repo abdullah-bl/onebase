@@ -468,7 +468,11 @@ export class Runtime {
   async runMutation(
     ref: FunctionLike,
     args: unknown,
-    opts: CallOptions & { inTransaction?: (tx: Exec) => Promise<unknown> } = {},
+    opts: CallOptions & {
+      inTransaction?: (tx: Exec) => Promise<unknown>;
+      /** Called just before the transaction commits (again if it's retried). */
+      beforeCommit?: () => void;
+    } = {},
   ): Promise<unknown> {
     const { name, fn } = this.resolve(ref, "mutation", opts.allowInternal ?? false);
     return this.calls.track(name, "mutation", opts.source ?? "function", () =>
@@ -476,7 +480,7 @@ export class Runtime {
         const value = await this.invoke(name, fn, this.mutationCtx(state, opts.identity ?? null), args);
         await opts.inTransaction?.(state.tx);
         return value;
-      }),
+      }, opts.beforeCommit),
     );
   }
 
@@ -484,7 +488,7 @@ export class Runtime {
    * Runs `body` in a write transaction with everything a mutation gets: commit broadcast,
    * post-commit hooks, scheduler wake-up and live-query invalidation.
    */
-  private async transact<T>(body: (state: TxState) => Promise<T>): Promise<T> {
+  private async transact<T>(body: (state: TxState) => Promise<T>, beforeCommit?: () => void): Promise<T> {
     const { value, writes, scheduled, afterCommit } = await this.mutations.run(() =>
       // The driver may run this more than once if another instance conflicts; each attempt starts fresh.
       this.driver.write(async (tx) => {
@@ -494,6 +498,7 @@ export class Runtime {
         if (this.driver.shared && this.driver.publish && (state.writes.length || state.scheduled)) {
           await this.driver.publish(tx, this.broadcastMessage(state));
         }
+        beforeCommit?.();
         return { value, writes: state.writes, scheduled: state.scheduled, afterCommit: state.afterCommit };
       }),
     );

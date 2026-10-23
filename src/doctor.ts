@@ -5,7 +5,8 @@ import { relative, resolve } from "node:path";
 import { staleGeneratedFiles } from "./codegen";
 import { listSourceFiles, loadProject, modulePathFor, type Project } from "./project";
 import { isRegisteredFunction } from "./server";
-import type { AnyValidator } from "./values";
+import type { SearchIndexDef } from "./schema";
+import { describeValidator, type AnyValidator } from "./values";
 
 export type Finding = { level: "error" | "warn"; where: string; message: string; fix?: string };
 
@@ -16,6 +17,10 @@ function collectIds(val: AnyValidator | undefined, out: string[]) {
   if (val.values) collectIds(val.values, out);
   for (const m of val.members ?? []) collectIds(m, out);
   for (const f of Object.values(val.fields ?? {})) collectIds(f, out);
+}
+
+function acceptsString(val: AnyValidator): boolean {
+  return val.kind === "string" || val.kind === "any" || (val.kind === "union" && val.members!.some(acceptsString));
 }
 
 function checkSchema(project: Project, findings: Finding[]) {
@@ -51,6 +56,22 @@ function checkSchema(project: Project, findings: Finding[]) {
             fix: `Known fields: ${fields.join(", ")}`,
           });
         }
+      }
+    }
+    for (const index of (def.searchIndexes ?? []) as SearchIndexDef[]) {
+      const where = `schema.ts › ${table}.searchIndex("${index.name}")`;
+      for (const field of [index.searchField, ...index.filterFields]) {
+        if (fields && !fields.includes(field.split(".")[0]!)) {
+          findings.push({ level: "error", where, message: `Field "${field}" doesn't exist on "${table}".`, fix: `Known fields: ${fields.join(", ")}` });
+        }
+      }
+      const searched: AnyValidator | undefined = def.validator.fields?.[index.searchField];
+      if (searched && !acceptsString(searched)) {
+        findings.push({
+          level: "error",
+          where,
+          message: `searchField "${index.searchField}" is ${describeValidator(searched)}; only string fields can be searched.`,
+        });
       }
     }
     const refs: string[] = [];
@@ -108,7 +129,27 @@ function checkFunctions(project: Project, findings: Finding[]) {
   }
 }
 
-const SOURCE_RULES: { pattern: RegExp; message: string; fix: string; level: "error" | "warn" }[] = [
+/**
+ * Is the `.filter(` at `column` of `lines[i]` called on a database query rather than an array?
+ * Follows a method chain back over lines that start with "." and looks for `.query(` with no
+ * array-producing call (`.collect()`, `.take()`, …) between it and the filter.
+ */
+function filtersQuery(lines: string[], i: number, column: number): boolean {
+  let start = i;
+  while (start > 0 && i - start < 10 && /^\s*\./.test(lines[start]!)) start--;
+  const before = [...lines.slice(start, i), lines[i]!.slice(0, column)].join("\n");
+  const q = before.lastIndexOf(".query(");
+  return q !== -1 && !/\.(collect|take|first|unique|paginate)\(/.test(before.slice(q));
+}
+
+const SOURCE_RULES: {
+  pattern: RegExp;
+  message: string;
+  fix: string;
+  level: "error" | "warn";
+  /** Extra check on a match, for rules a regex alone can't decide. */
+  applies?: (lines: string[], i: number, match: RegExpExecArray) => boolean;
+}[] = [
   {
     pattern: /from\s+["']convex\/(server|values)["']/,
     message: "Imports from the convex package instead of onebase.",
@@ -126,6 +167,8 @@ const SOURCE_RULES: { pattern: RegExp; message: string; fix: string; level: "err
     message: ".filter() on a query gets a filter builder, not a document.",
     fix: 'Write .filter(q => q.eq(q.field("x"), value)) or .filter({ x: value }).',
     level: "error",
+    // Array .filter() takes a document callback, as usual.
+    applies: (lines, i, match) => filtersQuery(lines, i, match.index),
   },
 ];
 
@@ -134,7 +177,8 @@ function checkSources(dir: string, files: string[], findings: Finding[]) {
     const lines = readFileSync(file, "utf8").split("\n");
     lines.forEach((line, i) => {
       for (const rule of SOURCE_RULES) {
-        if (rule.pattern.test(line)) {
+        const match = rule.pattern.exec(line);
+        if (match && (!rule.applies || rule.applies(lines, i, match))) {
           findings.push({ level: rule.level, where: `${modulePathFor(dir, file)}.ts:${i + 1}`, message: rule.message, fix: rule.fix });
         }
       }

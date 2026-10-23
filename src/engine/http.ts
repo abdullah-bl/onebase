@@ -80,6 +80,10 @@ type SocketData = {
   identity: UserIdentity | null;
   ready: Promise<void>;
   subs: Map<number, { path: string; args: unknown; unsubscribe: () => void }>;
+  /** This client's mutations that have committed but haven't been answered yet. */
+  committed: Set<number>;
+  /** Query updates and results held back meanwhile, then sent together as one transition. */
+  held: { updates: unknown[]; results: Map<number, unknown> };
 };
 
 const CORS_BASE = {
@@ -133,21 +137,41 @@ export function serve(opts: ServeOptions): Server<SocketData> {
     if (ws.readyState === 1) ws.send(JSON.stringify(msg));
   };
 
+  /**
+   * Query updates wait while one of this client's mutations is between commit and reply. The
+   * client then gets the updates and the result in one message and can drop the mutation's
+   * optimistic update at exactly the moment the real data arrives.
+   */
+  const pushUpdate = (ws: ServerWebSocket<SocketData>, msg: unknown) => {
+    if (ws.data.committed.size) ws.data.held.updates.push(msg);
+    else send(ws, msg);
+  };
+
+  const reply = (ws: ServerWebSocket<SocketData>, msg: { requestId: number }) => {
+    const d = ws.data;
+    if (!d.committed.has(msg.requestId)) return send(ws, msg);
+    d.held.results.set(msg.requestId, msg);
+    if (d.held.results.size < d.committed.size) return; // another mutation of theirs committed and is still finishing
+    send(ws, { type: "transition", updates: d.held.updates, results: [...d.held.results.values()] });
+    d.committed.clear();
+    d.held = { updates: [], results: new Map() };
+  };
+
   const subscribe = (ws: ServerWebSocket<SocketData>, id: number, path: string, args: unknown, counted = true) => {
     ws.data.subs.get(id)?.unsubscribe();
     const limit = counted ? limited(ws.data.ip) : null;
     if (limit) {
       ws.data.subs.set(id, { path, args, unsubscribe: () => {} });
-      return send(ws, { type: "update", id, ok: false, error: limit.message });
+      return pushUpdate(ws, { type: "update", id, ok: false, error: limit.message });
     }
     try {
       const { name } = runtime.resolve(path, "query", false);
-      const unsubscribe = subscriptions.subscribe(name, args, ws.data.identity, (update) => send(ws, { type: "update", id, ...update }));
+      const unsubscribe = subscriptions.subscribe(name, args, ws.data.identity, (update) => pushUpdate(ws, { type: "update", id, ...update }));
       ws.data.subs.set(id, { path, args, unsubscribe });
     } catch (err) {
       const e = runtime.toClientError(err);
       ws.data.subs.set(id, { path, args, unsubscribe: () => {} });
-      send(ws, { type: "update", id, ok: false, error: e.message, data: e.data });
+      pushUpdate(ws, { type: "update", id, ok: false, error: e.message, data: e.data });
     }
   };
 
@@ -182,13 +206,13 @@ export function serve(opts: ServeOptions): Server<SocketData> {
           msg.kind === "query"
             ? (await runtime.runQuery(msg.path, msg.args, opts)).value
             : msg.kind === "mutation"
-              ? await runtime.runMutation(msg.path, msg.args, opts)
+              ? await runtime.runMutation(msg.path, msg.args, { ...opts, beforeCommit: () => ws.data.committed.add(msg.requestId) })
               : await runtime.runAction(msg.path, msg.args, opts);
-        send(ws, { type: "result", requestId: msg.requestId, ok: true, value });
+        reply(ws, { type: "result", requestId: msg.requestId, ok: true, value } as any);
       } catch (err) {
         runtime.log.error(`${msg.path}: ${err instanceof Error ? err.message : String(err)}`);
         const e = runtime.toClientError(err, msg.path);
-        send(ws, { type: "result", requestId: msg.requestId, ok: false, error: e.message, data: e.data });
+        reply(ws, { type: "result", requestId: msg.requestId, ok: false, error: e.message, data: e.data } as any);
       }
     }
   };
@@ -228,7 +252,14 @@ export function serve(opts: ServeOptions): Server<SocketData> {
 
       if (path === "/api/sync") {
         if (!originAllowed(req)) return new Response("Origin not allowed", { status: 403 });
-        const data: SocketData = { ip: clientIp(req, server), identity: null, ready: Promise.resolve(), subs: new Map() };
+        const data: SocketData = {
+          ip: clientIp(req, server),
+          identity: null,
+          ready: Promise.resolve(),
+          subs: new Map(),
+          committed: new Set(),
+          held: { updates: [], results: new Map() },
+        };
         if (server.upgrade(req, { data })) return undefined;
         return new Response("Expected a WebSocket upgrade", { status: 400 });
       }

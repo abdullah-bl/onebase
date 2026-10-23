@@ -150,7 +150,16 @@ export class SqliteDriver implements Driver {
   }
 
   async explain(tx: Exec, sql: string, params: unknown[]) {
-    return (await tx.all(`EXPLAIN QUERY PLAN ${sql}`, params)).map((r) => String(r.detail));
+    // Not through tx.all(): a cached (never finalized) EXPLAIN statement pins the
+    // reader connection's WAL snapshot in bun:sqlite, so later reads never see new commits.
+    // Either connection yields the same plan.
+    const db = this.reader.inTransaction ? this.reader : this.writer;
+    const stmt = db.prepare(`EXPLAIN QUERY PLAN ${sql}`);
+    try {
+      return (stmt.all(...(params as any[])) as Row[]).map((r) => String(r.detail));
+    } finally {
+      stmt.finalize();
+    }
   }
 
   async close() {

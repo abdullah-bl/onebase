@@ -17,6 +17,7 @@ type Overview = {
   totals: { calls: number; errors: number };
   tables: { name: string; count: number; inSchema: boolean }[];
   schema: boolean;
+  signIn: string[];
 };
 
 const WINDOW = 60;
@@ -172,6 +173,7 @@ export function OverviewView({ go }: { go: (route: string) => void }) {
           <dt>Database</dt><dd><code>{data.driver.description}</code> ({data.driver.kind})</dd>
           <dt>Files</dt><dd><code>{data.files.backend}</code></dd>
           <dt>Schema</dt><dd>{data.schema ? "schema.ts, validated on every write" : "none (any document is accepted)"}</dd>
+          <dt>Sign-in</dt><dd>{data.signIn.length ? data.signIn.join(", ") : "not built in (tokens from auth.config.ts providers, if any)"}</dd>
           <dt>Scheduler</dt><dd>{data.jobs.pending ?? 0} pending · {data.jobs.failed ?? 0} failed · {data.crons} crons</dd>
         </dl>
       </div>

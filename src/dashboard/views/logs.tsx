@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { call, on, type CallRecord } from "../api";
 import { Badge, Empty, clockTime, duration, errorText } from "../ui";
 
-const SOURCES = ["client", "http", "subscription", "scheduler", "cron", "function", "dashboard"];
+const SOURCES = ["client", "http", "subscription", "scheduler", "cron", "function", "dashboard", "auth"];
 
 export function LogsView() {
   const [records, setRecords] = useState<CallRecord[]>([]);

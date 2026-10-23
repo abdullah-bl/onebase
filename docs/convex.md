@@ -15,6 +15,7 @@ onebase uses Convex's programming model and most of its API. If you know Convex,
 - `ctx.scheduler.runAfter / runAt / cancel`, `cronJobs()`
 - `ctx.storage.generateUploadUrl / getUrl / delete / store / get`, `v.id("_storage")`
 - `ctx.auth.getUserIdentity()` and the `auth.config.ts` provider format
+- Built-in sign-in shaped like Convex Auth: `authTables`, `getAuthUserId`, `signIn("password" | "github" | …)`, `signOut()`, `useAuthActions()`, `<Authenticated>` (configured in `auth.config.ts` instead of a separate package)
 - `httpRouter` / `httpAction`
 - `api` / `internal` references, `ConvexError`
 - `.searchIndex()` and `withSearchIndex(...)` full-text search

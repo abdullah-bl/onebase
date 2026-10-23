@@ -17,6 +17,7 @@
     ".": "./src/server.ts",
     "./server": "./src/server.ts",
     "./values": "./src/values.ts",
+    "./auth": "./src/auth.ts",
     "./browser": "./src/client/index.ts",
     "./react": "./src/client/react.ts"
   },

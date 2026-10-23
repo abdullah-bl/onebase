@@ -1,7 +1,8 @@
 // JWT verification for auth.config.ts providers (Clerk, Auth0, WorkOS, any OIDC issuer, or custom JWKS).
 // Uses WebCrypto only; no dependencies.
 
-import type { UserIdentity } from "../server";
+import type { AuthMethod } from "../auth";
+import type { DatabaseReader, UserIdentity } from "../server";
 import { OnebaseError } from "./database";
 
 /** Same shape as Convex: `{ domain, applicationID }` for OIDC issuers. */
@@ -180,23 +181,37 @@ export function identityFromClaims(claims: Claims & { sub: string }): UserIdenti
   return identity;
 }
 
+/** What a custom authenticate(token, ctx) can use: read-only database access. */
+export type AuthenticateCtx = { db: DatabaseReader<any> };
+
 export type AuthConfig = {
+  /** Built-in sign-in: password(), github(), google(), oidc(), oauth() from "onebase/auth". */
+  methods?: AuthMethod[];
+  /** Where OAuth sign-in may return to besides the site itself: origins or URL prefixes. */
+  redirects?: string[];
+  /** Days a session lasts without being used (default 30). */
+  sessionDays?: number;
+  /** External JWT issuers (Clerk, Auth0, WorkOS, any OIDC provider). */
   providers?: AuthProvider[];
-  /** Custom verification for anything else (API keys, sessions...). Return null for anonymous. */
-  authenticate?: (token: string) => Promise<UserIdentity | null> | UserIdentity | null;
+  /** Custom verification for anything else (API keys, your own tokens). Return null for anonymous. */
+  authenticate?: (token: string, ctx: AuthenticateCtx) => Promise<UserIdentity | null> | UserIdentity | null;
 };
 
-/** Turns auth.config.ts into one authenticate(token) function. */
-export function createAuthenticate(config: AuthConfig) {
+export type TokenVerifier = (token: string, ctx: AuthenticateCtx) => Promise<UserIdentity | null>;
+
+/** Turns auth.config.ts providers and authenticate() into one verifier; null when it has neither. */
+export function createAuthenticate(config: AuthConfig): TokenVerifier | null {
   const verifier = config?.providers?.length ? new JwtVerifier(config.providers) : null;
   const custom = typeof config?.authenticate === "function" ? config.authenticate : null;
   if (!verifier && !custom) {
+    if (config?.methods?.length) return null;
     throw new Error(
-      "auth.config.ts must export default { providers: [{ domain, applicationID }] } and/or { authenticate: async (token) => identity | null }.",
+      "auth.config.ts must export default { methods: [password(), ...] }, { providers: [{ domain, applicationID }] } " +
+        "and/or { authenticate: async (token, ctx) => identity | null }.",
     );
   }
-  return async (token: string): Promise<UserIdentity | null> => {
+  return async (token, ctx) => {
     if (verifier && (verifier.handles(token) || !custom)) return verifier.verify(token);
-    return (await custom!(token)) ?? null;
+    return (await custom!(token, ctx)) ?? null;
   };
 }

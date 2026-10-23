@@ -66,6 +66,21 @@ type TokenFetcher = () => Promise<string | null | undefined> | string | null | u
 export type ClientOptions = {
   /** Provide for environments without a global WebSocket. */
   webSocketConstructor?: typeof WebSocket;
+  /**
+   * Where built-in auth keeps the session token: localStorage in browsers by default. Pass null
+   * to keep it in memory only, or any object with getItem / setItem / removeItem.
+   */
+  authStorage?: AuthStorage | null;
+};
+
+export type AuthStorage = { getItem(key: string): string | null; setItem(key: string, value: string): void; removeItem(key: string): void };
+
+export type AuthState = {
+  /** True until the server has confirmed (or rejected) the current token. */
+  isLoading: boolean;
+  isAuthenticated: boolean;
+  /** Why the last sign-in failed, e.g. when an OAuth provider sends the browser back with an error. */
+  error: string | null;
 };
 
 export type ConnectionState = "connecting" | "open" | "closed";
@@ -88,6 +103,23 @@ function toError(msg: { error: string; data?: unknown }): Error {
 }
 
 const browserLocation = (globalThis as { location?: { href: string; origin: string } }).location;
+
+function httpUrl(address: string): string {
+  const url = new URL(address, browserLocation?.href);
+  return url.origin + url.pathname.replace(/\/$/, "");
+}
+
+const base64url = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const randomString = () => base64url(crypto.getRandomValues(new Uint8Array(32)));
+const sha256 = async (text: string) => base64url(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text))));
+
+function defaultStorage(): AuthStorage | null {
+  try {
+    return (globalThis as { localStorage?: AuthStorage }).localStorage ?? null;
+  } catch {
+    return null; // e.g. blocked by the browser
+  }
+}
 
 function syncUrl(address: string): string {
   const url = new URL(address, browserLocation?.href);
@@ -115,6 +147,18 @@ export class OnebaseClient {
   /** The current connection has an auth token set on the server. */
   private authSent = false;
   private authRun = 0;
+  /** Built-in auth: the session token, and the fetcher setAuth() gets while it's in use. */
+  private sessionToken: string | null = null;
+  private readonly sessionFetcher: TokenFetcher = () => this.sessionToken;
+  private readonly httpUrl: string;
+  private readonly storage: AuthStorage | null;
+  private readonly storageKey: string;
+  private _authState: AuthState = { isLoading: false, isAuthenticated: false, error: null };
+  private authListeners = new Set<(state: AuthState) => void>();
+  /** Auth messages sent but not yet answered; only the answer to the latest one counts. */
+  private authAcks = 0;
+  /** An OAuth redirect's code is being exchanged for a session. */
+  private exchanging = false;
   private stateListeners = new Set<(s: ConnectionState) => void>();
   private _state: ConnectionState = "connecting";
   private readonly url: string;
@@ -122,7 +166,17 @@ export class OnebaseClient {
 
   constructor(address: string = browserLocation?.origin ?? "", opts: ClientOptions = {}) {
     this.url = syncUrl(address);
+    this.httpUrl = httpUrl(address);
     this.WS = opts.webSocketConstructor ?? WebSocket;
+    this.storage = opts.authStorage !== undefined ? opts.authStorage : defaultStorage();
+    this.storageKey = `onebase:auth:${this.httpUrl}`;
+    const saved = this.readStorage(this.storageKey);
+    if (saved) {
+      this.sessionToken = saved;
+      this.fetchToken = this.sessionFetcher;
+      this._authState = { isLoading: true, isAuthenticated: false, error: null };
+    }
+    void this.completeRedirect();
     this.connect();
   }
 
@@ -196,8 +250,15 @@ export class OnebaseClient {
       }
     }
     if (run !== this.authRun || this.ws?.readyState !== 1) return;
-    if (token !== null || this.authSent) this.raw({ type: "auth", token });
+    if (token !== null || this.authSent) {
+      this.authAcks++;
+      this.raw({ type: "auth", token });
+    }
     this.authSent = token !== null;
+    // Signed out right away; a new token is "loading" until the server confirms it (unless
+    // already signed in, e.g. a refreshed token on reconnect, so the UI doesn't flash).
+    if (token === null) this.updateAuth({ isLoading: this.exchanging, isAuthenticated: false });
+    else if (!this._authState.isAuthenticated) this.updateAuth({ isLoading: true });
     for (const sub of this.subs.values()) {
       if (!sub.sent) {
         this.raw({ type: "sub", id: sub.id, path: sub.path, args: sub.args });
@@ -218,7 +279,143 @@ export class OnebaseClient {
     if (msg.type === "update") this.apply([msg], []);
     else if (msg.type === "result") this.apply([], [msg]);
     else if (msg.type === "transition") this.apply(msg.updates, msg.results);
-    else if (msg.type === "auth" && !msg.ok) console.warn(`onebase auth failed: ${msg.error}`);
+    else if (msg.type === "auth") this.onAuthAnswer(msg);
+  }
+
+  private onAuthAnswer(msg: { ok: boolean; identity?: unknown; error?: string }) {
+    if (this.authAcks > 0) this.authAcks--;
+    if (this.authAcks > 0) return; // a newer token is on its way
+    if (msg.ok) return this.updateAuth({ isLoading: false, isAuthenticated: Boolean(msg.identity), error: null });
+    // Rejected, or signed out from elsewhere. A built-in session that ended is forgotten.
+    if (this.fetchToken === this.sessionFetcher) {
+      this.forgetSession();
+      this.fetchToken = null;
+      this.authSent = false;
+    } else {
+      console.warn(`onebase auth failed: ${msg.error}`);
+    }
+    this.updateAuth({ isLoading: false, isAuthenticated: false });
+  }
+
+  // ---- Built-in auth ----
+
+  /** Signed in or not, and whether that's still being checked. */
+  get authState(): AuthState {
+    return this._authState;
+  }
+
+  onAuthChange(listener: (state: AuthState) => void): () => void {
+    this.authListeners.add(listener);
+    return () => this.authListeners.delete(listener);
+  }
+
+  private updateAuth(change: Partial<AuthState>) {
+    const next = { ...this._authState, ...change };
+    const prev = this._authState;
+    if (next.isLoading === prev.isLoading && next.isAuthenticated === prev.isAuthenticated && next.error === prev.error) return;
+    this._authState = next;
+    for (const l of this.authListeners) l(next);
+  }
+
+  /**
+   * Signs in with a built-in method. Resolves `{ signingIn: true }` once signed in, or
+   * `{ signingIn: false }` when the next step happens elsewhere (an emailed code, an OAuth page).
+   * - Password: `signIn("password", { flow: "signUp" | "signIn", email, password })`.
+   * - Codes: `flow: "reset"` with `email`, then `"reset-verification"` with `email, code, newPassword`;
+   *   `"email-verification"` with `email, code` after signing up with verifyEmail.
+   * - OAuth: `signIn("github")` sends the browser to the provider and back to this page
+   *   (or `redirectTo`); the client then finishes signing in on its own.
+   */
+  async signIn(provider: string, params: Record<string, unknown> = {}): Promise<{ signingIn: boolean; redirect?: string }> {
+    const { redirectTo, ...rest } = params;
+    const verifier = randomString();
+    // OAuth binds the sign-in to this browser with a verifier; WebCrypto needs a secure context.
+    const challenge = globalThis.crypto?.subtle ? await sha256(verifier) : undefined;
+    const res = await this.authRequest("signin", { provider, params: rest, redirectTo: redirectTo ?? browserLocation?.href, challenge });
+    if (res.redirect) {
+      this.writeStorage(`${this.storageKey}:verifier`, verifier);
+      (globalThis as { location?: { assign(url: string): void } }).location?.assign(res.redirect);
+      return { signingIn: false, redirect: res.redirect };
+    }
+    if (!res.token) return { signingIn: false }; // a code was emailed
+    this.useSession(res.token);
+    return { signingIn: true };
+  }
+
+  /** Ends the built-in session on the server and signs this client out. */
+  async signOut(): Promise<void> {
+    const token = this.sessionToken;
+    this.forgetSession();
+    this.setAuth(null);
+    this.updateAuth({ isLoading: false, isAuthenticated: false, error: null });
+    if (token) await this.authRequest("signout", {}, token).catch(() => {});
+  }
+
+  private useSession(token: string) {
+    this.sessionToken = token;
+    this.writeStorage(this.storageKey, token);
+    if (!this._authState.isAuthenticated) this.updateAuth({ isLoading: true, error: null });
+    this.setAuth(this.sessionFetcher);
+  }
+
+  private forgetSession() {
+    this.sessionToken = null;
+    this.removeStorage(this.storageKey);
+  }
+
+  /** Finishes an OAuth sign-in when the provider sends the browser back with ?onebase_code=… */
+  private async completeRedirect() {
+    if (!browserLocation) return;
+    const url = new URL(browserLocation.href);
+    const code = url.searchParams.get("onebase_code");
+    const error = url.searchParams.get("auth_error");
+    if (!code && !error) return;
+    url.searchParams.delete("onebase_code");
+    url.searchParams.delete("auth_error");
+    (globalThis as { history?: { replaceState(data: unknown, unused: string, url: string): void } }).history?.replaceState(null, "", url.toString());
+    if (!code) return this.updateAuth({ error });
+    this.exchanging = true;
+    this.updateAuth({ isLoading: true, error: null });
+    try {
+      const verifier = this.readStorage(`${this.storageKey}:verifier`);
+      this.removeStorage(`${this.storageKey}:verifier`);
+      this.useSession((await this.authRequest("signin", { code, verifier })).token);
+    } catch (err) {
+      this.updateAuth({ isLoading: false, isAuthenticated: false, error: err instanceof Error ? err.message : String(err) });
+    } finally {
+      this.exchanging = false;
+    }
+  }
+
+  private async authRequest(path: string, body: unknown, token?: string): Promise<any> {
+    const res = await fetch(`${this.httpUrl}/api/auth/${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify(body),
+    });
+    const data = (await res.json().catch(() => ({}))) as { error?: string; errorMessage?: string };
+    if (!res.ok) throw new Error(data.error ?? data.errorMessage ?? `Sign-in failed (HTTP ${res.status}).`);
+    return data;
+  }
+
+  private readStorage(key: string): string | null {
+    try {
+      return this.storage?.getItem(key) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  private writeStorage(key: string, value: string) {
+    try {
+      this.storage?.setItem(key, value);
+    } catch {}
+  }
+
+  private removeStorage(key: string) {
+    try {
+      this.storage?.removeItem(key);
+    } catch {}
   }
 
   /**

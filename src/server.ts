@@ -24,6 +24,7 @@ import {
 export { anyApi, getFunctionName } from "./api";
 export type { FunctionArgs, FunctionReference, FunctionReturnType } from "./api";
 export { defineSchema, defineTable } from "./schema";
+import { defineTable } from "./schema";
 export type { DataModelFromSchema } from "./schema";
 export { ConvexError, v } from "./values";
 export type { GenericId, Infer } from "./values";
@@ -177,6 +178,25 @@ export type UserIdentity = {
 
 export interface Auth {
   getUserIdentity(): Promise<UserIdentity | null>;
+}
+
+/**
+ * Tables for built-in auth: `defineSchema({ ...authTables, ... })`. To add your own user fields,
+ * define `users` yourself and keep these fields (they must stay optional).
+ */
+export const authTables = {
+  users: defineTable({
+    name: v.optional(v.string()),
+    email: v.optional(v.string()),
+    image: v.optional(v.string()),
+    emailVerificationTime: v.optional(v.number()),
+  }).index("email", ["email"]),
+};
+
+/** The signed-in user's id in the users table (built-in auth), or null if signed out or signed in another way. */
+export async function getAuthUserId(ctx: { auth: Auth }): Promise<GenericId<"users"> | null> {
+  const identity = await ctx.auth.getUserIdentity();
+  return identity?.tokenIdentifier.startsWith("onebase|") ? (identity.subject as GenericId<"users">) : null;
 }
 
 type Call<T extends FunctionType> = <F extends FunctionReference<T, any>>(

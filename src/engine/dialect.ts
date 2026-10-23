@@ -65,6 +65,16 @@ function sqliteEncode(value: unknown): unknown {
   return value;
 }
 
+/** System tables for built-in auth (credentials, sessions, one-time codes, failed attempts). */
+const authDdl = (time: string) => [
+  `CREATE TABLE IF NOT EXISTS _auth_accounts (provider TEXT NOT NULL, account_id TEXT NOT NULL, user_id TEXT NOT NULL, secret TEXT, created ${time} NOT NULL, PRIMARY KEY (provider, account_id))`,
+  "CREATE INDEX IF NOT EXISTS _auth_accounts_user ON _auth_accounts(user_id)",
+  `CREATE TABLE IF NOT EXISTS _auth_sessions (id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, user_id TEXT NOT NULL, created ${time} NOT NULL, expires ${time} NOT NULL, last_used ${time} NOT NULL)`,
+  "CREATE INDEX IF NOT EXISTS _auth_sessions_user ON _auth_sessions(user_id)",
+  `CREATE TABLE IF NOT EXISTS _auth_codes (code_hash TEXT PRIMARY KEY, kind TEXT NOT NULL, data TEXT NOT NULL, expires ${time} NOT NULL)`,
+  `CREATE TABLE IF NOT EXISTS _auth_attempts (key TEXT PRIMARY KEY, count INTEGER NOT NULL, window_start ${time} NOT NULL)`,
+];
+
 const sign = (n: number) => (n < 0 ? -1 : n > 0 ? 1 : 0);
 
 /** Compares by Unicode code point, which matches SQLite's binary collation on UTF-8 text. */
@@ -142,6 +152,7 @@ export const sqliteDialect: Dialect = {
     "CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
     // Integer row ids for FTS5 tables (documents has text ids).
     "CREATE TABLE IF NOT EXISTS _search_ids (rid INTEGER PRIMARY KEY, doc_id TEXT NOT NULL UNIQUE)",
+    ...authDdl("REAL"),
   ],
   createIndex: (name, table, columns) =>
     `CREATE INDEX "${name}" ON documents(${columns.join(", ")}) WHERE tbl = ${tableLiteral(table)}`,
@@ -211,6 +222,7 @@ export const postgresDialect: Dialect = {
     "CREATE TABLE IF NOT EXISTS _storage (id TEXT PRIMARY KEY, ct DOUBLE PRECISION NOT NULL, sha256 TEXT NOT NULL, size BIGINT NOT NULL, content_type TEXT)",
     "CREATE TABLE IF NOT EXISTS _upload_tokens (token TEXT PRIMARY KEY, expires DOUBLE PRECISION NOT NULL)",
     "CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    ...authDdl("DOUBLE PRECISION"),
   ],
   createIndex: (name, table, columns) =>
     `CREATE INDEX "${name}" ON documents(${columns.join(", ")}) WHERE tbl = ${tableLiteral(table)}`,

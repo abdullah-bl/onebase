@@ -5,7 +5,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { createDriver, type Driver } from "../src/engine/driver";
 import { Runtime } from "../src/engine/runtime";
 import { SubscriptionManager } from "../src/engine/sync";
-import { cronJobs, defineSchema, defineTable, internalMutation, mutation, query } from "../src/server";
+import { password } from "../src/auth";
+import { authTables, cronJobs, defineSchema, defineTable, internalMutation, mutation, query } from "../src/server";
 import { v } from "../src/values";
 
 const schema = defineSchema({
@@ -106,6 +107,23 @@ for (const [name, url] of URLS) {
       const ticks = (await a.runQuery("ticks:count", {})).value as number;
       expect(ticks).toBeGreaterThanOrEqual(2);
       expect(ticks).toBeLessThanOrEqual(3);
+    });
+
+    test("a sign-out on one instance reaches connections on the others", async () => {
+      const authed = async () => {
+        const driver = createDriver(url);
+        const runtime = new Runtime({ driver, schema: defineSchema({ ...authTables }), modules: {}, log: quiet, auth: { methods: [password()] } });
+        await runtime.init();
+        open.push({ runtime, driver });
+        return runtime;
+      };
+      const a = await authed();
+      const b = await authed();
+      const revoked: string[] = [];
+      b.onSessionsRevoked((ids) => revoked.push(...ids));
+      await a.authWrite(async ({ revoke }) => revoke(["session-1"]));
+      for (let i = 0; i < 20 && !revoked.length; i++) await Bun.sleep(50);
+      expect(revoked).toEqual(["session-1"]);
     });
   });
 }

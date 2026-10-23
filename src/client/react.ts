@@ -1,6 +1,6 @@
 // React bindings (imported as "onebase/react"). Same hook names as convex/react.
 
-import { createContext, createElement, useCallback, useContext, useEffect, useMemo, useState, useSyncExternalStore, type ReactNode } from "react";
+import { createContext, createElement, Fragment, useCallback, useContext, useEffect, useMemo, useState, useSyncExternalStore, type ReactNode } from "react";
 import type { FunctionArgs, FunctionReference, FunctionReturnType, OptionalRestArgs } from "../api";
 import { getFunctionName } from "../api";
 import { OnebaseClient, type OptimisticUpdate, type QueryResult } from "./index";
@@ -161,5 +161,40 @@ export function usePaginatedQuery<Q extends FunctionReference<"query">>(
   return { results: combined.items as PaginatedItem<Q>[], status, isLoading: status === "LoadingFirstPage" || status === "LoadingMore", loadMore };
 }
 
+// ---- Auth ----
+
+/** Signed in or not: `{ isLoading, isAuthenticated, error }`. Works with built-in auth and setAuth() tokens. */
+export function useOnebaseAuth() {
+  const client = useOnebase();
+  return useSyncExternalStore(
+    (cb) => client.onAuthChange(cb),
+    () => client.authState,
+    () => client.authState,
+  );
+}
+
+/** `signIn(method, params)` and `signOut()` for built-in auth. */
+export function useAuthActions() {
+  const client = useOnebase();
+  return useMemo(() => ({ signIn: client.signIn.bind(client), signOut: client.signOut.bind(client) }), [client]);
+}
+
+/** Renders its children only when signed in. */
+export function Authenticated(props: { children?: ReactNode }) {
+  const { isLoading, isAuthenticated } = useOnebaseAuth();
+  return !isLoading && isAuthenticated ? createElement(Fragment, null, props.children) : null;
+}
+
+/** Renders its children only when signed out. */
+export function Unauthenticated(props: { children?: ReactNode }) {
+  const { isLoading, isAuthenticated } = useOnebaseAuth();
+  return !isLoading && !isAuthenticated ? createElement(Fragment, null, props.children) : null;
+}
+
+/** Renders its children while the auth state is being checked. */
+export function AuthLoading(props: { children?: ReactNode }) {
+  return useOnebaseAuth().isLoading ? createElement(Fragment, null, props.children) : null;
+}
+
 /** Aliases so code written for Convex ports by changing the import path. */
-export { OnebaseProvider as ConvexProvider, OnebaseClient as ConvexReactClient };
+export { OnebaseProvider as ConvexProvider, OnebaseClient as ConvexReactClient, useOnebaseAuth as useConvexAuth };

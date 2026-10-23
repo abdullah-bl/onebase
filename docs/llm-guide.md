@@ -159,19 +159,38 @@ Files are kept in `<data>/files`, or in S3 with `--files s3://bucket/prefix`. Se
 
 ## Auth
 
+Built-in sign-in (like Convex Auth): spread `authTables` into the schema and list methods in `auth.config.ts`.
+
 ```ts
-// onebase/auth.config.ts. Same provider format as Convex: works with Clerk, Auth0, WorkOS, any OIDC issuer.
+// onebase/schema.ts
+import { authTables, defineSchema } from "onebase/server";
+export default defineSchema({ ...authTables, /* your tables */ });
+
+// onebase/auth.config.ts
+import { github, google, password } from "onebase/auth";
 export default {
-  providers: [
-    { domain: "https://your-app.clerk.accounts.dev", applicationID: "onebase" },
-    // Without OIDC discovery: { type: "customJwt", issuer: "https://...", jwks: "https://.../jwks.json", algorithm: "RS256" },
-  ],
-  // Optional, for anything that isn't a JWT from those issuers (API keys, sessions...):
-  // authenticate: async (token) => ({ subject: "...", tokenIdentifier: "..." }) or null,
+  methods: [password(), github(), google()], // OAuth credentials from $AUTH_GITHUB_ID / $AUTH_GITHUB_SECRET etc.
+  redirects: ["https://app.example.com"],    // where OAuth may return to, besides --url and --cors origins
 };
 ```
 
-On the client: `client.setAuth(async () => await getToken())`. In functions, `await ctx.auth.getUserIdentity()` returns `{ subject, tokenIdentifier, email, name, ... }` or `null`. Token problems (expired, wrong audience, unknown issuer) come back as clear errors.
+- Client: `signIn("password", { flow: "signUp" | "signIn", email, password })`, `signIn("github")`, `signOut()`. React: `useAuthActions()`, `useOnebaseAuth()` (`{ isLoading, isAuthenticated }`), `<Authenticated>`, `<Unauthenticated>`, `<AuthLoading>`.
+- Functions: `const userId = await getAuthUserId(ctx)` (from `onebase/server`) returns `Id<"users"> | null`. Users are normal documents in `users`.
+- Password reset and email verification: `password({ sendCode: async ({ email, code, purpose }) => { /* email it */ }, verifyEmail: true })`. Flows: `"reset"` (email) → `"reset-verification"` (email, code, newPassword); with verifyEmail, `signUp` resolves `{ signingIn: false }` and `"email-verification"` (email, code) signs in.
+
+External providers use the Convex format, and `authenticate` checks any other token with read access to the database:
+
+```ts
+export default {
+  providers: [{ domain: "https://your-app.clerk.accounts.dev", applicationID: "onebase" }],
+  authenticate: async (token, ctx) => {
+    const key = await ctx.db.query("apiKeys").withIndex("by_key", (q) => q.eq("key", token)).unique();
+    return key ? { subject: key.owner, tokenIdentifier: `apikey|${key._id}` } : null;
+  },
+};
+```
+
+With providers, the client calls `client.setAuth(async () => await getToken())`. In functions, `await ctx.auth.getUserIdentity()` returns `{ subject, tokenIdentifier, email, name, ... }` or `null`.
 
 ## Client
 

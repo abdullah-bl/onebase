@@ -345,7 +345,11 @@ export class LibsqlDriver implements Driver {
 
   async subscribe(onMessage: (message: string) => void) {
     const seen = new Map<string, number>();
-    let since = Date.now() - 1000;
+    const rows = this.exec(this.client);
+    let since = Date.now();
+    // Commits already in the log are older than anything this instance will read, so don't replay them.
+    const existing = await rows.all("SELECT id, at FROM _commits WHERE at > ?", [since - 5000]).catch(() => []);
+    for (const r of existing) seen.set(r.id, r.at);
     let busy = false;
     const poll = async () => {
       if (busy) return;
@@ -353,7 +357,6 @@ export class LibsqlDriver implements Driver {
       try {
         const now = Date.now();
         // Look back a few seconds: a slow transaction can commit after newer ones.
-        const rows = this.exec(this.client);
         const fresh = await rows.all("SELECT id, at, payload FROM _commits WHERE at > ? ORDER BY at", [since - 5000]);
         for (const r of fresh) {
           if (seen.has(r.id)) continue;

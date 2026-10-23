@@ -17,6 +17,8 @@ onebase uses Convex's programming model and most of its API. If you know Convex,
 - `ctx.auth.getUserIdentity()` and the `auth.config.ts` provider format
 - `httpRouter` / `httpAction`
 - `api` / `internal` references, `ConvexError`
+- `.searchIndex()` and `withSearchIndex(...)` full-text search
+- Optimistic updates: `useMutation(ref).withOptimisticUpdate(...)` and `client.mutation(ref, args, { optimisticUpdate })`
 - React: `useQuery`, `useMutation`, `useAction`, `usePaginatedQuery`, plus the `ConvexProvider` / `ConvexReactClient` aliases
 
 ## What's different
@@ -30,7 +32,8 @@ onebase uses Convex's programming model and most of its API. If you know Convex,
 | Mutations | Optimistic concurrency | Serial per process; serializable across instances |
 | Imports | `convex/server`, `convex/values` | `onebase/server`, `onebase/values` (builders still come from `./_generated/server`) |
 | Functions folder | `convex/` | `onebase/` (a `convex/` folder also works) |
-| Search & vector indexes | ✓ | Not yet |
+| Full-text search | ✓ | ✓ (`searchIndex`, `withSearchIndex`) |
+| Vector search | ✓ | Not yet |
 | Dashboard | ✓ | ✓ (built in, at `/_admin`) |
 
 ## Porting a project

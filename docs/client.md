@@ -95,6 +95,37 @@ function Tasks() {
 
 **Porting from Convex:** the aliases `ConvexProvider` and `ConvexReactClient` are exported too, so code written for Convex works after changing the import path.
 
+## Optimistic updates
+
+An optimistic update shows a mutation's expected effect immediately, before the server replies. When the mutation finishes, the server's real result takes its place. If the mutation fails, the update is undone.
+
+```tsx
+const like = useMutation(api.posts.like).withOptimisticUpdate((store, { id }) => {
+  const posts = store.getQuery(api.posts.list, {});
+  if (posts !== undefined) {
+    store.setQuery(api.posts.list, {}, posts.map((p) => (p._id === id ? { ...p, likes: p.likes + 1 } : p)));
+  }
+});
+```
+
+Without React, pass it as an option:
+
+```js
+await client.mutation(api.posts.like, { id }, { optimisticUpdate: (store, { id }) => { /* same as above */ } });
+```
+
+The `store` covers the queries this client is subscribed to:
+
+| | |
+|---|---|
+| `store.getQuery(ref, args)` | current result, or `undefined` if not subscribed or loading |
+| `store.getAllQueries(ref)` | `[{ args, value }]` for every subscribed instance of the query |
+| `store.setQuery(ref, args, value)` | replaces the result until the mutation finishes; `undefined` shows it as loading |
+
+- **Don't modify results in place.** Build new arrays and objects, as above.
+- **It may run more than once:** first when you call the mutation, then again on top of each new server result that arrives while the mutation is in flight. Keep it a pure function of `store` and `args`.
+- **No flicker:** the server sends a mutation's result together with the query updates that include its writes, and the client applies them in one step.
+
 ## Authentication
 
 ```ts

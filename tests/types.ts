@@ -51,6 +51,26 @@ export const typedDb = query({
   },
 });
 
+export const typedSearch = query({
+  args: { channel: v.id("channels") },
+  handler: async (ctx, args) => {
+    const hits = await ctx.db
+      .query("messages")
+      .withSearchIndex("search_body", (q) => q.search("body", "hello").eq("channel", args.channel))
+      .take(5);
+    const body: string | undefined = hits[0]?.body;
+    // @ts-expect-error unknown search index
+    ctx.db.query("messages").withSearchIndex("by_body", (q) => q.search("body", "x"));
+    // @ts-expect-error not the index's search field
+    ctx.db.query("messages").withSearchIndex("search_body", (q) => q.search("author", "x"));
+    // @ts-expect-error not one of the index's filter fields
+    ctx.db.query("messages").withSearchIndex("search_body", (q) => q.search("body", "x").eq("author", "a"));
+    // @ts-expect-error search results are ordered by relevance
+    ctx.db.query("messages").withSearchIndex("search_body", (q) => q.search("body", "x")).order("desc");
+    return body;
+  },
+});
+
 export function ReactTypes() {
   const msgs = useQuery(api.messages.list, { channel });
   const skipped = useQuery(api.messages.list, "skip");

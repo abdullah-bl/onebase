@@ -66,6 +66,7 @@ export const byAuthor = query({
 - `.filter` takes `q => q.eq(q.field("published"), true)` **or** the shorthand `{ published: true }`. It does **not** take a document callback. For arbitrary JS logic, use `(await query.collect()).filter(doc => ...)`.
 - You don't have to use `withIndex`: if an index exists for the fields you filter on, it is used automatically. In dev mode a warning tells you when a filter scans the whole table, and which index to add.
 - In `withIndex`, call `.eq()` on index fields in order, then at most one lower bound (`gt`/`gte`) and one upper bound (`lt`/`lte`) on the next field.
+- Full-text search: declare `.searchIndex("search_title", { searchField: "title", filterFields: ["author"] })` on the table, then `ctx.db.query("posts").withSearchIndex("search_title", (q) => q.search("title", text).eq("author", author)).take(10)`. Results are best match first (no `.order()`), at most 1024; any word matches and the last word also matches as a prefix.
 
 ## Mutations (transactional writes)
 
@@ -186,12 +187,21 @@ await client.mutation(api.posts.publish, { id });
 
 `useQuery` returns `undefined` while loading. Pass `"skip"` as the args to not subscribe.
 
+Optimistic updates show a mutation's effect before the server replies, and are replaced by the real result when it arrives:
+
+```ts
+const like = useMutation(api.posts.like).withOptimisticUpdate((store, { id }) => {
+  const posts = store.getQuery(api.posts.list, {});
+  if (posts) store.setQuery(api.posts.list, {}, posts.map((p) => (p._id === id ? { ...p, likes: p.likes + 1 } : p)));
+});
+```
+
 ## Differences from Convex
 
 - Functions run in Bun, on SQLite by default, or on Postgres or Turso with `--db`. Any npm package works anywhere, and there is no `"use node"`.
 - Mutations run one at a time; reads use a consistent snapshot.
 - `.filter` also accepts an object shorthand, and indexes are picked automatically for filters.
 - `auth.config.ts` can also export a custom `authenticate(token)`.
-- Not supported yet: search and vector indexes, `ctx.db.system`.
+- Not supported yet: vector indexes, `ctx.db.system`.
 
 Run `onebase doctor` after changes: it checks the schema, indexes, imports and common mistakes, and prints the fix for each.

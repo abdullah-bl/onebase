@@ -1,6 +1,8 @@
 // SQL differences between SQLite/libSQL and Postgres. Every query is written with `?`
 // placeholders; the Postgres driver renumbers them to $1, $2...
 
+import type { Exec } from "./driver";
+
 export const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
 export const FIELD_PATH = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/;
 
@@ -31,6 +33,16 @@ export interface Dialect {
   /** Schema for system tables. */
   ddl: string[];
   createIndex(name: string, table: string, columns: string[]): string;
+  /** Drops an index made by createIndex() or searchIndex(). */
+  dropIndex(name: string): string;
+  /** Statements that create a search index and fill it from existing documents; `def` changes when they do. */
+  searchIndex(name: string, table: string, field: string): { def: string; create: string[] };
+  /** SQL for a search query: what to select from, the match condition and the relevance order. */
+  searchSql(name: string, field: string): { from: string; match: string; rank: string; rankTakesQuery: boolean };
+  /** Search terms in the database's query syntax: any term matches, the last one also as a prefix. */
+  searchQuery(terms: string[]): string;
+  /** Updates search indexes after a document write (SQLite keeps them in separate FTS5 tables). */
+  syncSearch?(tx: Exec, docId: string, entries: { name: string; text: string | null }[]): Promise<void>;
 }
 
 export function checkPath(path: string): string {
@@ -128,9 +140,41 @@ export const sqliteDialect: Dialect = {
     "CREATE TABLE IF NOT EXISTS _storage (id TEXT PRIMARY KEY, ct REAL NOT NULL, sha256 TEXT NOT NULL, size INTEGER NOT NULL, content_type TEXT)",
     "CREATE TABLE IF NOT EXISTS _upload_tokens (token TEXT PRIMARY KEY, expires REAL NOT NULL)",
     "CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    // Integer row ids for FTS5 tables (documents has text ids).
+    "CREATE TABLE IF NOT EXISTS _search_ids (rid INTEGER PRIMARY KEY, doc_id TEXT NOT NULL UNIQUE)",
   ],
   createIndex: (name, table, columns) =>
     `CREATE INDEX "${name}" ON documents(${columns.join(", ")}) WHERE tbl = ${tableLiteral(table)}`,
+  dropIndex: (name) => (name.startsWith("sx_") ? `DROP TABLE IF EXISTS "${name}"` : `DROP INDEX IF EXISTS "${name}"`),
+  searchIndex: (name, table, field) => {
+    const path = `'$.${checkPath(field)}'`;
+    const tbl = tableLiteral(table);
+    const create = [
+      `CREATE VIRTUAL TABLE "${name}" USING fts5(text, tokenize = 'unicode61 remove_diacritics 2')`,
+      `INSERT OR IGNORE INTO _search_ids (doc_id) SELECT id FROM documents WHERE tbl = ${tbl} AND json_type(doc, ${path}) = 'text'`,
+      `INSERT INTO "${name}" (rowid, text) SELECT s.rid, json_extract(d.doc, ${path}) FROM documents d ` +
+        `JOIN _search_ids s ON s.doc_id = d.id WHERE d.tbl = ${tbl} AND json_type(d.doc, ${path}) = 'text'`,
+    ];
+    return { def: create.join(";\n"), create };
+  },
+  searchSql: (name) => ({
+    from: `"${name}" JOIN _search_ids ON _search_ids.rid = "${name}".rowid JOIN documents ON documents.id = _search_ids.doc_id`,
+    match: `"${name}" MATCH ?`,
+    rank: `"${name}".rank`, // bm25: lower is better
+    rankTakesQuery: false,
+  }),
+  searchQuery: (terms) => terms.map((t, i) => `"${t}"${i === terms.length - 1 ? "*" : ""}`).join(" OR "),
+  async syncSearch(tx, docId, entries) {
+    const row = await tx.get("SELECT rid FROM _search_ids WHERE doc_id = ?", [docId]);
+    const indexed = entries.some((e) => e.text !== null);
+    if (!row && !indexed) return;
+    const rid = row?.rid ?? (await tx.get("INSERT INTO _search_ids (doc_id) VALUES (?) RETURNING rid", [docId]))!.rid;
+    for (const e of entries) {
+      if (row) await tx.run(`DELETE FROM "${e.name}" WHERE rowid = ?`, [rid]);
+      if (e.text !== null) await tx.run(`INSERT INTO "${e.name}" (rowid, text) VALUES (?, ?)`, [rid, e.text]);
+    }
+    if (!indexed) await tx.run("DELETE FROM _search_ids WHERE rid = ?", [rid]);
+  },
 };
 
 const pgPath = (path: string) =>
@@ -139,6 +183,10 @@ const pgPath = (path: string) =>
     .split(".")
     .map((p) => ` -> '${p}'`)
     .join("");
+
+/** Must match between the index and queries, character for character, for the index to be used. */
+const pgSearchVector = (field: string) =>
+  `to_tsvector('simple'::regconfig, coalesce(doc #>> '{${checkPath(field).split(".").join(",")}}', ''))`;
 
 export const postgresDialect: Dialect = {
   name: "postgres",
@@ -166,6 +214,19 @@ export const postgresDialect: Dialect = {
   ],
   createIndex: (name, table, columns) =>
     `CREATE INDEX "${name}" ON documents(${columns.join(", ")}) WHERE tbl = ${tableLiteral(table)}`,
+  dropIndex: (name) => `DROP INDEX IF EXISTS "${name}"`,
+  // An expression index over the documents table itself, so writes need no extra work.
+  searchIndex: (name, table, field) => {
+    const def = `CREATE INDEX "${name}" ON documents USING GIN (${pgSearchVector(field)}) WHERE tbl = ${tableLiteral(table)}`;
+    return { def, create: [def] };
+  },
+  searchSql: (_name, field) => ({
+    from: "documents",
+    match: `${pgSearchVector(field)} @@ to_tsquery('simple'::regconfig, ?)`,
+    rank: `ts_rank(${pgSearchVector(field)}, to_tsquery('simple'::regconfig, ?)) DESC`,
+    rankTakesQuery: true,
+  }),
+  searchQuery: (terms) => terms.map((t, i) => (i === terms.length - 1 ? `${t}:*` : t)).join(" | "),
 };
 
 const ID_ALPHABET = "0123456789abcdefghjkmnpqrstvwxyz";

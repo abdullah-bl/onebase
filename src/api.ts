@@ -28,6 +28,11 @@ export type OptionalRestArgs<F> = keyof FunctionArgs<F> extends never
   ? [args?: FunctionArgs<F>]
   : [args: FunctionArgs<F>];
 
+/** Arguments followed by an options object; `{}` args stay optional. */
+export type ArgsAndOptions<F, Options> = keyof FunctionArgs<F> extends never
+  ? [args?: FunctionArgs<F>, options?: Options]
+  : [args: FunctionArgs<F>, options?: Options];
+
 /** Anything that names a function: a reference from `api` or a "module:export" string. */
 export type FunctionLike = FunctionReference | string;
 

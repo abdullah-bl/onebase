@@ -3,7 +3,7 @@
 import { createContext, createElement, useCallback, useContext, useEffect, useMemo, useState, useSyncExternalStore, type ReactNode } from "react";
 import type { FunctionArgs, FunctionReference, FunctionReturnType, OptionalRestArgs } from "../api";
 import { getFunctionName } from "../api";
-import { OnebaseClient, type QueryResult } from "./index";
+import { OnebaseClient, type OptimisticUpdate, type QueryResult } from "./index";
 
 export * from "./index";
 
@@ -33,7 +33,7 @@ export function useQuery<Q extends FunctionReference<"query">>(
   const argsKey = skip ? "skip" : JSON.stringify(a ?? {});
 
   const subscribe = useCallback(
-    (onChange: () => void) => (skip ? () => {} : client.subscribe(path, JSON.parse(argsKey), onChange)),
+    (onChange: () => void) => (skip ? () => {} : client.watch(path, JSON.parse(argsKey), onChange)),
     [client, path, argsKey, skip],
   );
   const getSnapshot = useCallback(
@@ -46,12 +46,25 @@ export function useQuery<Q extends FunctionReference<"query">>(
   return result.value as FunctionReturnType<Q>;
 }
 
-export function useMutation<M extends FunctionReference<"mutation">>(mutation: M | string) {
+/** A mutation function from useMutation(); `.withOptimisticUpdate()` returns one that updates queries right away. */
+export type ReactMutation<M extends FunctionReference<"mutation">> = {
+  (...args: OptionalRestArgs<M>): Promise<FunctionReturnType<M>>;
+  withOptimisticUpdate(update: OptimisticUpdate<FunctionArgs<M>>): ReactMutation<M>;
+};
+
+function reactMutation<M extends FunctionReference<"mutation">>(client: OnebaseClient, name: string, update?: OptimisticUpdate<any>): ReactMutation<M> {
+  const run = ((...args: any[]) => client.mutation(name, args[0], update ? { optimisticUpdate: update } : undefined)) as ReactMutation<M>;
+  run.withOptimisticUpdate = (next) => {
+    if (update) throw new Error(`This mutation already has an optimistic update; combine them into one function.`);
+    return reactMutation<M>(client, name, next);
+  };
+  return run;
+}
+
+export function useMutation<M extends FunctionReference<"mutation">>(mutation: M | string): ReactMutation<M> {
   const client = useOnebase();
-  return useCallback(
-    (...args: OptionalRestArgs<M>): Promise<FunctionReturnType<M>> => client.mutation(mutation as any, ...(args as [any])) as any,
-    [client, getFunctionName(mutation)],
-  );
+  const name = getFunctionName(mutation);
+  return useMemo(() => reactMutation<M>(client, name), [client, name]);
 }
 
 export function useAction<A extends FunctionReference<"action">>(action: A | string) {

@@ -5,7 +5,8 @@ import { relative, resolve } from "node:path";
 import { staleGeneratedFiles } from "./codegen";
 import { listSourceFiles, loadProject, modulePathFor, type Project } from "./project";
 import { isRegisteredFunction } from "./server";
-import type { AnyValidator } from "./values";
+import type { SearchIndexDef } from "./schema";
+import { describeValidator, type AnyValidator } from "./values";
 
 export type Finding = { level: "error" | "warn"; where: string; message: string; fix?: string };
 
@@ -16,6 +17,10 @@ function collectIds(val: AnyValidator | undefined, out: string[]) {
   if (val.values) collectIds(val.values, out);
   for (const m of val.members ?? []) collectIds(m, out);
   for (const f of Object.values(val.fields ?? {})) collectIds(f, out);
+}
+
+function acceptsString(val: AnyValidator): boolean {
+  return val.kind === "string" || val.kind === "any" || (val.kind === "union" && val.members!.some(acceptsString));
 }
 
 function checkSchema(project: Project, findings: Finding[]) {
@@ -51,6 +56,22 @@ function checkSchema(project: Project, findings: Finding[]) {
             fix: `Known fields: ${fields.join(", ")}`,
           });
         }
+      }
+    }
+    for (const index of (def.searchIndexes ?? []) as SearchIndexDef[]) {
+      const where = `schema.ts › ${table}.searchIndex("${index.name}")`;
+      for (const field of [index.searchField, ...index.filterFields]) {
+        if (fields && !fields.includes(field.split(".")[0]!)) {
+          findings.push({ level: "error", where, message: `Field "${field}" doesn't exist on "${table}".`, fix: `Known fields: ${fields.join(", ")}` });
+        }
+      }
+      const searched: AnyValidator | undefined = def.validator.fields?.[index.searchField];
+      if (searched && !acceptsString(searched)) {
+        findings.push({
+          level: "error",
+          where,
+          message: `searchField "${index.searchField}" is ${describeValidator(searched)}; only string fields can be searched.`,
+        });
       }
     }
     const refs: string[] = [];

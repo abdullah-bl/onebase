@@ -73,6 +73,7 @@ export function createAdmin(opts: { runtime: Runtime; key: string; assets: Dashb
         fields: def?.validator?.kind === "object" ? Object.keys(def.validator.fields) : [],
         validator: def?.validator ?? null,
         indexes: [{ name: "by_creation_time", fields: ["_creationTime"] }, ...(def?.indexes ?? [])],
+        searchIndexes: def?.searchIndexes ?? [],
       };
     });
   };

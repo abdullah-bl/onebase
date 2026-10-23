@@ -67,6 +67,26 @@ defineTable({ ... }).index("by_author_published", ["author", "published"])
 - **Changes:** indexes are created and dropped automatically at startup when `schema.ts` changes.
 - **Nested fields:** use dots, e.g. `["profile.country"]`.
 
+## Search indexes
+
+```ts
+defineTable({ ... }).searchIndex("search_body", { searchField: "body", filterFields: ["channel"] })
+```
+
+Full-text search over one string field. See [Search](./search.md).
+
+## Changing a schema
+
+When `schema.ts` changes, onebase checks every stored document against it at startup, like a Convex deploy. If some don't match, the server refuses to start and lists them:
+
+```
+schema.ts doesn't match 2 existing documents:
+  - people k57… : document.age is required (expected v.number())
+  - people k9a… : document.age is required (expected v.number())
+```
+
+Either make the schema accept the data (`v.optional(...)`, `v.union(...)`), or fix the data: start with `{ schemaValidation: false }`, update the documents in a mutation or the [dashboard](./dashboard.md), then turn validation back on. The check runs only when the schema changes.
+
 ## Validation errors
 
 A bad write fails with a message that lists every problem:

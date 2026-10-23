@@ -77,6 +77,8 @@ The callback receives a filter builder, not a document. For logic the builder ca
 const posts = (await ctx.db.query("posts").collect()).filter((p) => p.title.includes("onebase"));
 ```
 
+For full-text search, use `.withSearchIndex(...)` instead of `.withIndex(...)`. See [Search](./search.md).
+
 ## Pagination
 
 ```ts

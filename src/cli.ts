@@ -7,13 +7,15 @@ import { parseArgs } from "node:util";
 import { directoryAssets, embeddedAssets, startApp, VERSION } from "./app";
 import { backupNow, listBackups, restore } from "./backup";
 import { codegen } from "./codegen";
+import { deploy } from "./deploy";
 import { doctor, printFindings } from "./doctor";
 import { SqliteDriver } from "./engine/driver";
 import { LocalBlobs } from "./engine/files";
 import { parseRateLimit } from "./engine/http";
 import type { AuthConfig } from "./engine/jwt";
 import type { Modules } from "./engine/runtime";
-import { listSourceFiles, loadProject, modulePathFor } from "./project";
+import { loadEnv, withoutBunEnv } from "./env";
+import { loadProject, projectEntry, type Project } from "./project";
 import type { SchemaDefinition } from "./schema";
 import type { Crons, HttpRouter } from "./server";
 
@@ -32,6 +34,7 @@ const HELP = `onebase v${VERSION}: a lightweight, Convex-style reactive backend
 Usage:
   onebase serve    Run the server
   onebase dev      Run the server, regenerate types and restart on changes
+  onebase deploy   Push functions (and ./public) to a running server, with no restart
   onebase codegen  Write <dir>/_generated (typed api, server, dataModel)
   onebase doctor   Check schema and functions for common mistakes
   onebase build    Compile functions + frontend into one executable (from source)
@@ -39,66 +42,115 @@ Usage:
   onebase backups  List snapshots in --backup
   onebase restore  Restore the newest snapshot (or --at <time>) into --data
 
-Options:
-  --dir <path>      Functions directory (default: ./onebase; a ported ./convex folder also works)
-  --data <path>     Data directory (default: ./onebase_data)
-  --public <path>   Static frontend directory (default: ./public if it exists)
+Options (each $NAME can also come from a .env file):
+  --dir <path>      Functions directory (default: ./onebase, or $ONEBASE_DIR; a ported ./convex folder also works)
+  --data <path>     Data directory (default: ./onebase_data, or $ONEBASE_DATA)
+  --public <path>   Static frontend directory (default: ./public if it exists, or $ONEBASE_PUBLIC)
   --port <n>        Port (default: 8090, or $PORT)
-  --host <addr>     Bind address (default: 0.0.0.0)
+  --host <addr>     Bind address (default: 0.0.0.0, or $ONEBASE_HOST)
   --url <url>       Public URL, used for file URLs (default: http://localhost:<port>, or $ONEBASE_URL)
+                    deploy: the server to push to ($ONEBASE_DEPLOY_URL)
   --db <url>        Database: SQLite path (default <data>/db.sqlite), postgres://… or
                     libsql://… / https://… for Turso ($ONEBASE_DB, $DATABASE_URL)
   --files <s3url>   Keep uploaded files in S3/R2/MinIO: s3://bucket/prefix ($ONEBASE_FILES)
   --backup <s3url>  Back up SQLite to s3://bucket/prefix ($ONEBASE_BACKUP)
-  --backup-every <d>  Backup interval, e.g. 15m, 1h, 1d (default: 1h)
-  --backup-keep <n>   Snapshots to keep (default: 24)
+  --backup-every <d>  Backup interval, e.g. 15m, 1h, 1d (default: 1h, or $ONEBASE_BACKUP_EVERY)
+  --backup-keep <n>   Snapshots to keep (default: 24, or $ONEBASE_BACKUP_KEEP)
   --cors <origins>  Browser origins allowed to call the API, comma-separated (default: any; $ONEBASE_CORS)
   --rate-limit <r>  Per-IP limit on function calls, e.g. 100/10s or 600/m (default: off; $ONEBASE_RATE_LIMIT)
-  --trust-proxy     Take the client IP from X-Forwarded-For (when behind a reverse proxy)
+  --trust-proxy     Take the client IP from X-Forwarded-For (when behind a reverse proxy; $ONEBASE_TRUST_PROXY=1)
   --at <time>       restore: snapshot to use, e.g. 20261022T0300 (default: newest)
   --force           restore: overwrite an existing database
-  --no-dashboard    Don't serve the dashboard at /_admin ($ONEBASE_DASHBOARD=off)
+  --no-dashboard    Don't serve the dashboard or admin API at /_admin, which also turns off deploys ($ONEBASE_DASHBOARD=off)
+  --no-deploy       Refuse onebase deploy and run the local code, not what was pushed ($ONEBASE_DEPLOY=off)
+  --dry-run         deploy: check the code against the server's data without changing anything
+  --rollback        deploy: go back to the previous deployment
+  --env-file <path> Read this .env file instead of the defaults (repeatable)
   --out <file>      Output file for build (default: ./app)
   --target <t>      Build target, e.g. bun-linux-x64, bun-linux-arm64, bun-darwin-arm64, bun-windows-x64
+
+.env files: onebase dev reads .env, .env.local, .env.development and .env.development.local;
+other commands read .env, .env.local, .env.production and .env.production.local. Later files win,
+and real environment variables win over all of them.
+
+deploy authenticates with $ONEBASE_DEPLOY_KEY: the server's admin key ($ONEBASE_ADMIN_KEY there,
+or the contents of its onebase_data/admin.key).
 
 S3 credentials come from S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_ENDPOINT, S3_REGION
 (or the AWS_* equivalents), or as ?endpoint=…&region=… on the s3:// URL.
 Turso tokens come from ?authToken=… or $TURSO_AUTH_TOKEN.
 `;
 
+/** Compiled binaries are built without bun's own .env loading; from source, bun has already done it. */
+const COMPILED = Bun.main.includes("$bunfs") || Bun.main.includes("~BUN");
+
+const enabled = (value: string | undefined) => value !== undefined && ["1", "true", "yes", "on"].includes(value.toLowerCase());
+
+/** Flags, then .env files, then environment variables, then defaults. */
 function options(argv: string[]) {
   const { values, positionals } = parseArgs({
     args: argv,
     allowPositionals: true,
     options: {
       dir: { type: "string" },
-      data: { type: "string", default: "./onebase_data" },
+      data: { type: "string" },
       public: { type: "string" },
-      port: { type: "string", default: process.env.PORT ?? "8090" },
-      host: { type: "string", default: "0.0.0.0" },
-      url: { type: "string", default: process.env.ONEBASE_URL },
-      db: { type: "string", default: process.env.ONEBASE_DB ?? process.env.DATABASE_URL },
-      files: { type: "string", default: process.env.ONEBASE_FILES },
-      backup: { type: "string", default: process.env.ONEBASE_BACKUP },
-      "backup-every": { type: "string", default: "1h" },
-      "backup-keep": { type: "string", default: "24" },
-      cors: { type: "string", default: process.env.ONEBASE_CORS },
-      "rate-limit": { type: "string", default: process.env.ONEBASE_RATE_LIMIT },
-      "trust-proxy": { type: "boolean", default: false },
+      port: { type: "string" },
+      host: { type: "string" },
+      url: { type: "string" },
+      db: { type: "string" },
+      files: { type: "string" },
+      backup: { type: "string" },
+      "backup-every": { type: "string" },
+      "backup-keep": { type: "string" },
+      cors: { type: "string" },
+      "rate-limit": { type: "string" },
+      "trust-proxy": { type: "boolean" },
       at: { type: "string" },
       force: { type: "boolean", default: false },
-      "no-dashboard": { type: "boolean", default: process.env.ONEBASE_DASHBOARD === "off" },
+      "no-dashboard": { type: "boolean" },
+      "no-deploy": { type: "boolean" },
+      "dry-run": { type: "boolean", default: false },
+      rollback: { type: "boolean", default: false },
+      "env-file": { type: "string", multiple: true },
       out: { type: "string", default: "./app" },
       target: { type: "string" },
       dev: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
   });
-  const port = Number(values.port);
-  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error(`--port must be a number, got "${values.port}"`);
-  // Default to ./onebase, but pick up ./convex in a project ported from Convex.
-  const dir = values.dir ?? (!existsSync("./onebase") && existsSync("./convex") ? "./convex" : "./onebase");
-  return { ...values, dir, port, command: positionals[0] };
+  const command = positionals[0];
+  // `onebase dev` passes its flags to a `serve --dev` child, which reads the files (again on each restart).
+  if (command !== "dev" && !values.help) {
+    loadEnv({ mode: values.dev ? "development" : "production", files: values["env-file"], bunAutoloaded: !COMPILED });
+  }
+  const env = process.env;
+  const port = Number(values.port ?? env.PORT ?? "8090");
+  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error(`--port must be a number, got "${values.port ?? env.PORT}"`);
+  const givenDir = values.dir ?? env.ONEBASE_DIR;
+  return {
+    ...values,
+    command,
+    // Default to ./onebase, but pick up ./convex in a project ported from Convex.
+    dir: givenDir ?? (!existsSync("./onebase") && existsSync("./convex") ? "./convex" : "./onebase"),
+    givenDir: givenDir !== undefined,
+    data: values.data ?? env.ONEBASE_DATA ?? "./onebase_data",
+    public: values.public ?? env.ONEBASE_PUBLIC,
+    port,
+    host: values.host ?? env.ONEBASE_HOST ?? "0.0.0.0",
+    // For deploy, --url is the server to push to; its own public URL is a server setting.
+    url: values.url ?? (command === "deploy" ? env.ONEBASE_DEPLOY_URL : env.ONEBASE_URL),
+    db: values.db ?? env.ONEBASE_DB ?? env.DATABASE_URL,
+    files: values.files ?? env.ONEBASE_FILES,
+    backup: values.backup ?? env.ONEBASE_BACKUP,
+    "backup-every": values["backup-every"] ?? env.ONEBASE_BACKUP_EVERY ?? "1h",
+    "backup-keep": values["backup-keep"] ?? env.ONEBASE_BACKUP_KEEP ?? "24",
+    cors: values.cors ?? env.ONEBASE_CORS,
+    "rate-limit": values["rate-limit"] ?? env.ONEBASE_RATE_LIMIT,
+    "trust-proxy": values["trust-proxy"] ?? enabled(env.ONEBASE_TRUST_PROXY),
+    "no-dashboard": values["no-dashboard"] ?? env.ONEBASE_DASHBOARD === "off",
+    "no-deploy": values["no-deploy"] ?? env.ONEBASE_DEPLOY === "off",
+  };
 }
 
 function duration(text: string): number {
@@ -119,6 +171,7 @@ function serverOptions(opts: ReturnType<typeof options>) {
     rateLimit: opts["rate-limit"] ? parseRateLimit(opts["rate-limit"]) : null,
     trustProxy: opts["trust-proxy"],
     dashboard: !opts["no-dashboard"],
+    deploys: !opts["no-deploy"],
   };
 }
 
@@ -160,7 +213,9 @@ function publicDir(explicit: string | undefined): string | null {
 }
 
 async function serveCommand(opts: ReturnType<typeof options>) {
-  const project = await loadProject(opts.dir);
+  // A server that only runs what `onebase deploy` pushes needs no functions folder.
+  const empty: Project = { dir: resolve(opts.dir), schema: null, modules: {}, http: null, crons: null, authConfig: null, sources: {} };
+  const project = !opts.givenDir && !existsSync(opts.dir) && !opts.dev ? empty : await loadProject(opts.dir);
   const pub = publicDir(opts.public);
   await startApp({
     schema: project.schema,
@@ -180,14 +235,15 @@ async function serveCommand(opts: ReturnType<typeof options>) {
 
 /** The binary re-runs itself as the child; from source we re-run the script. */
 function selfCommand(): string[] {
-  const compiled = Bun.main.includes("$bunfs") || Bun.main.includes("~BUN");
-  return compiled ? [process.execPath] : [process.execPath, Bun.main];
+  return COMPILED ? [process.execPath] : [process.execPath, Bun.main];
 }
 
 async function devCommand(opts: ReturnType<typeof options>, argv: string[]) {
   const dir = resolve(opts.dir);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   const childArgs = ["serve", "--dev", ...argv.filter((a) => a !== "dev")];
+  // The child reads the .env files itself; give it the environment without bun's copy of them, so edits apply on restart.
+  const childEnv = COMPILED ? { ...process.env } : withoutBunEnv(process.env);
   let child: ReturnType<typeof Bun.spawn> | null = null;
 
   const restart = async (reason?: string) => {
@@ -202,16 +258,22 @@ async function devCommand(opts: ReturnType<typeof options>, argv: string[]) {
       await child.exited;
     }
     if (reason) console.log(`\x1b[2m${reason} changed, restarting…\x1b[0m`);
-    child = Bun.spawn([...selfCommand(), ...childArgs], { stdio: ["inherit", "inherit", "inherit"] });
+    child = Bun.spawn([...selfCommand(), ...childArgs], { stdio: ["inherit", "inherit", "inherit"], env: childEnv });
   };
 
   await restart();
   let timer: ReturnType<typeof setTimeout> | null = null;
+  const changed = (name: string) => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => void restart(name), 150);
+  };
   watch(dir, { recursive: true }, (_event, file) => {
     const name = String(file ?? "").replace(/\\/g, "/");
     if (!name || name.startsWith("_generated") || name.includes("node_modules")) return;
-    if (timer) clearTimeout(timer);
-    timer = setTimeout(() => void restart(name), 150);
+    changed(name);
+  });
+  watch(process.cwd(), (_event, file) => {
+    if (file && /^\.env(\..+)?$/.test(String(file))) changed(String(file));
   });
   const stop = () => {
     child?.kill();
@@ -223,31 +285,14 @@ async function devCommand(opts: ReturnType<typeof options>, argv: string[]) {
 
 /** Generates an entry file that statically imports the project, then compiles it. */
 async function buildCommand(opts: ReturnType<typeof options>) {
-  const compiled = Bun.main.includes("$bunfs") || Bun.main.includes("~BUN");
-  if (compiled) {
+  if (COMPILED) {
     throw new Error("`build` needs onebase's source (run it with bun from an installed package), not the prebuilt binary.");
   }
   const dir = resolve(opts.dir);
   await codegen(dir);
-  const files = await listSourceFiles(dir);
+  const { imports, fields, files } = await projectEntry(dir);
   const pub = publicDir(opts.public);
-  const lines: string[] = [`import { runEmbedded } from ${JSON.stringify(import.meta.path)};`];
-  const modules: string[] = [];
-  let schema = "null";
-  let http = "null";
-  let auth = "null";
-  let crons = "null";
-  files.forEach((file, i) => {
-    const modulePath = modulePathFor(dir, file);
-    lines.push(`import * as m${i} from ${JSON.stringify(file)};`);
-    if (modulePath === "schema") schema = `m${i}.default`;
-    else if (modulePath === "auth.config") auth = `m${i}.default`;
-    else {
-      modules.push(`${JSON.stringify(modulePath)}: m${i}`);
-      if (modulePath === "http") http = `(m${i}.default?.__onebase === "httpRouter" ? m${i}.default : null)`;
-      if (modulePath === "crons") crons = `(m${i}.default?.__onebase === "crons" ? m${i}.default : null)`;
-    }
-  });
+  const lines: string[] = [`import { runEmbedded } from ${JSON.stringify(import.meta.path)};`, ...imports];
   const publicEntries: string[] = [];
   if (pub) {
     const root = resolve(pub);
@@ -258,19 +303,18 @@ async function buildCommand(opts: ReturnType<typeof options>) {
       i++;
     }
   }
-  lines.push(
-    `await runEmbedded({ schema: ${schema}, modules: { ${modules.join(", ")} }, http: ${http}, authConfig: ${auth}, crons: ${crons}, publicFiles: { ${publicEntries.join(", ")} } });`,
-  );
+  lines.push(`await runEmbedded({ ${fields}, publicFiles: { ${publicEntries.join(", ")} } });`);
   const entry = join(dirname(dir), ".onebase", "entry.ts");
   mkdirSync(dirname(entry), { recursive: true });
   writeFileSync(entry, lines.join("\n") + "\n");
 
   const out = resolve(opts.out);
-  const args = [process.execPath, "build", "--compile", "--minify", entry, "--outfile", out];
+  // onebase reads .env files itself (see env.ts), in its own order.
+  const args = [process.execPath, "build", "--compile", "--minify", "--no-compile-autoload-dotenv", entry, "--outfile", out];
   if (opts.target) args.push("--target", opts.target);
   const proc = Bun.spawn(args, { stdio: ["inherit", "inherit", "inherit"] });
   if ((await proc.exited) !== 0) throw new Error("bun build failed");
-  console.log(`\nBuilt ${relative(process.cwd(), out) || out}: ${files.length} module(s), ${publicEntries.length} static file(s).`);
+  console.log(`\nBuilt ${relative(process.cwd(), out) || out}: ${files} module(s), ${publicEntries.length} static file(s).`);
   console.log(`Run it with: ${relative(process.cwd(), out).startsWith(".") ? "" : "./"}${relative(process.cwd(), out)} --port 8090 --data ./onebase_data`);
 }
 
@@ -312,6 +356,16 @@ export async function main(argv = process.argv.slice(2)) {
       if (findings.some((f) => f.level === "error")) process.exit(1);
       return;
     }
+    case "deploy":
+      await deploy({
+        dir: opts.dir,
+        url: opts.url,
+        key: process.env.ONEBASE_DEPLOY_KEY?.trim(),
+        public: publicDir(opts.public),
+        dryRun: opts["dry-run"],
+        rollback: opts.rollback,
+      });
+      return;
     case "build":
       return buildCommand(opts);
     case "backup":

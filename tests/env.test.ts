@@ -1,0 +1,125 @@
+import { afterEach, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { loadEnv, parseEnv, withoutBunEnv } from "../src/env";
+
+const dirs: string[] = [];
+afterEach(() => {
+  for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+});
+
+function project(files: Record<string, string>): string {
+  const dir = mkdtempSync(join(tmpdir(), "onebase-env-"));
+  dirs.push(dir);
+  for (const [name, text] of Object.entries(files)) writeFileSync(join(dir, name), text);
+  return dir;
+}
+
+test("parses .env files the way bun does", () => {
+  const env = parseEnv(
+    [
+      "# a comment",
+      "PLAIN=hello world  # trailing comment",
+      "export EXPORTED=yes",
+      "EMPTY=",
+      'DOUBLE="line1\\nline2 # not a comment \\t \\"kept\\""',
+      "SINGLE='literal \\n # but $HOST expands'",
+      'MULTI="first',
+      'second"',
+      "HASH=abc#comment",
+      'QUOTED_HASH="abc#def"',
+      'AFTER="value" trailing junk',
+      "URL=https://${HOST}:$PORT/api",
+      "DEFAULT=${MISSING:-fallback}",
+      "ESCAPED=\\$HOST",
+      "  SPACED  =  padded  ",
+      "not a variable line",
+    ].join("\n"),
+    (k) => ({ HOST: "example.com", PORT: "443" })[k],
+  );
+  expect(env).toEqual({
+    PLAIN: "hello world",
+    EXPORTED: "yes",
+    EMPTY: "",
+    DOUBLE: 'line1\nline2 # not a comment \\t \\"kept\\"',
+    SINGLE: "literal \\n # but example.com expands",
+    MULTI: "first\nsecond",
+    HASH: "abc",
+    QUOTED_HASH: "abc#def",
+    AFTER: "value",
+    URL: "https://example.com:443/api",
+    DEFAULT: "fallback",
+    ESCAPED: "$HOST",
+    SPACED: "padded",
+  });
+});
+
+test("a variable means its final value, wherever it's defined", () => {
+  expect(parseEnv("URL=https://$HOST\nHOST=api.example.com\nLOOP=$LOOP\nCRLF=ok\r\n")).toEqual({
+    URL: "https://api.example.com",
+    HOST: "api.example.com",
+    LOOP: "",
+    CRLF: "ok",
+  });
+  // Real variables win over the file's own definitions.
+  expect(parseEnv("HOST=file\nURL=$HOST", (k) => (k === "HOST" ? "real" : undefined)).URL).toBe("real");
+});
+
+test("matches bun's own .env parsing", async () => {
+  const text = [
+    "PLAIN=hello world  # c",
+    'DOUBLE="a\\nb \\"q\\" \\$HOST"',
+    "SINGLE='x $HOST \\n'",
+    "BACKTICK=`y ${HOST}`",
+    "HASH=http://x/#frag",
+    "HOST=example.com",
+    "LATER=$HOST/path",
+    "DEFAULT=${NOPE:-d}",
+  ].join("\n");
+  const cwd = project({ ".env": text, "print.ts": "console.log(JSON.stringify(process.env))" });
+  const proc = Bun.spawn([process.execPath, "print.ts"], { cwd, env: { PATH: process.env.PATH }, stdout: "pipe" });
+  const bun = JSON.parse(await new Response(proc.stdout).text());
+  const mine = parseEnv(text);
+  for (const key of Object.keys(mine)) expect([key, mine[key]]).toEqual([key, bun[key]]);
+});
+
+test("later files win, and real environment variables win over all of them", () => {
+  const cwd = project({
+    ".env": "A=env\nB=env\nC=env\nD=env\nREAL=env",
+    ".env.local": "B=local\nC=local\nD=local",
+    ".env.production": "C=production\nD=production",
+    ".env.production.local": "D=production.local",
+    ".env.development": "A=development",
+  });
+  const env: Record<string, string | undefined> = { REAL: "real" };
+  const loaded = loadEnv({ mode: "production", cwd, env });
+  expect(env).toEqual({ A: "env", B: "local", C: "production", D: "production.local", REAL: "real" });
+  expect(loaded.map((p) => p.slice(cwd.length + 1))).toEqual([".env", ".env.local", ".env.production", ".env.production.local"]);
+
+  const dev: Record<string, string | undefined> = {};
+  loadEnv({ mode: "development", cwd, env: dev });
+  expect(dev.A).toBe("development");
+});
+
+test("--env-file reads only the files given, and they must exist", () => {
+  const cwd = project({ ".env": "A=default", "prod.env": "A=prod\nB=prod", "extra.env": "B=extra" });
+  const env: Record<string, string | undefined> = {};
+  loadEnv({ mode: "production", cwd, env, files: ["prod.env", "extra.env"] });
+  expect(env).toEqual({ A: "prod", B: "extra" });
+  expect(() => loadEnv({ mode: "production", cwd, env: {}, files: ["missing.env"] })).toThrow("--env-file missing.env: file not found");
+});
+
+test("values bun loaded on its own get onebase's order, not a real variable's", () => {
+  // `bun run` with NODE_ENV unset reads .env.development, even for `onebase serve`.
+  const cwd = project({ ".env": "A=env", ".env.development": "A=development\nDEV_ONLY=1", ".env.production": "A=production" });
+  const env: Record<string, string | undefined> = { A: "development", DEV_ONLY: "1", REAL: "real" };
+  expect(withoutBunEnv(env, cwd)).toEqual({ REAL: "real" });
+  loadEnv({ mode: "production", cwd, env, bunAutoloaded: true });
+  expect(env).toEqual({ A: "production", REAL: "real" });
+
+  // A real variable that differs from the files is kept.
+  const overridden: Record<string, string | undefined> = { A: "from the shell" };
+  loadEnv({ mode: "production", cwd, env: overridden, bunAutoloaded: true });
+  expect(overridden.A).toBe("from the shell");
+});

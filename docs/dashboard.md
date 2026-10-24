@@ -70,6 +70,6 @@ You can also set `ONEBASE_DASHBOARD=off`. `/_admin` then returns 404.
 
 ## Security notes
 
-- **Admin key:** treat it like a database password. Anyone with it can read and change all data.
+- **Admin key:** treat it like a database password. Anyone with it can read and change all data, and push code with [`onebase deploy`](./deployment.md#onebase-deploy).
 - **Exposure:** the dashboard is served on the same port as your API. If you don't want it reachable from the internet, block `/_admin` at your reverse proxy, or run with `--no-dashboard` and keep a separate internal instance with the dashboard on.
 - **Rotating the key:** delete `admin.key` and restart, or change `ONEBASE_ADMIN_KEY`.

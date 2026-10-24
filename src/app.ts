@@ -13,12 +13,16 @@ import type { Crons, HttpRouter } from "./server";
 import { clientBundle } from "./client/bundle.generated";
 import { dashboardAssets } from "./dashboard/bundle.generated";
 import { createAdmin, loadAdminKey } from "./engine/admin";
+import { serveAsset } from "./engine/deployments";
+import { importBundle } from "./deploy";
 
 export const VERSION = "0.1.0";
 
 export type AppOptions = {
   /** Serve the dashboard at /_admin (default true). */
   dashboard?: boolean;
+  /** Accept `onebase deploy` and run what it pushed, instead of the code given here (default true; never in dev). */
+  deploys?: boolean;
   schema: SchemaDefinition<any> | null;
   modules: Modules;
   http?: HttpRouter | null;
@@ -85,6 +89,7 @@ export async function startApp(opts: AppOptions) {
     crons: opts.crons?.jobs ?? [],
     dev: opts.dev,
     log: consoleLogger,
+    loadCode: opts.deploys === false ? null : importBundle,
   });
   const { created, dropped } = await runtime.init();
   const adminKey = opts.dashboard === false ? null : loadAdminKey(opts.dataDir);
@@ -92,7 +97,8 @@ export async function startApp(opts: AppOptions) {
     runtime,
     port: opts.port,
     hostname: opts.hostname,
-    assets: opts.assets,
+    // A deployment's own frontend, if it shipped one; otherwise the server's.
+    assets: (path) => (runtime.deployment?.assets ? serveAsset(runtime.deployment.assets, path) : (opts.assets?.(path) ?? null)),
     clientBundle,
     cors: opts.cors,
     rateLimit: opts.rateLimit,
@@ -109,7 +115,13 @@ export async function startApp(opts: AppOptions) {
     console.log(`\x1b[1monebase\x1b[0m v${VERSION}${opts.dev ? " (dev)" : ""}`);
     console.log(`  functions  ${names.length}${names.length ? ` (${names.slice(0, 6).join(", ")}${names.length > 6 ? ", …" : ""})` : ""}`);
     if (created.length || dropped.length) console.log(`  indexes    +${created.length} -${dropped.length}`);
-    if (opts.crons?.jobs.length) console.log(`  crons      ${opts.crons.jobs.map((j) => j.name).join(", ")}`);
+    if (runtime.deployment) {
+      const d = runtime.deployment;
+      console.log(`  deployment ${d.id}, pushed ${new Date(d.created).toLocaleString()}${d.assets ? ` (${d.assets.size} static files)` : ""}`);
+    } else if (!names.length && opts.deploys !== false && !opts.dev) {
+      console.log(`  \x1b[2mno functions yet: add some to ./onebase, or push them with onebase deploy\x1b[0m`);
+    }
+    if (runtime.cronJobs.length) console.log(`  crons      ${runtime.cronJobs.map((j) => j.name).join(", ")}`);
     if (runtime.auth) console.log(`  sign-in    ${runtime.auth.ids.join(", ")}`);
     console.log(`  database   ${driver.description}`);
     console.log(`  files      ${blobs.description}`);

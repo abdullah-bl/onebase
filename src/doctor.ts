@@ -215,16 +215,16 @@ export async function doctor(dirInput: string): Promise<Finding[]> {
   return findings;
 }
 
-export function printFindings(findings: Finding[]): void {
+export function printFindings(findings: Finding[], log: (line: string) => void = console.log): void {
   if (findings.length === 0) {
-    console.log("\x1b[32m✓\x1b[0m No problems found.");
+    log("\x1b[32m✓\x1b[0m No problems found.");
     return;
   }
   for (const f of findings) {
     const tag = f.level === "error" ? "\x1b[31m✗ error\x1b[0m" : "\x1b[33m⚠ warn \x1b[0m";
-    console.log(`${tag} ${f.where}: ${f.message}`);
-    if (f.fix) console.log(`         fix: ${f.fix}`);
+    log(`${tag} ${f.where}: ${f.message}`);
+    if (f.fix) log(`         fix: ${f.fix}`);
   }
   const errors = findings.filter((f) => f.level === "error").length;
-  console.log(`\n${errors} error(s), ${findings.length - errors} warning(s)`);
+  log(`\n${errors} error(s), ${findings.length - errors} warning(s)`);
 }

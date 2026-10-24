@@ -14,10 +14,48 @@ import { CallLog, type CallSource } from "./calllog";
 import { currentFunction, installGuards } from "./guard";
 import { AuthService, SESSION_PREFIX } from "./auth";
 import { createAuthenticate, type AuthConfig, type AuthenticateCtx } from "./jwt";
+import {
+  activeDeployment,
+  getDeployment,
+  previousDeployment,
+  saveDeployment,
+  setActiveDeployment,
+  toDeployment,
+  type Deployment,
+  type StoredDeployment,
+} from "./deployments";
 
 export type Modules = Record<string, Record<string, unknown>>;
 export type Authenticate = (token: string, ctx: AuthenticateCtx) => Promise<UserIdentity | null> | UserIdentity | null;
 export type Logger = { info(msg: string): void; warn(msg: string): void; error(msg: string): void };
+
+/** A project's code: everything `onebase deploy` replaces in a running server. */
+export type ProjectCode = {
+  schema: SchemaDefinition<any> | null;
+  modules: Modules;
+  http: HttpRouter | null;
+  auth: AuthConfig | null;
+  crons: CronJob[];
+};
+
+export type DeployResult = {
+  id: string;
+  created: number;
+  functions: number;
+  indexes: { created: string[]; dropped: string[] };
+  /** Static files in the deployment (0: the server keeps serving its own --public). */
+  files: number;
+  warnings: string[];
+  dryRun: boolean;
+};
+
+/** Code checked and ready to install. */
+type PreparedCode = {
+  code: ProjectCode;
+  functions: Map<string, RegisteredFunction>;
+  auth: AuthService | null;
+  authenticate: Authenticate | null;
+};
 
 export type RuntimeOptions = {
   driver: Driver;
@@ -36,6 +74,11 @@ export type RuntimeOptions = {
   /** Dev mode: full error messages to clients and index warnings. */
   dev?: boolean;
   log?: Logger;
+  /**
+   * Imports the source of a bundle pushed with `onebase deploy`. Without it the runtime ignores
+   * deployments and refuses new ones; dev mode always does.
+   */
+  loadCode?: ((source: string, id: string) => Promise<ProjectCode>) | null;
 };
 
 export type CallOptions = {
@@ -85,9 +128,16 @@ const REVOKED_PER_MESSAGE = 100;
 
 export class Runtime {
   readonly driver: Driver;
-  readonly schema: SchemaDefinition<any> | null;
+  // The project's code. A deploy replaces it; calls already running finish with the old code.
+  schema: SchemaDefinition<any> | null = null;
   readonly functions = new Map<string, RegisteredFunction>();
-  readonly http: HttpRouter | null;
+  http: HttpRouter | null = null;
+  /** Built-in sign-in, when auth.config.ts lists methods. */
+  auth: AuthService | null = null;
+  private authenticate: Authenticate | null = null;
+  private crons: CronJob[] = [];
+  /** The `onebase deploy` push being run, if any. */
+  deployment: Deployment | null = null;
   readonly dev: boolean;
   readonly log: Logger;
   readonly files: FileStore;
@@ -97,14 +147,16 @@ export class Runtime {
   /** Live counts reported by the HTTP layer, for the dashboard. */
   readonly stats = { connections: 0, subscriptions: () => 0 };
   siteUrl: string;
-  private readonly authenticate: Authenticate | null;
-  /** Built-in sign-in, when auth.config.ts lists methods. */
-  readonly auth: AuthService | null;
+  private readonly customAuthenticate: Authenticate | null;
+  private readonly loadCode: RuntimeOptions["loadCode"];
   private revokeListeners: ((sessionIds: string[]) => void)[] = [];
-  private readonly crons: CronJob[];
+  private deployListeners: (() => Promise<void> | void)[] = [];
   private cronRunner: CronRunner | null = null;
+  private schedulerStarted = false;
   /** Mutations from this process run one at a time; other instances are handled by the driver. */
   private readonly mutations = new SerialQueue();
+  /** Deploys and rollbacks, one at a time, so the code running is always the one recorded. */
+  private readonly deploys = new SerialQueue();
   private commitListeners: ((event: CommitEvent) => Promise<void>)[] = [];
   private schedulerTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeat: ReturnType<typeof setInterval> | null = null;
@@ -115,28 +167,39 @@ export class Runtime {
   constructor(opts: RuntimeOptions) {
     installGuards();
     this.driver = opts.driver;
-    this.schema = opts.schema;
-    this.http = opts.http ?? null;
-    this.authenticate = opts.authenticate ?? (opts.auth ? createAuthenticate(opts.auth) : null);
-    this.auth = opts.auth?.methods?.length ? new AuthService(this, opts.auth) : null;
+    this.customAuthenticate = opts.authenticate ?? null;
     this.dev = opts.dev ?? false;
     this.log = opts.log ?? consoleLogger;
+    this.loadCode = this.dev ? null : opts.loadCode;
     this.files = new FileStore(opts.blobs ?? new LocalBlobs(mkdtempSync(join(tmpdir(), "onebase-files-"))), () => this.nextCreationTime());
     this.siteUrl = (opts.siteUrl ?? "http://localhost:8090").replace(/\/$/, "");
-    this.crons = opts.crons ?? [];
-    for (const [modulePath, exports] of Object.entries(opts.modules)) {
-      for (const [exportName, value] of Object.entries(exports)) {
-        if (isRegisteredFunction(value)) this.functions.set(`${modulePath}:${exportName}`, value);
-      }
-    }
+    const code = { schema: opts.schema, modules: opts.modules, http: opts.http ?? null, auth: opts.auth ?? null, crons: opts.crons ?? [] };
+    this.setCode(this.prepare(code), null);
   }
 
-  /** Creates system tables and schema indexes, checks existing data, and starts listening to other instances. */
+  /**
+   * Creates system tables and schema indexes, checks existing data, and starts listening to other
+   * instances. A deployment pushed with `onebase deploy` replaces the code given to the constructor.
+   */
   async init(): Promise<{ created: string[]; dropped: string[] }> {
-    this.auth?.check();
     await this.driver.init();
-    const result = await this.driver.write((tx) => applySchema(tx, this.driver.dialect, this.schema));
-    await this.checkExistingDocuments();
+    const stored = this.loadCode ? await this.driver.read((tx) => activeDeployment(tx)) : null;
+    if (stored) {
+      try {
+        this.setCode(this.prepare(await this.loadCode!(stored.code, stored.id)), toDeployment(stored));
+      } catch (err) {
+        throw new OnebaseError(
+          `Couldn't load deployment ${stored.id} (pushed ${new Date(stored.created).toISOString()}): ${err instanceof Error ? err.message : String(err)}\n` +
+            `Fix what it needs (often an environment variable) and restart, or start with --no-deploy to run the local code instead.`,
+        );
+      }
+    }
+    this.auth?.check();
+    const { result, warnings } = await this.driver.write(async (tx) => {
+      const result = await applySchema(tx, this.driver.dialect, this.schema);
+      return { result, warnings: await this.checkDocuments(tx, this.schema) };
+    });
+    for (const w of warnings) this.log.warn(w);
     const row = await this.driver.read((tx) => tx.get("SELECT MAX(ct) AS ct FROM documents"));
     this.lastCreationTime = Math.max(this.lastCreationTime, Number(row?.ct ?? 0));
     if (this.driver.shared && this.driver.subscribe) {
@@ -147,19 +210,19 @@ export class Runtime {
 
   /**
    * When schema.ts changes, every stored document is checked against it, like a Convex deploy.
-   * The schema's fingerprint is saved once the data matches, so unchanged schemas cost nothing.
+   * The schema's fingerprint is saved once the data matches (unless `record` is false, for a dry
+   * run), so unchanged schemas cost nothing. Returns warnings about data the schema ignores.
    */
-  private async checkExistingDocuments() {
-    const schema = this.schema;
+  private async checkDocuments(tx: Exec, schema: SchemaDefinition<any> | null, record = true): Promise<string[]> {
     if (!schema?.schemaValidation) {
       // Writes aren't validated now, so check everything again once validation is turned back on.
-      if (schema) await this.driver.write((tx) => tx.run("DELETE FROM _meta WHERE key = 'schema'"));
-      return;
+      if (schema && record) await tx.run("DELETE FROM _meta WHERE key = 'schema'");
+      return [];
     }
     const tables = Object.entries(schema.tables) as [string, { validator: AnyValidator }][];
     const fingerprint = new Bun.CryptoHasher("sha256").update(JSON.stringify(tables.map(([t, d]) => [t, d.validator]))).digest("hex");
-    const stored = await this.driver.read((tx) => tx.get("SELECT value FROM _meta WHERE key = 'schema'"));
-    if (stored?.value === fingerprint) return;
+    const stored = await tx.get("SELECT value FROM _meta WHERE key = 'schema'");
+    if (stored?.value === fingerprint) return [];
 
     const d = this.driver.dialect;
     const examples: string[] = [];
@@ -167,11 +230,9 @@ export class Runtime {
     for (const [table, def] of tables) {
       let after: [number, string] = [-1, ""];
       for (;;) {
-        const rows = await this.driver.read((tx) =>
-          tx.all(`SELECT id, ct, doc FROM documents WHERE tbl = ? AND (ct, id) > (${d.placeholder("ct")}, ${d.placeholder("id")}) ORDER BY ct, id LIMIT 500`, [
-            table,
-            ...after,
-          ]),
+        const rows = await tx.all(
+          `SELECT id, ct, doc FROM documents WHERE tbl = ? AND (ct, id) > (${d.placeholder("ct")}, ${d.placeholder("id")}) ORDER BY ct, id LIMIT 500`,
+          [table, ...after],
         );
         for (const row of rows) {
           const errors = validate(def.validator, d.parseDoc(row.doc), "document");
@@ -192,11 +253,168 @@ export class Runtime {
       );
     }
     const known = new Set(tables.map(([t]) => t));
-    const orphans = (await this.driver.read((tx) => tx.all("SELECT DISTINCT tbl FROM documents"))).map((r) => r.tbl as string).filter((t) => !known.has(t));
-    for (const t of orphans) this.log.warn(`Table "${t}" has documents but isn't in schema.ts, so functions can't read them. Add it back to keep using them.`);
-    await this.driver.write((tx) =>
-      tx.run("INSERT INTO _meta (key, value) VALUES ('schema', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [fingerprint]),
+    const orphans = (await tx.all("SELECT DISTINCT tbl FROM documents")).map((r) => r.tbl as string).filter((t) => !known.has(t));
+    if (record) {
+      await tx.run("INSERT INTO _meta (key, value) VALUES ('schema', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [fingerprint]);
+    }
+    return orphans.map((t) => `Table "${t}" has documents but isn't in schema.ts, so functions can't read them. Add it back to keep using them.`);
+  }
+
+  // ---- Code & deploys ----
+
+  /** Collects a project's functions and builds its sign-in, without installing anything yet. */
+  private prepare(code: ProjectCode): PreparedCode {
+    const functions = new Map<string, RegisteredFunction>();
+    for (const [modulePath, exports] of Object.entries(code.modules)) {
+      for (const [exportName, value] of Object.entries(exports)) {
+        if (isRegisteredFunction(value)) functions.set(`${modulePath}:${exportName}`, value);
+      }
+    }
+    return {
+      code,
+      functions,
+      auth: code.auth?.methods?.length ? new AuthService(this, code.auth) : null,
+      authenticate: this.customAuthenticate ?? (code.auth ? createAuthenticate(code.auth) : null),
+    };
+  }
+
+  private setCode(prepared: PreparedCode, deployment: Deployment | null) {
+    this.schema = prepared.code.schema;
+    this.http = prepared.code.http;
+    this.auth = prepared.auth;
+    this.authenticate = prepared.authenticate;
+    this.crons = prepared.code.crons;
+    this.functions.clear();
+    for (const [name, fn] of prepared.functions) this.functions.set(name, fn);
+    this.deployment = deployment;
+  }
+
+  /** Swaps in new code, restarts crons, and lets the HTTP layer re-run live queries. */
+  private async install(prepared: PreparedCode, deployment: Deployment) {
+    this.setCode(prepared, deployment);
+    if (this.schedulerStarted) {
+      this.cronRunner?.stop();
+      this.cronRunner = null;
+      await this.startCrons();
+      this.pokeScheduler();
+    }
+    await Promise.all(this.deployListeners.map((l) => l()));
+  }
+
+  /** Calls `listener` after a deploy or rollback has replaced the code (here or on another instance). */
+  onDeploy(listener: () => Promise<void> | void): () => void {
+    this.deployListeners.push(listener);
+    return () => {
+      this.deployListeners = this.deployListeners.filter((l) => l !== listener);
+    };
+  }
+
+  private codeLoader() {
+    if (this.loadCode) return this.loadCode;
+    throw new OnebaseError(
+      this.dev
+        ? "This server runs in dev mode, which runs ./onebase from disk. Deploy to a server started with onebase serve."
+        : "Deploys are turned off on this server (--no-deploy or ONEBASE_DEPLOY=off).",
     );
+  }
+
+  /** The checks startup would do, so a deploy that can't start is refused while the old code keeps running. */
+  private async load(stored: StoredDeployment): Promise<PreparedCode> {
+    let code: ProjectCode;
+    try {
+      code = await this.codeLoader()(stored.code, stored.id);
+    } catch (err) {
+      if (err instanceof OnebaseError) throw err;
+      throw new OnebaseError(`The deployed code failed to load: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    const prepared = this.prepare(code);
+    prepared.auth?.check(code.schema);
+    for (const job of code.crons) {
+      if (!prepared.functions.has(getFunctionName(job.fn))) throw new OnebaseError(`crons.ts: "${job.name}" runs ${job.fn}, which doesn't exist.`);
+    }
+    return prepared;
+  }
+
+  /**
+   * Replaces the running code with a bundle from `onebase deploy`, without a restart. Like a
+   * Convex push, the new schema is checked against every document first, in the same transaction
+   * that updates indexes, and nothing changes if anything fails. Live queries re-run on the new code.
+   */
+  async deploy(input: { code: string; assets?: Record<string, string> | null; dryRun?: boolean }): Promise<DeployResult> {
+    if (typeof input.code !== "string" || !input.code) throw new OnebaseError("A deploy needs the bundle's code.");
+    if (input.assets && Object.values(input.assets).some((v) => typeof v !== "string")) {
+      throw new OnebaseError('assets must map paths to base64 strings: { "/index.html": "PCFkb2N0eXBl..." }.');
+    }
+    const stored: StoredDeployment = {
+      id: newId(),
+      created: Date.now(),
+      code: input.code,
+      assets: input.assets && Object.keys(input.assets).length ? JSON.stringify(input.assets) : null,
+    };
+    return this.deploys.run(() => this.activate(stored, { save: true, dryRun: input.dryRun ?? false }));
+  }
+
+  /** Goes back to the deployment pushed before the current one. */
+  async rollback(): Promise<DeployResult> {
+    this.codeLoader();
+    return this.deploys.run(async () => {
+      const { current, previous } = await this.driver.read(async (tx) => {
+        const current = await activeDeployment(tx);
+        return { current, previous: current ? await previousDeployment(tx, current) : null };
+      });
+      if (!current) throw new OnebaseError("Nothing to roll back: this server isn't running a deployment.");
+      if (!previous) throw new OnebaseError(`Nothing to roll back to: ${current.id} is the oldest deployment kept.`);
+      return this.activate(previous, { save: false, dryRun: false });
+    });
+  }
+
+  private async activate(stored: StoredDeployment, opts: { save: boolean; dryRun: boolean }): Promise<DeployResult> {
+    const prepared = await this.load(stored);
+    const schema = prepared.code.schema;
+    const apply = async (tx: Exec) => {
+      const warnings = await this.checkDocuments(tx, schema, !opts.dryRun);
+      if (opts.dryRun) return { indexes: { created: [], dropped: [] }, warnings };
+      const indexes = await applySchema(tx, this.driver.dialect, schema);
+      if (opts.save) await saveDeployment(tx, stored);
+      await setActiveDeployment(tx, stored.id);
+      if (this.driver.shared && this.driver.publish) await this.driver.publish(tx, JSON.stringify({ o: this.instanceId, d: stored.id }));
+      return { indexes, warnings };
+    };
+    // Queued with this process's mutations, so none of them runs between the check and the swap.
+    const { indexes, warnings } = opts.dryRun ? await this.driver.read(apply) : await this.withWriter(apply);
+    const deployment = toDeployment(stored);
+    if (!opts.dryRun) {
+      await this.install(prepared, deployment);
+      this.log.info(`Deployment ${stored.id} is live: ${prepared.functions.size} function(s).`);
+    }
+    for (const w of warnings) this.log.warn(w);
+    return {
+      id: stored.id,
+      created: stored.created,
+      functions: prepared.functions.size,
+      indexes,
+      files: deployment.assets?.size ?? 0,
+      warnings,
+      dryRun: opts.dryRun,
+    };
+  }
+
+  /** Another instance pushed a deployment: it already checked and stored it, so just run it. */
+  private async onRemoteDeploy(id: string) {
+    if (!this.loadCode) {
+      this.log.warn(`Another instance deployed ${id}, but this one has deploys turned off and keeps its own code.`);
+      return;
+    }
+    try {
+      await this.deploys.run(async () => {
+        const stored = await this.driver.read((tx) => getDeployment(tx, id));
+        if (!stored) return;
+        await this.install(this.prepare(await this.loadCode!(stored.code, stored.id)), toDeployment(stored));
+        this.log.info(`Deployment ${id} is live (pushed to another instance).`);
+      });
+    } catch (err) {
+      this.log.error(`Couldn't load deployment ${id} from another instance: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   /** Strictly increasing creation times keep ordering and cursors unambiguous. */
@@ -232,13 +450,14 @@ export class Runtime {
   }
 
   private async onRemoteCommit(message: string) {
-    let parsed: { o: string; w?: Write[]; t?: string[]; s?: boolean; r?: string[] };
+    let parsed: { o: string; w?: Write[]; t?: string[]; s?: boolean; r?: string[]; d?: string };
     try {
       parsed = JSON.parse(message);
     } catch {
       return;
     }
     if (parsed.o === this.instanceId) return;
+    if (parsed.d) return this.onRemoteDeploy(parsed.d);
     if (parsed.s) this.pokeScheduler();
     if (parsed.r?.length) this.notifyRevoked(parsed.r);
     if (parsed.w || parsed.t) await this.notifyCommit(parsed.w ? { writes: parsed.w } : { tables: parsed.t ?? [] });
@@ -642,10 +861,14 @@ export class Runtime {
     this.pokeScheduler();
     // With a shared database, pick up jobs left by instances that went away.
     if (this.driver.shared) this.heartbeat = setInterval(() => this.pokeScheduler(), 30_000);
-    if (this.crons.length) {
-      this.cronRunner = new CronRunner(this, this.crons);
-      await this.cronRunner.start().catch((err) => this.log.error(`Crons: ${err instanceof Error ? err.message : String(err)}`));
-    }
+    this.schedulerStarted = true;
+    await this.startCrons();
+  }
+
+  private async startCrons() {
+    if (!this.crons.length || this.stopped) return;
+    this.cronRunner = new CronRunner(this, this.crons);
+    await this.cronRunner.start().catch((err) => this.log.error(`Crons: ${err instanceof Error ? err.message : String(err)}`));
   }
 
   pokeScheduler() {

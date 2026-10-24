@@ -31,13 +31,28 @@ my-app/
 onebase dev          # codegen + restart on change
 onebase doctor       # check for mistakes
 onebase serve        # production
+onebase deploy       # push your code to a running server, no restart
 ```
 
 **Website and docs:** https://abdullah-bl.github.io/onebase/ (source in [docs/](docs/)). The [LLM guide](docs/llm-guide.md) is a one-page summary of the API to give an AI assistant.
 
-## Deploying as a single file
+## Deploying
 
-**1. Generic binary + functions folder** (like PocketBase + `pb_hooks`):
+**1. Push with `onebase deploy`** (like `npx convex deploy`): run `onebase serve` on the server once, then ship each change from your machine:
+
+```bash
+# .env.local (git ignores it)
+ONEBASE_DEPLOY_URL=https://api.example.com
+ONEBASE_DEPLOY_KEY=…                 # the server's admin key
+```
+
+```bash
+onebase deploy                       # also: --dry-run, --rollback
+```
+
+The server checks the new schema against its data, updates indexes, and swaps the code in without a restart. Connected clients' live queries re-run on the new code. If a check fails, nothing changes.
+
+**2. Generic binary + functions folder** (like PocketBase + `pb_hooks`):
 
 ```bash
 bun run build:binary                 # → dist/onebase
@@ -58,9 +73,11 @@ server/
 cd server && onebase serve --port 8090
 ```
 
+Every flag has an environment variable, and onebase reads `.env`, `.env.local`, `.env.production` and `.env.production.local` (`.env.development*` for `onebase dev`).
+
 Functions can import npm packages from a `node_modules` folder next to them.
 
-**2. Everything in one executable** (functions + frontend embedded):
+**3. Everything in one executable** (functions + frontend embedded):
 
 ```bash
 onebase build --out ./app          # cross-compile with --target bun-linux-arm64 etc.

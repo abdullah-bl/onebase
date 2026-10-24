@@ -109,6 +109,11 @@ export class SubscriptionManager {
     return event.writes.some((w) => rs.ids.has(w.id) || rs.ranges.some((r) => writeAffects(r, w, dialect)));
   }
 
+  /** Re-runs every query (after a deploy replaced the code); resolves once results are delivered. */
+  async rerunAll(): Promise<void> {
+    await Promise.all([...this.entries.values()].map((e) => this.refresh(e)));
+  }
+
   /** Re-runs affected queries; resolves once their new results have been delivered. */
   async invalidate(event: CommitEvent): Promise<void> {
     const affected = [...this.entries.values()].filter((e) => this.affected(e, event));

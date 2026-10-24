@@ -80,7 +80,8 @@ type SocketData = {
   ip: string;
   identity: UserIdentity | null;
   ready: Promise<void>;
-  subs: Map<number, { path: string; args: unknown; unsubscribe: () => void }>;
+  /** `failed`: the query couldn't start (unknown function, rate limit), so a deploy retries it. */
+  subs: Map<number, { path: string; args: unknown; unsubscribe: () => void; failed?: boolean }>;
   /** This client's mutations that have committed but haven't been answered yet. */
   committed: Set<number>;
   /** Query updates and results held back meanwhile, then sent together as one transition. */
@@ -163,7 +164,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
     ws.data.subs.get(id)?.unsubscribe();
     const limit = counted ? limited(ws.data.ip) : null;
     if (limit) {
-      ws.data.subs.set(id, { path, args, unsubscribe: () => {} });
+      ws.data.subs.set(id, { path, args, unsubscribe: () => {}, failed: true });
       return pushUpdate(ws, { type: "update", id, ok: false, error: limit.message });
     }
     try {
@@ -172,7 +173,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
       ws.data.subs.set(id, { path, args, unsubscribe });
     } catch (err) {
       const e = runtime.toClientError(err);
-      ws.data.subs.set(id, { path, args, unsubscribe: () => {} });
+      ws.data.subs.set(id, { path, args, unsubscribe: () => {}, failed: true });
       pushUpdate(ws, { type: "update", id, ok: false, error: e.message, data: e.data });
     }
   };
@@ -188,6 +189,16 @@ export function serve(opts: ServeOptions): Server<SocketData> {
       send(ws, { type: "auth", ok: false, ended: true, error: "You were signed out." });
       for (const [id, sub] of ws.data.subs) subscribe(ws, id, sub.path, sub.args, false);
     }
+  });
+
+  // New code: re-run every live query, and retry the ones that couldn't start (say, a function
+  // that only exists now). Clients stay connected.
+  runtime.onDeploy(async () => {
+    const rerun = subscriptions.rerunAll();
+    for (const ws of sockets) {
+      for (const [id, sub] of ws.data.subs) if (sub.failed) subscribe(ws, id, sub.path, sub.args, false);
+    }
+    await rerun;
   });
 
   const handleMessage = async (ws: ServerWebSocket<SocketData>, msg: ClientMessage) => {
@@ -311,7 +322,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
           if (res.status < 300 || res.status >= 400) for (const [k, v] of Object.entries(cors(req))) res.headers.set(k, v);
           return res;
         }
-        if (path === "/api/health") return json(req, { ok: true, functions: runtime.functions.size, subscriptions: subscriptions.size });
+        if (path === "/api/health") return json(req, { ok: true, functions: runtime.functions.size, subscriptions: subscriptions.size, deployment: runtime.deployment?.id ?? null });
         if (req.method === "POST" && ["query", "mutation", "action", "run"].includes(kind)) return handleHttpApi(req, kind);
         return json(req, { status: "error", errorMessage: `Unknown endpoint ${req.method} ${path}` }, 404);
       }

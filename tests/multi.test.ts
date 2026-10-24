@@ -2,8 +2,12 @@
 // Runs when TEST_POSTGRES_URL / TEST_LIBSQL_URL are set.
 
 import { afterEach, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { bundleProject, importBundle } from "../src/deploy";
 import { createDriver, type Driver } from "../src/engine/driver";
-import { Runtime } from "../src/engine/runtime";
+import { Runtime, type RuntimeOptions } from "../src/engine/runtime";
 import { SubscriptionManager } from "../src/engine/sync";
 import { password } from "../src/auth";
 import { authTables, cronJobs, defineSchema, defineTable, internalMutation, mutation, query } from "../src/server";
@@ -45,9 +49,9 @@ for (const [name, url] of URLS) {
     const open: { runtime: Runtime; driver: Driver }[] = [];
     const quiet = { info() {}, warn() {}, error() {} };
 
-    async function instance(crons?: ReturnType<typeof cronJobs>) {
+    async function instance(crons?: ReturnType<typeof cronJobs>, extra: Partial<RuntimeOptions> = {}) {
       const driver = createDriver(url);
-      const runtime = new Runtime({ driver, schema, modules, crons: crons?.jobs, log: quiet });
+      const runtime = new Runtime({ driver, schema, modules, crons: crons?.jobs, log: quiet, ...extra });
       await runtime.init();
       open.push({ runtime, driver });
       return runtime;
@@ -58,6 +62,36 @@ for (const [name, url] of URLS) {
         runtime.stop();
         await driver.close();
       }
+    });
+
+    test("a deploy on one instance goes live on the others", async () => {
+      const reset = (r: Runtime) =>
+        r.driver.write(async (tx) => {
+          await tx.run("DELETE FROM _deployments");
+          await tx.run("DELETE FROM _meta WHERE key = 'deployment'");
+        });
+      await reset(await instance());
+      const a = await instance(undefined, { loadCode: importBundle });
+      const b = await instance(undefined, { loadCode: importBundle });
+
+      const dir = mkdtempSync(join(tmpdir(), "onebase-multi-deploy-"));
+      mkdirSync(join(dir, "onebase"));
+      writeFileSync(
+        join(dir, "onebase", "schema.ts"),
+        `import { defineSchema, defineTable } from "onebase/server";\nimport { v } from "onebase/values";\n` +
+          `export default defineSchema({ counters: defineTable({ name: v.string(), value: v.number() }).index("by_name", ["name"]), ticks: defineTable({ instance: v.string() }) });`,
+      );
+      writeFileSync(join(dir, "onebase", "hello.ts"), `import { query } from "onebase/server";\nexport const where = query({ args: {}, handler: () => "deployed" });`);
+      const { code } = await bundleProject(join(dir, "onebase"));
+      rmSync(dir, { recursive: true, force: true });
+
+      const r = await a.deploy({ code });
+      const deadline = Date.now() + 3000;
+      while (b.deployment?.id !== r.id && Date.now() < deadline) await Bun.sleep(25);
+      expect(b.deployment?.id).toBe(r.id);
+      expect((await b.runQuery("hello:where", {})).value).toBe("deployed");
+      expect(b.functions.has("counters:get")).toBe(false);
+      await reset(a);
     });
 
     test("a write on one instance updates live queries on another", async () => {

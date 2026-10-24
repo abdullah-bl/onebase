@@ -169,11 +169,7 @@ export class AuthService {
       now + this.sessionMs,
       now,
     ]);
-    if (Math.random() < 0.05) {
-      await tx.run("DELETE FROM _auth_sessions WHERE expires < ?", [now]);
-      await tx.run("DELETE FROM _auth_codes WHERE expires < ?", [now]);
-      await tx.run("DELETE FROM _auth_attempts WHERE window_start < ?", [now - FAILURE_WINDOW]);
-    }
+    if (Math.random() < AuthService.cleanupChance) await this.cleanup(tx);
     return token;
   }
 
@@ -195,9 +191,10 @@ export class AuthService {
   // ---- One-time codes (OAuth state, login codes) ----
 
   private async saveCode(code: string, kind: string, data: Record<string, unknown>, ttl: number) {
-    await this.runtime.withWriter((tx) =>
-      tx.run("INSERT INTO _auth_codes (code_hash, kind, data, expires) VALUES (?, ?, ?, ?)", [sha256(code), kind, JSON.stringify(data), Date.now() + ttl]),
-    );
+    await this.runtime.withWriter(async (tx) => {
+      await tx.run("INSERT INTO _auth_codes (code_hash, kind, data, expires) VALUES (?, ?, ?, ?)", [sha256(code), kind, JSON.stringify(data), Date.now() + ttl]);
+      if (Math.random() < AuthService.cleanupChance) await this.cleanup(tx);
+    });
   }
 
   /** Returns a code's data and deletes it: each code works once. */
@@ -214,13 +211,13 @@ export class AuthService {
   // ---- HTTP ----
 
   /** Handles /api/auth/*; returns null for unknown paths. `origins` are the --cors origins (null: any). */
-  async handle(req: Request, url: URL, origins: Set<string> | null): Promise<Response | null> {
+  async handle(req: Request, url: URL, origins: Set<string> | null, client = "unknown"): Promise<Response | null> {
     const path = url.pathname.slice("/api/auth/".length);
     try {
       if (path === "methods" && req.method === "GET") {
         return json({ methods: this.methods.map((m) => ({ id: m.id, kind: m.kind, name: m.kind === "oauth" ? m.name : "Password" })) });
       }
-      if (path === "signin" && req.method === "POST") return json(await this.signIn(await this.body(req), origins));
+      if (path === "signin" && req.method === "POST") return json(await this.signIn(await this.body(req), origins, client));
       if (path === "signout" && req.method === "POST") {
         const header = req.headers.get("Authorization");
         await this.signOut(header?.startsWith("Bearer ") ? header.slice(7) : null, (await this.body(req)).everywhere === true);
@@ -248,10 +245,10 @@ export class AuthService {
     throw new AuthError("The request body must be a JSON object.");
   }
 
-  private async signIn(body: Record<string, any>, origins: Set<string> | null): Promise<SignInResult> {
+  private async signIn(body: Record<string, any>, origins: Set<string> | null, client: string): Promise<SignInResult> {
     if (typeof body.code === "string") return this.redeemCode(body.code, body.verifier);
     const provider = body.provider;
-    if (provider === "password" && this.password) return this.signInPassword(this.password, body.params ?? {});
+    if (provider === "password" && this.password) return this.signInPassword(this.password, body.params ?? {}, client);
     const method = typeof provider === "string" ? this.oauth.get(provider) : undefined;
     if (method) return { redirect: await this.startOAuth(method, body.redirectTo, body.challenge, origins) };
     throw new AuthError(`Unknown sign-in method ${JSON.stringify(provider)}. Enabled: ${this.ids.join(", ") || "none"}.`);
@@ -259,21 +256,21 @@ export class AuthService {
 
   // ---- Password ----
 
-  private async signInPassword(method: PasswordMethod, params: Record<string, unknown>): Promise<SignInResult> {
+  private async signInPassword(method: PasswordMethod, params: Record<string, unknown>, client: string): Promise<SignInResult> {
     const email = normalizeEmail(params.email);
     if (!EMAIL.test(email)) throw new AuthError("Enter a valid email address.");
     const flow = params.flow ?? "signIn";
     switch (flow) {
       case "signIn":
-        return this.passwordSignIn(method, email, this.checkPassword(params.password, 1));
+        return this.passwordSignIn(method, email, this.checkPassword(params.password, 1), client);
       case "signUp":
-        return this.signUp(method, email, this.checkPassword(params.password, method.minLength), params);
+        return this.signUp(method, email, this.checkPassword(params.password, method.minLength), params, client);
       case "reset":
         return this.requestReset(method, email);
       case "reset-verification":
-        return this.resetPassword(method, email, params.code, this.checkPassword(params.newPassword, method.minLength));
+        return this.resetPassword(method, email, params.code, this.checkPassword(params.newPassword, method.minLength), client);
       case "email-verification":
-        return this.confirmEmail(email, params.code);
+        return this.confirmEmail(email, params.code, client);
       default:
         throw new AuthError(`flow must be one of signIn, signUp, reset, reset-verification, email-verification; got ${JSON.stringify(flow)}.`);
     }
@@ -295,8 +292,10 @@ export class AuthService {
     return user ? { user, secret: account!.secret } : null;
   }
 
-  private async passwordSignIn(method: PasswordMethod, email: string, password: string): Promise<SignInResult> {
-    const key = `password:${email}`;
+  private async passwordSignIn(method: PasswordMethod, email: string, password: string, client: string): Promise<SignInResult> {
+    // Wrong passwords are counted per email and network, so nobody can lock someone else out by
+    // guessing at their address from elsewhere.
+    const key = `password:${email}|${client}`;
     await this.countAttempt(key, MAX_FAILURES, "failed sign-in attempts");
     const found = await this.passwordUser(email);
     // Verify against a dummy hash for unknown emails, so timing doesn't reveal which emails have accounts.
@@ -311,18 +310,22 @@ export class AuthService {
     return this.runtime.withWriter(async (tx) => ({ userId: user._id, token: await this.createSession(tx, user._id) }));
   }
 
-  private async signUp(method: PasswordMethod, email: string, password: string, params: Record<string, unknown>): Promise<SignInResult> {
+  private async signUp(method: PasswordMethod, email: string, password: string, params: Record<string, unknown>, client: string): Promise<SignInResult> {
     const name = typeof params.name === "string" && params.name.trim() ? params.name.trim() : undefined;
     // Only a confirmed code marks an email verified (OAuth sign-ins join users by verified email).
     const fields = method.profile ? { ...method.profile(params), email, emailVerificationTime: undefined } : defined({ email, name });
+    // Hashed either way, so the time a sign-up takes doesn't reveal whether the email is taken.
     const secret = await Bun.password.hash(password);
-    const taken = () => new AuthError("An account with this email already exists. Sign in instead.", 409);
-    let result: SignInResult;
+    let existing = false;
+    let created: SignInResult | null = null;
     try {
-      result = await this.runtime.authWrite(async ({ db, tx }) => {
-        const existing = await tx.get("SELECT user_id FROM _auth_accounts WHERE provider = 'password' AND account_id = ?", [email]);
-        if (existing) {
-          if (await db.get(existing.user_id)) throw taken();
+      created = await this.runtime.authWrite(async ({ db, tx }) => {
+        const account = await tx.get("SELECT user_id FROM _auth_accounts WHERE provider = 'password' AND account_id = ?", [email]);
+        if (account) {
+          if (await db.get(account.user_id)) {
+            existing = true;
+            return null;
+          }
           await tx.run("DELETE FROM _auth_accounts WHERE provider = 'password' AND account_id = ?", [email]); // its user was deleted
         }
         const userId = await db.insert("users", fields);
@@ -336,11 +339,23 @@ export class AuthService {
         return method.verifyEmail ? { codeSent: true as const } : { userId, token: await this.createSession(tx, userId) };
       });
     } catch (err) {
-      if (isUniqueViolation(err)) throw taken(); // signed up twice at once
-      throw err;
+      if (!isUniqueViolation(err)) throw err;
+      existing = true; // signed up twice at once; the account is there now
     }
-    if ("codeSent" in result) await this.sendEmailCode(method, email, "verify");
-    return result;
+    if (!existing) {
+      if ("codeSent" in created!) await this.sendEmailCode(method, email, "verify");
+      return created!;
+    }
+    // The email already has an account, but the answer must read exactly like a fresh sign-up's,
+    // so sign-up never reveals which emails are registered.
+    if (method.verifyEmail) {
+      // A code is sent either way; confirming it signs the owner into their existing account.
+      await this.sendEmailCode(method, email, "verify");
+      return { codeSent: true };
+    }
+    // Without emailed codes there's nothing to answer a fresh sign-up's token with: the right
+    // password signs in (the same reply a new account gets), a wrong one fails exactly like sign-in.
+    return this.passwordSignIn(method, email, password, client);
   }
 
   // ---- Email codes: verification and password reset ----
@@ -381,8 +396,8 @@ export class AuthService {
   }
 
   /** Consumes a code; wrong guesses count toward a lockout, like failed passwords. */
-  private async takeEmailCode(purpose: "verify" | "reset", email: string, code: unknown) {
-    const key = `code:${email}`;
+  private async takeEmailCode(purpose: "verify" | "reset", email: string, code: unknown, client: string) {
+    const key = `code:${email}|${client}`;
     await this.countAttempt(key, MAX_FAILURES, "wrong codes");
     const entered = typeof code === "string" ? code.replace(/\s/g, "") : "";
     const valid =
@@ -410,8 +425,8 @@ export class AuthService {
   }
 
   /** Step 2 of a reset: a new password, signed in, and every other session ended. */
-  private async resetPassword(method: PasswordMethod, email: string, code: unknown, newPassword: string): Promise<SignInResult> {
-    await this.takeEmailCode("reset", email, code);
+  private async resetPassword(method: PasswordMethod, email: string, code: unknown, newPassword: string, client: string): Promise<SignInResult> {
+    await this.takeEmailCode("reset", email, code, client);
     const secret = await Bun.password.hash(newPassword);
     return this.runtime.authWrite(async ({ db, tx, revoke }) => {
       const account = await tx.get("SELECT user_id FROM _auth_accounts WHERE provider = 'password' AND account_id = ?", [email]);
@@ -420,7 +435,8 @@ export class AuthService {
       await tx.run("UPDATE _auth_accounts SET secret = ? WHERE provider = 'password' AND account_id = ?", [secret, email]);
       revoke((await tx.all("SELECT id FROM _auth_sessions WHERE user_id = ?", [user._id])).map((r) => r.id as string));
       await tx.run("DELETE FROM _auth_sessions WHERE user_id = ?", [user._id]);
-      await tx.run("DELETE FROM _auth_attempts WHERE key = ?", [`password:${email}`]);
+      // The owner has proven the inbox: their failed-password count ends, on every network.
+      await tx.run("DELETE FROM _auth_attempts WHERE key = ? OR key LIKE ?", [`password:${email}`, `password:${email}|%`]);
       // The code proves they read this inbox.
       if (typeof user.emailVerificationTime !== "number" && "emailVerificationTime" in this.fitUsers({ emailVerificationTime: 1 })) {
         await db.patch(user._id, { emailVerificationTime: Date.now() });
@@ -430,8 +446,8 @@ export class AuthService {
   }
 
   /** Confirms the email of a new account (verifyEmail) and signs in. */
-  private async confirmEmail(email: string, code: unknown): Promise<SignInResult> {
-    await this.takeEmailCode("verify", email, code);
+  private async confirmEmail(email: string, code: unknown, client: string): Promise<SignInResult> {
+    await this.takeEmailCode("verify", email, code, client);
     return this.runtime.authWrite(async ({ db, tx }) => {
       const account = await tx.get("SELECT user_id FROM _auth_accounts WHERE provider = 'password' AND account_id = ?", [email]);
       const user = account ? await db.get(account.user_id) : null;
@@ -445,6 +461,17 @@ export class AuthService {
     return (this.dummyHash ??= Bun.password.hash(randomToken()));
   }
 
+  /** Chance any auth write also tidies expired rows, so the tables stay small without a timer. */
+  static cleanupChance = 0.05;
+
+  /** Deletes expired sessions and codes, and attempts outside the window. */
+  private async cleanup(tx: Exec) {
+    const now = Date.now();
+    await tx.run("DELETE FROM _auth_sessions WHERE expires < ?", [now]);
+    await tx.run("DELETE FROM _auth_codes WHERE expires < ?", [now]);
+    await tx.run("DELETE FROM _auth_attempts WHERE window_start < ?", [now - FAILURE_WINDOW]);
+  }
+
   /**
    * Counts an attempt before it's made and throws once `key` has been counted more than `max` times
    * within the hour. Counting first, in one write, means parallel requests can't all slip under the
@@ -456,10 +483,12 @@ export class AuthService {
       const row = await tx.get("SELECT count, window_start FROM _auth_attempts WHERE key = ?", [key]);
       if (!row) {
         await tx.run("INSERT INTO _auth_attempts (key, count, window_start) VALUES (?, 1, ?)", [key, now]);
+        if (Math.random() < AuthService.cleanupChance) await this.cleanup(tx);
         return { count: 1, start: now };
       }
       if (Number(row.window_start) < now - FAILURE_WINDOW) {
         await tx.run("UPDATE _auth_attempts SET count = 1, window_start = ? WHERE key = ?", [now, key]);
+        if (Math.random() < AuthService.cleanupChance) await this.cleanup(tx);
         return { count: 1, start: now };
       }
       await tx.run("UPDATE _auth_attempts SET count = count + 1 WHERE key = ?", [key]);

@@ -272,9 +272,12 @@ for (const D of DRIVERS) describe(D.name, () => {
       const affected = (subs as any).affected.bind(subs);
       (subs as any).affected = (...a: unknown[]) => (checks++, affected(...a));
       const seen: number[] = [];
-      const stops = Array.from({ length: 500 }, (_, i) => subs.subscribe("messages:list", { channel: `c${i}` }, null, () => {}));
+      const stops: (() => void)[] = [];
+      // Until its first result, a subscription is checked on every commit, so wait for all of them.
+      await Promise.all(
+        Array.from({ length: 500 }, (_, i) => new Promise((resolve) => stops.push(subs.subscribe("messages:list", { channel: `c${i}` }, null, resolve)))),
+      );
       subs.subscribe("messages:list", { channel: "c7" }, null, (u) => seen.push(u.ok ? (u.value as any[]).length : -1));
-      await Bun.sleep(50);
       checks = 0;
       await m("messages:send", { channel: "c7", author: "x", body: "1" });
       expect(seen.at(-1)).toBe(1);
@@ -282,6 +285,7 @@ for (const D of DRIVERS) describe(D.name, () => {
       // Unsubscribing removes entries from the index.
       stops.forEach((stop) => stop());
       expect((subs as any).index.always.size + [...(subs as any).index.byKey.values()].reduce((n: number, s: Set<unknown>) => n + s.size, 0)).toBe(1);
+      expect([...(subs as any).index.paths.get("messages")]).toEqual([["channel", 1]]);
     });
 
     test("identical subscriptions share one execution", async () => {

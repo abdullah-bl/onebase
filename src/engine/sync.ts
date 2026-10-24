@@ -53,7 +53,10 @@ class SubscriptionIndex {
         keys.add(`tbl|${r.table}`);
         continue;
       }
-      keys.add(`eq|${r.table}|${first[0]}|${valueKey(first[1])}`);
+      const key = `eq|${r.table}|${first[0]}|${valueKey(first[1])}`;
+      // Count each key once, as remove() does: a query can read the same range twice.
+      if (keys.has(key)) continue;
+      keys.add(key);
       const paths = this.paths.get(r.table) ?? this.paths.set(r.table, new Map()).get(r.table)!;
       paths.set(first[0], (paths.get(first[0]) ?? 0) + 1);
     }

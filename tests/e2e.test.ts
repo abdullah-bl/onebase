@@ -14,8 +14,8 @@ let url: string;
 beforeAll(async () => {
   dataDir = mkdtempSync(join(tmpdir(), "onebase-e2e-"));
   const project = await loadProject(join(import.meta.dir, "../example/onebase"));
-  const { schema, modules, http, crons, authenticate } = project;
-  app = await startApp({ schema, modules, http, crons, authenticate, dataDir, port: 0, hostname: "127.0.0.1", dev: false, quiet: true });
+  const { schema, modules, http, crons, authConfig } = project;
+  app = await startApp({ schema, modules, http, crons, auth: authConfig, dataDir, port: 0, hostname: "127.0.0.1", dev: false, quiet: true });
   url = `http://127.0.0.1:${app.server.port}`;
 });
 

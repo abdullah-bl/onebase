@@ -7,14 +7,16 @@ import { isRegisteredFunction, type CronJob, type HttpRouter, type RegisteredFun
 import { ConvexError, describeValue, isPlainObject, validate, type AnyValidator } from "../values";
 import { CronRunner } from "./crons";
 import { applySchema, DatabaseImpl, OnebaseError, readerView, writerView, type ReadSet, type Write } from "./database";
-import { newId } from "./dialect";
+import { isIdForTable, newId } from "./dialect";
 import { savepoint, SerialQueue, type Driver, type Exec } from "./driver";
 import { FileStore, LocalBlobs, type BlobBackend } from "./files";
 import { CallLog, type CallSource } from "./calllog";
 import { currentFunction, installGuards } from "./guard";
+import { AuthService, SESSION_PREFIX } from "./auth";
+import { createAuthenticate, type AuthConfig, type AuthenticateCtx } from "./jwt";
 
 export type Modules = Record<string, Record<string, unknown>>;
-export type Authenticate = (token: string) => Promise<UserIdentity | null> | UserIdentity | null;
+export type Authenticate = (token: string, ctx: AuthenticateCtx) => Promise<UserIdentity | null> | UserIdentity | null;
 export type Logger = { info(msg: string): void; warn(msg: string): void; error(msg: string): void };
 
 export type RuntimeOptions = {
@@ -24,6 +26,9 @@ export type RuntimeOptions = {
   /** Where file bytes go (default: a temporary local directory). */
   blobs?: BlobBackend;
   http?: HttpRouter | null;
+  /** auth.config.ts: built-in sign-in methods, external JWT providers and/or authenticate(). */
+  auth?: AuthConfig | null;
+  /** A token verifier to use instead of the one built from `auth`. */
   authenticate?: Authenticate | null;
   crons?: CronJob[];
   /** Public base URL used for file URLs, e.g. https://api.example.com. */
@@ -63,10 +68,20 @@ export class FunctionError extends Error {
   }
 }
 
-type TxState = { tx: Exec; db: DatabaseImpl; writes: Write[]; scheduled: boolean; afterCommit: (() => Promise<void> | void)[] };
+type TxState = {
+  tx: Exec;
+  db: DatabaseImpl;
+  writes: Write[];
+  scheduled: boolean;
+  afterCommit: (() => Promise<void> | void)[];
+  /** Auth sessions ended in this transaction; connections using them are signed out after commit. */
+  revoked: string[];
+};
 
 /** Commit broadcasts above this size only list the tables (Postgres NOTIFY caps payloads at 8000 bytes). */
 const MAX_BROADCAST = 7000;
+/** Ended sessions per broadcast message; more go in extra messages, so the cap above holds. */
+const REVOKED_PER_MESSAGE = 100;
 
 export class Runtime {
   readonly driver: Driver;
@@ -83,6 +98,9 @@ export class Runtime {
   readonly stats = { connections: 0, subscriptions: () => 0 };
   siteUrl: string;
   private readonly authenticate: Authenticate | null;
+  /** Built-in sign-in, when auth.config.ts lists methods. */
+  readonly auth: AuthService | null;
+  private revokeListeners: ((sessionIds: string[]) => void)[] = [];
   private readonly crons: CronJob[];
   private cronRunner: CronRunner | null = null;
   /** Mutations from this process run one at a time; other instances are handled by the driver. */
@@ -99,7 +117,8 @@ export class Runtime {
     this.driver = opts.driver;
     this.schema = opts.schema;
     this.http = opts.http ?? null;
-    this.authenticate = opts.authenticate ?? null;
+    this.authenticate = opts.authenticate ?? (opts.auth ? createAuthenticate(opts.auth) : null);
+    this.auth = opts.auth?.methods?.length ? new AuthService(this, opts.auth) : null;
     this.dev = opts.dev ?? false;
     this.log = opts.log ?? consoleLogger;
     this.files = new FileStore(opts.blobs ?? new LocalBlobs(mkdtempSync(join(tmpdir(), "onebase-files-"))), () => this.nextCreationTime());
@@ -114,6 +133,7 @@ export class Runtime {
 
   /** Creates system tables and schema indexes, checks existing data, and starts listening to other instances. */
   async init(): Promise<{ created: string[]; dropped: string[] }> {
+    this.auth?.check();
     await this.driver.init();
     const result = await this.driver.write((tx) => applySchema(tx, this.driver.dialect, this.schema));
     await this.checkExistingDocuments();
@@ -212,7 +232,7 @@ export class Runtime {
   }
 
   private async onRemoteCommit(message: string) {
-    let parsed: { o: string; w?: Write[]; t?: string[]; s?: boolean };
+    let parsed: { o: string; w?: Write[]; t?: string[]; s?: boolean; r?: string[] };
     try {
       parsed = JSON.parse(message);
     } catch {
@@ -220,16 +240,67 @@ export class Runtime {
     }
     if (parsed.o === this.instanceId) return;
     if (parsed.s) this.pokeScheduler();
-    await this.notifyCommit(parsed.w ? { writes: parsed.w } : { tables: parsed.t ?? [] });
+    if (parsed.r?.length) this.notifyRevoked(parsed.r);
+    if (parsed.w || parsed.t) await this.notifyCommit(parsed.w ? { writes: parsed.w } : { tables: parsed.t ?? [] });
+  }
+
+  /** Calls `listener` with the ids of auth sessions that end (sign-out here or on another instance). */
+  onSessionsRevoked(listener: (sessionIds: string[]) => void): () => void {
+    this.revokeListeners.push(listener);
+    return () => {
+      this.revokeListeners = this.revokeListeners.filter((l) => l !== listener);
+    };
+  }
+
+  private notifyRevoked(sessionIds: string[]) {
+    for (const l of this.revokeListeners) l(sessionIds);
   }
 
   async identify(token: string | null | undefined): Promise<UserIdentity | null> {
     if (!token) return null;
+    if (this.auth && token.startsWith(SESSION_PREFIX)) return this.auth.identifySession(token);
     if (!this.authenticate) {
-      throw new OnebaseError("A client sent an auth token but there's no auth.config.ts exporting authenticate(token).");
+      throw new OnebaseError(
+        "A client sent an auth token, but auth.config.ts has no sign-in methods, providers or authenticate(token, ctx) to check it.",
+      );
     }
-    return (await this.authenticate(token)) ?? null;
+    return (await this.authenticate(token, this.authCtx)) ?? null;
   }
+
+  /**
+   * ctx for a custom authenticate(token, ctx): read-only database access. Each read runs in its
+   * own snapshot, so no transaction stays open while authenticate() waits on anything else.
+   */
+  private readonly authCtx: AuthenticateCtx = (() => {
+    const read = <T>(fn: (db: ReturnType<typeof readerView>) => Promise<T>) => this.withReader((tx) => fn(readerView(this.newDb(tx, {}))));
+    const terminal = new Set(["collect", "take", "first", "unique", "paginate"]);
+    const query = (table: string) => {
+      const steps: [string, unknown[]][] = [];
+      const replay = (db: any) => steps.reduce((q, [method, args]) => q[method](...args), db.query(table));
+      const builder: any = new Proxy(
+        {},
+        {
+          get: (_target, prop) => {
+            if (prop === Symbol.asyncIterator) return async function* () { yield* (await read((db) => replay(db).collect())) as unknown[]; };
+            if (typeof prop !== "string" || prop === "then") return undefined;
+            if (terminal.has(prop)) return (...args: unknown[]) => read((db) => replay(db)[prop](...args));
+            return (...args: unknown[]) => {
+              steps.push([prop, args]);
+              return builder;
+            };
+          },
+        },
+      );
+      return builder;
+    };
+    return {
+      db: {
+        get: (id: string) => read((db) => db.get(id)),
+        query,
+        normalizeId: (table: string, id: string) => (isIdForTable(id, table) ? id : null),
+      } as any,
+    };
+  })();
 
   // ---- Lookup & validation ----
 
@@ -281,7 +352,7 @@ export class Runtime {
 
   // ---- Contexts ----
 
-  private auth(identity: UserIdentity | null) {
+  private authFor(identity: UserIdentity | null) {
     return { getUserIdentity: async () => identity };
   }
 
@@ -390,13 +461,13 @@ export class Runtime {
   }
 
   private queryCtx(db: DatabaseImpl, identity: UserIdentity | null) {
-    return { db: readerView(db), auth: this.auth(identity), storage: this.storageReader(db.tx) };
+    return { db: readerView(db), auth: this.authFor(identity), storage: this.storageReader(db.tx) };
   }
 
   private mutationCtx(state: TxState, identity: UserIdentity | null) {
     return {
       db: writerView(state.db),
-      auth: this.auth(identity),
+      auth: this.authFor(identity),
       storage: this.storageWriter(state),
       scheduler: this.schedulerFor(state),
       runQuery: (ref: FunctionLike, args?: unknown) => {
@@ -421,7 +492,7 @@ export class Runtime {
 
   actionCtx(identity: UserIdentity | null) {
     const ctx = {
-      auth: this.auth(identity),
+      auth: this.authFor(identity),
       storage: this.storageForActions(),
       scheduler: this.schedulerFor(null),
       runQuery: (ref: FunctionLike, args?: unknown) => this.runQuery(ref, args, { identity, allowInternal: true }).then((r) => r.value),
@@ -489,19 +560,20 @@ export class Runtime {
    * post-commit hooks, scheduler wake-up and live-query invalidation.
    */
   private async transact<T>(body: (state: TxState) => Promise<T>, beforeCommit?: () => void): Promise<T> {
-    const { value, writes, scheduled, afterCommit } = await this.mutations.run(() =>
+    const { value, writes, scheduled, afterCommit, revoked } = await this.mutations.run(() =>
       // The driver may run this more than once if another instance conflicts; each attempt starts fresh.
       this.driver.write(async (tx) => {
-        const state: TxState = { tx, db: undefined as any, writes: [], scheduled: false, afterCommit: [] };
+        const state: TxState = { tx, db: undefined as any, writes: [], scheduled: false, afterCommit: [], revoked: [] };
         state.db = this.newDb(tx, { writes: state.writes });
         const value = await body(state);
-        if (this.driver.shared && this.driver.publish && (state.writes.length || state.scheduled)) {
-          await this.driver.publish(tx, this.broadcastMessage(state));
+        if (this.driver.shared && this.driver.publish && (state.writes.length || state.scheduled || state.revoked.length)) {
+          for (const message of this.broadcastMessages(state)) await this.driver.publish(tx, message);
         }
         beforeCommit?.();
-        return { value, writes: state.writes, scheduled: state.scheduled, afterCommit: state.afterCommit };
+        return { value, writes: state.writes, scheduled: state.scheduled, afterCommit: state.afterCommit, revoked: state.revoked };
       }),
     );
+    if (revoked.length) this.notifyRevoked(revoked);
     for (const fn of afterCommit) await fn();
     if (scheduled) this.pokeScheduler();
     if (writes.length) await this.notifyCommit({ writes });
@@ -520,6 +592,16 @@ export class Runtime {
     );
   }
 
+  /**
+   * Built-in auth: one transaction over the system tables and the users table, which live
+   * queries see like any mutation. `revoke` signs out connections using those sessions.
+   */
+  authWrite<T>(body: (ctx: { db: DatabaseImpl; tx: Exec; revoke(sessionIds: string[]): void }) => Promise<T>): Promise<T> {
+    return this.calls.track("auth", "mutation", "auth", () =>
+      this.transact((state) => body({ db: state.db, tx: state.tx, revoke: (ids) => state.revoked.push(...ids) })),
+    );
+  }
+
   /** Dashboard reads: a snapshot `db` that isn't limited to schema.ts tables. */
   adminRead<T>(body: (db: DatabaseImpl, tx: Exec) => Promise<T>): Promise<T> {
     return this.driver.read((tx) =>
@@ -530,10 +612,14 @@ export class Runtime {
     );
   }
 
-  private broadcastMessage(state: TxState): string {
-    const full = JSON.stringify({ o: this.instanceId, w: state.writes, s: state.scheduled || undefined });
-    if (full.length <= MAX_BROADCAST) return full;
-    return JSON.stringify({ o: this.instanceId, t: [...new Set(state.writes.map((w) => w.table))], s: state.scheduled || undefined });
+  private broadcastMessages(state: TxState): string[] {
+    const revoked: string[][] = [];
+    for (let i = 0; i < state.revoked.length; i += REVOKED_PER_MESSAGE) revoked.push(state.revoked.slice(i, i + REVOKED_PER_MESSAGE));
+    const extra = { s: state.scheduled || undefined, r: revoked[0] };
+    const full = JSON.stringify({ o: this.instanceId, w: state.writes, ...extra });
+    const first = full.length <= MAX_BROADCAST ? full : JSON.stringify({ o: this.instanceId, t: [...new Set(state.writes.map((w) => w.table))], ...extra });
+    // Signing out a user with many sessions ends them all; the rest of the ids follow on their own.
+    return [first, ...revoked.slice(1).map((r) => JSON.stringify({ o: this.instanceId, r }))];
   }
 
   async runAction(ref: FunctionLike, args: unknown, opts: CallOptions = {}): Promise<unknown> {

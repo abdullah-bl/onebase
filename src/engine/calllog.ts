@@ -4,7 +4,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { format } from "node:util";
 
-export type CallSource = "client" | "http" | "subscription" | "scheduler" | "cron" | "function" | "dashboard";
+export type CallSource = "client" | "http" | "subscription" | "scheduler" | "cron" | "function" | "dashboard" | "auth";
 export type LogLine = { level: "log" | "info" | "warn" | "error" | "debug"; text: string };
 export type CallRecord = {
   id: number;

@@ -47,7 +47,7 @@ onebase follows [Convex](https://convex.dev)'s programming model and API, and ma
 | [Live queries](./client.md) | WebSocket subscriptions that update only when relevant data changes |
 | [Scheduling](./scheduling.md) | `runAfter` / `runAt`, plus cron jobs that survive restarts |
 | [File storage](./file-storage.md) | Uploads and downloads, on local disk or in S3 / R2 / MinIO |
-| [Auth](./auth.md) | JWT verification for Clerk, Auth0, WorkOS and any OIDC provider |
+| [Auth](./auth.md) | Built-in password and OAuth sign-in with sessions, or tokens from Clerk, Auth0, WorkOS and any OIDC provider |
 | [HTTP actions](./http-actions.md) | Webhooks and custom HTTP endpoints |
 | [Databases](./databases.md) | SQLite, Postgres or Turso, including multiple instances |
 | [Backups](./backups.md) | SQLite snapshots to S3, with restore |

@@ -92,6 +92,8 @@ function Tasks() {
 | `useAction(ref)` | returns `(args) => Promise` |
 | `usePaginatedQuery(ref, args, { initialNumItems })` | `{ results, status, isLoading, loadMore(n) }`; every loaded page stays live; errors throw to the nearest error boundary |
 | `useConnectionState()` | `"connecting" \| "open" \| "closed"` |
+| `useOnebaseAuth()` | `{ isLoading, isAuthenticated, error }` (also exported as `useConvexAuth`) |
+| `useAuthActions()` | `{ signIn, signOut }` for built-in sign-in |
 
 **Porting from Convex:** the aliases `ConvexProvider` and `ConvexReactClient` are exported too, so code written for Convex works after changing the import path.
 
@@ -128,12 +130,24 @@ The `store` covers the queries this client is subscribed to:
 
 ## Authentication
 
+With [built-in sign-in](./auth.md#built-in-sign-in):
+
+```ts
+await client.signIn("password", { flow: "signIn", email, password });
+await client.signIn("github"); // goes to GitHub and comes back signed in
+client.authState; // { isLoading, isAuthenticated, error }
+client.onAuthChange((state) => render(state));
+await client.signOut();
+```
+
+With an external provider:
+
 ```ts
 client.setAuth(async () => await getTokenFromYourAuthProvider()); // called on every (re)connect
 client.clearAuth();
 ```
 
-The server then re-runs your subscriptions as that user. See [Auth](./auth.md).
+Either way, the server re-runs your subscriptions as that user. See [Auth](./auth.md).
 
 ## Scripts and servers
 

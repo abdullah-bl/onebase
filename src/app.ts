@@ -6,6 +6,7 @@ import { RateLimiter, serve, type AssetResolver, type RateLimit } from "./engine
 import { startBackups, type BackupOptions } from "./backup";
 import { createDriver } from "./engine/driver";
 import { LocalBlobs, parseS3Url, S3Blobs } from "./engine/files";
+import type { AuthConfig } from "./engine/jwt";
 import { consoleLogger, Runtime, type Authenticate, type Modules } from "./engine/runtime";
 import type { SchemaDefinition } from "./schema";
 import type { Crons, HttpRouter } from "./server";
@@ -21,6 +22,9 @@ export type AppOptions = {
   schema: SchemaDefinition<any> | null;
   modules: Modules;
   http?: HttpRouter | null;
+  /** auth.config.ts: sign-in methods, external providers and/or authenticate(token, ctx). */
+  auth?: AuthConfig | null;
+  /** A token verifier to use instead of the one built from `auth`. */
   authenticate?: Authenticate | null;
   crons?: Crons | null;
   dataDir: string;
@@ -76,6 +80,7 @@ export async function startApp(opts: AppOptions) {
     schema: opts.schema,
     modules: opts.modules,
     http: opts.http,
+    auth: opts.auth,
     authenticate: opts.authenticate,
     crons: opts.crons?.jobs ?? [],
     dev: opts.dev,
@@ -105,6 +110,7 @@ export async function startApp(opts: AppOptions) {
     console.log(`  functions  ${names.length}${names.length ? ` (${names.slice(0, 6).join(", ")}${names.length > 6 ? ", …" : ""})` : ""}`);
     if (created.length || dropped.length) console.log(`  indexes    +${created.length} -${dropped.length}`);
     if (opts.crons?.jobs.length) console.log(`  crons      ${opts.crons.jobs.map((j) => j.name).join(", ")}`);
+    if (runtime.auth) console.log(`  sign-in    ${runtime.auth.ids.join(", ")}`);
     console.log(`  database   ${driver.description}`);
     console.log(`  files      ${blobs.description}`);
     if (opts.backup) console.log(`  backups    ${opts.backup.url} every ${Math.round(opts.backup.everyMs / 60_000)} min, keep ${opts.backup.keep}`);

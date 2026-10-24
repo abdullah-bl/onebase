@@ -98,10 +98,11 @@ describe("JWT auth providers", () => {
   });
 
   test("providers and a custom authenticate() can be combined", async () => {
-    const authenticate = createAuthenticate({
+    const verify = createAuthenticate({
       providers: [{ domain: rs.origin }],
       authenticate: (token) => (token === "api-key-123" ? { subject: "service", tokenIdentifier: "key|service" } : null),
-    });
+    })!;
+    const authenticate = (token: string) => verify(token, { db: null as any });
     expect((await authenticate("api-key-123"))?.subject).toBe("service");
     expect(await authenticate("nope")).toBeNull();
     expect((await authenticate(await rs.sign({ iss: rs.origin, sub: "jwt-user", exp: now() + 60 })))?.subject).toBe("jwt-user");

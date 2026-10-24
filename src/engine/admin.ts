@@ -99,6 +99,7 @@ export function createAdmin(opts: { runtime: Runtime; key: string; assets: Dashb
         totals: runtime.calls.totals,
         tables: t.map(({ name, count, inSchema }) => ({ name, count, inSchema })),
         schema: Boolean(runtime.schema),
+        signIn: runtime.auth?.ids ?? [],
       };
     },
 

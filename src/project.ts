@@ -3,8 +3,9 @@
 import { plugin } from "bun";
 import { existsSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
-import { createAuthenticate, type AuthConfig } from "./engine/jwt";
-import type { Authenticate, Modules } from "./engine/runtime";
+import * as auth from "./auth";
+import type { AuthConfig } from "./engine/jwt";
+import type { Modules } from "./engine/runtime";
 import type { SchemaDefinition } from "./schema";
 import * as server from "./server";
 import type { Crons, HttpRouter } from "./server";
@@ -16,7 +17,8 @@ export type Project = {
   modules: Modules;
   http: HttpRouter | null;
   crons: Crons | null;
-  authenticate: Authenticate | null;
+  /** auth.config.ts's default export. */
+  authConfig: AuthConfig | null;
   /** Module path → source file. */
   sources: Record<string, string>;
 };
@@ -26,7 +28,7 @@ const SPECIAL = new Set(["schema", "auth.config"]);
 let registered = false;
 
 /**
- * Makes `onebase/server` and `onebase/values` importable from function files on disk,
+ * Makes `onebase/server`, `onebase/values` and `onebase/auth` importable from function files on disk,
  * even inside a compiled single-file binary where no node_modules exist.
  */
 export function registerVirtualModules() {
@@ -37,6 +39,7 @@ export function registerVirtualModules() {
     setup(build) {
       build.module("onebase/server", () => ({ exports: server, loader: "object" }));
       build.module("onebase/values", () => ({ exports: values, loader: "object" }));
+      build.module("onebase/auth", () => ({ exports: auth, loader: "object" }));
       build.module("onebase", () => ({ exports: server, loader: "object" }));
     },
   });
@@ -82,7 +85,7 @@ export async function loadProject(dirInput: string, onError?: (err: ProjectLoadE
   if (!existsSync(dir)) {
     throw new Error(`Functions directory not found: ${dir}\nCreate it (e.g. mkdir onebase) or pass --dir <path>.`);
   }
-  const project: Project = { dir, schema: null, modules: {}, http: null, crons: null, authenticate: null, sources: {} };
+  const project: Project = { dir, schema: null, modules: {}, http: null, crons: null, authConfig: null, sources: {} };
   for (const file of await listSourceFiles(dir)) {
     const modulePath = modulePathFor(dir, file);
     let exports: Record<string, unknown>;
@@ -102,7 +105,7 @@ export async function loadProject(dirInput: string, onError?: (err: ProjectLoadE
       continue;
     }
     if (modulePath === "auth.config") {
-      project.authenticate = createAuthenticate(exports.default as AuthConfig);
+      project.authConfig = (exports.default as AuthConfig) ?? null;
       continue;
     }
     if (modulePath === "http" && (exports.default as any)?.__onebase === "httpRouter") {

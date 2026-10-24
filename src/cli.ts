@@ -11,7 +11,7 @@ import { doctor, printFindings } from "./doctor";
 import { SqliteDriver } from "./engine/driver";
 import { LocalBlobs } from "./engine/files";
 import { parseRateLimit } from "./engine/http";
-import { createAuthenticate, type AuthConfig } from "./engine/jwt";
+import type { AuthConfig } from "./engine/jwt";
 import type { Modules } from "./engine/runtime";
 import { listSourceFiles, loadProject, modulePathFor } from "./project";
 import type { SchemaDefinition } from "./schema";
@@ -166,7 +166,7 @@ async function serveCommand(opts: ReturnType<typeof options>) {
     schema: project.schema,
     modules: project.modules,
     http: project.http,
-    authenticate: project.authenticate,
+    auth: project.authConfig,
     crons: project.crons,
     dataDir: opts.data,
     ...serverOptions(opts),
@@ -282,7 +282,7 @@ export async function runEmbedded(project: EmbeddedProject, argv = process.argv.
     schema: project.schema,
     modules: project.modules,
     http: project.http,
-    authenticate: project.authConfig ? createAuthenticate(project.authConfig) : null,
+    auth: project.authConfig,
     crons: project.crons,
     dataDir: opts.data,
     ...serverOptions(opts),

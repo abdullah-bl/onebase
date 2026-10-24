@@ -1,5 +1,6 @@
 import type { Server, ServerWebSocket } from "bun";
 import type { UserIdentity } from "../server";
+import { AuthError } from "./auth";
 import type { Runtime } from "./runtime";
 import { SubscriptionManager } from "./sync";
 
@@ -94,6 +95,7 @@ const CORS_BASE = {
 export function serve(opts: ServeOptions): Server<SocketData> {
   const { runtime } = opts;
   const subscriptions = new SubscriptionManager(runtime);
+  const sockets = new Set<ServerWebSocket<SocketData>>();
   const origins = opts.cors?.length && !opts.cors.includes("*") ? new Set(opts.cors.map((o) => o.replace(/\/$/, ""))) : null;
   const limiter = opts.rateLimit ? new RateLimiter(opts.rateLimit) : null;
 
@@ -175,6 +177,19 @@ export function serve(opts: ServeOptions): Server<SocketData> {
     }
   };
 
+  // A signed-out session stops working at once on every connection using it, here or (via the
+  // commit broadcast) on another instance.
+  runtime.onSessionsRevoked((ids) => {
+    const ended = new Set(ids);
+    for (const ws of sockets) {
+      const sessionId = ws.data.identity?.sessionId;
+      if (typeof sessionId !== "string" || !ended.has(sessionId)) continue;
+      ws.data.identity = null;
+      send(ws, { type: "auth", ok: false, ended: true, error: "You were signed out." });
+      for (const [id, sub] of ws.data.subs) subscribe(ws, id, sub.path, sub.args, false);
+    }
+  });
+
   const handleMessage = async (ws: ServerWebSocket<SocketData>, msg: ClientMessage) => {
     if (msg.type === "auth") {
       ws.data.ready = (async () => {
@@ -183,7 +198,9 @@ export function serve(opts: ServeOptions): Server<SocketData> {
           send(ws, { type: "auth", ok: true, identity: ws.data.identity ? { subject: ws.data.identity.subject } : null });
         } catch (err) {
           ws.data.identity = null;
-          send(ws, { type: "auth", ok: false, error: runtime.toClientError(err).message });
+          // `ended`: the session is gone for good. Anything else (say, the database timing out) may pass.
+          const ended = err instanceof AuthError && err.status === 401;
+          send(ws, { type: "auth", ok: false, ended, error: runtime.toClientError(err).message });
         }
         // Results depend on who is asking, so re-subscribe under the new identity.
         for (const [id, sub] of ws.data.subs) subscribe(ws, id, sub.path, sub.args, false);
@@ -266,7 +283,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
       if (path.startsWith("/api/")) {
         if (req.method === "OPTIONS") return new Response(null, { headers: cors(req) });
         const kind = path.slice(5);
-        const counted = req.method === "POST" && ["query", "mutation", "action", "run", "storage/upload"].includes(kind);
+        const counted = req.method === "POST" && ["query", "mutation", "action", "run", "storage/upload", "auth/signin"].includes(kind);
         const limit = counted ? limited(clientIp(req, server)) : null;
         if (limit) {
           return json(req, { status: "error", errorMessage: limit.message }, 429, { "Retry-After": String(Math.ceil(limit.retryMs / 1000)) });
@@ -283,6 +300,15 @@ export function serve(opts: ServeOptions): Server<SocketData> {
           const res = await runtime.serveFile(path.slice("/api/storage/".length), req);
           if (!res) return new Response("File not found", { status: 404, headers: cors(req) });
           for (const [k, v] of Object.entries(cors(req))) res.headers.set(k, v);
+          return res;
+        }
+        if (path.startsWith("/api/auth/")) {
+          const res = runtime.auth ? await runtime.auth.handle(req, url, origins) : null;
+          if (!res) {
+            const hint = runtime.auth ? "" : " Built-in auth is off: add methods: [password(), ...] to auth.config.ts.";
+            return json(req, { error: `Unknown endpoint ${req.method} ${path}.${hint}` }, 404);
+          }
+          if (res.status < 300 || res.status >= 400) for (const [k, v] of Object.entries(cors(req))) res.headers.set(k, v);
           return res;
         }
         if (path === "/api/health") return json(req, { ok: true, functions: runtime.functions.size, subscriptions: subscriptions.size });
@@ -311,7 +337,8 @@ export function serve(opts: ServeOptions): Server<SocketData> {
     },
     websocket: {
       idleTimeout: 120,
-      open() {
+      open(ws) {
+        sockets.add(ws);
         runtime.stats.connections++;
       },
       message(ws, raw) {
@@ -324,6 +351,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
         void handleMessage(ws, msg);
       },
       close(ws) {
+        sockets.delete(ws);
         runtime.stats.connections--;
         for (const sub of ws.data.subs.values()) sub.unsubscribe();
         ws.data.subs.clear();

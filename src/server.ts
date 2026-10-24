@@ -11,7 +11,7 @@ import type {
 } from "./api";
 import { getFunctionName } from "./api";
 import { parseCron } from "./cron";
-import type { AnyDataModel, GenericDataModel, GenericTableInfo } from "./schema";
+import type { AnyDataModel, GenericDataModel, GenericTableInfo, SearchIndexConfig } from "./schema";
 import {
   asObjectValidator,
   type AnyValidator,
@@ -42,6 +42,9 @@ type TableNames<DM> = keyof DM & string;
 type DocOf<DM, T extends keyof DM> = DM[T] extends GenericTableInfo ? DM[T]["document"] : any;
 type WithoutSystemFields<D> = { [K in keyof D as K extends "_id" | "_creationTime" ? never : K]: D[K] };
 type IndexesOf<DM, T extends keyof DM> = DM[T] extends GenericTableInfo ? DM[T]["indexes"] : Record<string, string[]>;
+type SearchIndexesOf<DM, T extends keyof DM> = DM[T] extends { searchIndexes: infer S extends Record<string, SearchIndexConfig> }
+  ? S
+  : Record<string, SearchIndexConfig>;
 
 export type Expression<T = unknown> = { readonly __expr: true; readonly __t?: T };
 type ExprOrValue<T> = Expression<T> | T;
@@ -92,17 +95,39 @@ export interface Query<Doc> extends OrderedQuery<Doc> {
   order(order: "asc" | "desc"): OrderedQuery<Doc>;
 }
 
-export interface QueryInitializer<Doc, Indexes extends Record<string, string[]>> extends Query<Doc> {
+/** Marks a finished search expression; built by `q.search(...)`. */
+export type SearchFilter = { readonly __searchFilter: true };
+
+export interface SearchFilterBuilder<Doc, Index extends SearchIndexConfig> {
+  /** Documents whose `field` contains any of the words in `text` (the last word also matches as a prefix), best matches first. */
+  search(field: Index["searchField"], text: string): SearchFilterFinalizer<Doc, Index>;
+}
+
+export interface SearchFilterFinalizer<Doc, Index extends SearchIndexConfig> extends SearchFilter {
+  /** Only documents where a `filterFields` field equals `value`. */
+  eq<F extends Index["filterFields"]>(field: F, value: F extends keyof Doc ? Doc[F] : any): SearchFilterFinalizer<Doc, Index>;
+}
+
+export interface QueryInitializer<
+  Doc,
+  Indexes extends Record<string, string[]>,
+  SearchIndexes extends Record<string, SearchIndexConfig> = Record<string, SearchIndexConfig>,
+> extends Query<Doc> {
   withIndex<I extends keyof Indexes & string>(
     indexName: I,
     range?: (q: IndexRangeBuilder<Doc, Indexes[I][number]>) => IndexRangeBuilder<Doc, any>,
   ): Query<Doc>;
+  /** Full-text search. Results come best match first (at most 1024), so `.order()` isn't available. */
+  withSearchIndex<I extends keyof SearchIndexes & string>(
+    indexName: I,
+    search: (q: SearchFilterBuilder<Doc, SearchIndexes[I]>) => SearchFilter,
+  ): OrderedQuery<Doc>;
   fullTableScan(): Query<Doc>;
 }
 
 export interface DatabaseReader<DM> {
   get<T extends TableNames<DM>>(id: GenericId<T>): Promise<DocOf<DM, T> | null>;
-  query<T extends TableNames<DM>>(table: T): QueryInitializer<DocOf<DM, T>, IndexesOf<DM, T>>;
+  query<T extends TableNames<DM>>(table: T): QueryInitializer<DocOf<DM, T>, IndexesOf<DM, T>, SearchIndexesOf<DM, T>>;
   /** Returns the id if it is a valid id for `table`, otherwise null. */
   normalizeId<T extends TableNames<DM>>(table: T, id: string): GenericId<T> | null;
 }

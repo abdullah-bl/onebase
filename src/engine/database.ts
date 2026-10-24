@@ -1,4 +1,4 @@
-import type { SchemaDefinition } from "../schema";
+import type { SchemaDefinition, SearchIndexDef } from "../schema";
 import type { PaginationOptions, PaginationResult } from "../server";
 import { describeValue, isPlainObject, validate, type AnyValidator } from "../values";
 import { FIELD_PATH, isIdForTable, newId, systemKind, tableLiteral, type Dialect, type ValueKind } from "./dialect";
@@ -262,9 +262,30 @@ function decodeCursor(cursor: string): unknown[] {
   throw new OnebaseError(`Invalid pagination cursor. Pass null for the first page, then the continueCursor you got back.`);
 }
 
+// ---- Search ----
+
+/** Search queries return at most this many results, like Convex. */
+export const MAX_SEARCH_RESULTS = 1024;
+
+export const searchIndexName = (table: string, index: string) => `sx_${table}__${index}`;
+
+/** Words in a search string (letters, digits and combining marks), at most 16. */
+export function searchTerms(text: string): string[] {
+  return (text.toLowerCase().match(/[\p{L}\p{N}\p{M}]+/gu) ?? []).slice(0, 16);
+}
+
+/** Search results are ordered by relevance, so their cursors are positions in that order. */
+function searchOffset(cursor: string): number {
+  const key = decodeCursor(cursor);
+  if (key[0] !== "search" || !Number.isInteger(key[1])) throw new OnebaseError("This cursor belongs to a different query.");
+  return key[1] as number;
+}
+
 // ---- Queries ----
 
 type Cond = { field: string; op: "eq" | "gt" | "gte" | "lt" | "lte"; value: unknown };
+type Search = { index: SearchIndexDef; text: string; eq: Cond[] };
+const COND_SQL = { eq: "=", gt: ">", gte: ">=", lt: "<", lte: "<=" };
 
 class QueryImpl {
   private indexName: string | null = null;
@@ -272,6 +293,7 @@ class QueryImpl {
   private rangeConds: Cond[] = [];
   private filters: Expr[] = [];
   private direction: "asc" | "desc" = "asc";
+  private search: Search | null = null;
 
   constructor(
     private readonly db: DatabaseImpl,
@@ -280,6 +302,7 @@ class QueryImpl {
 
   withIndex(indexName: string, range?: (q: any) => unknown) {
     if (this.indexName) throw new OnebaseError(`.withIndex() can only be called once per query.`);
+    if (this.search) throw new OnebaseError(`A query can use .withSearchIndex() or .withIndex(), not both.`);
     const fields = this.db.indexFields(this.table, indexName);
     this.indexName = indexName;
     this.indexFields = fields;
@@ -300,7 +323,8 @@ class QueryImpl {
   }
 
   private checkRange(conds: Cond[]) {
-    const fields = this.indexFields;
+    // Like Convex, every index ends with _creationTime, so it can follow the declared fields.
+    const fields = this.indexFields.at(-1) === "_creationTime" ? this.indexFields : [...this.indexFields, "_creationTime"];
     const where = `index "${this.indexName}" on "${this.table}" (fields: ${fields.join(", ")})`;
     let pos = 0;
     let i = 0;
@@ -333,11 +357,47 @@ class QueryImpl {
     }
   }
 
+  withSearchIndex(indexName: string, build: (q: any) => unknown) {
+    if (this.indexName || this.search) throw new OnebaseError(`A query can use .withSearchIndex() or .withIndex() once, not both.`);
+    const index = this.db.searchIndex(this.table, indexName);
+    const where = `search index "${indexName}" on "${this.table}"`;
+    let text: string | null = null;
+    const eq: Cond[] = [];
+    const finalizer = {
+      __searchFilter: true,
+      eq: (field: string, value: unknown) => {
+        if (!index.filterFields.includes(field)) {
+          throw new OnebaseError(
+            `"${field}" isn't a filter field of ${where} (filterFields: ${index.filterFields.join(", ") || "none"}). ` +
+              `Add it to filterFields in schema.ts, or use .filter() after .withSearchIndex().`,
+          );
+        }
+        eq.push({ field, op: "eq", value });
+        return finalizer;
+      },
+    };
+    const result = build({
+      search: (field: string, query: unknown) => {
+        if (text !== null) throw new OnebaseError(`Call q.search() once per .withSearchIndex().`);
+        if (field !== index.searchField) throw new OnebaseError(`${where} searches "${index.searchField}", not "${field}".`);
+        if (typeof query !== "string") throw new OnebaseError(`q.search("${field}", text) needs a string, got ${describeValue(query)}.`);
+        text = query;
+        return finalizer;
+      },
+    });
+    if (text === null || result !== finalizer) {
+      throw new OnebaseError(`.withSearchIndex("${indexName}", (q) => q.search("${index.searchField}", text)) must return q.search(...).`);
+    }
+    this.search = { index, text, eq };
+    return this;
+  }
+
   fullTableScan() {
     return this;
   }
 
   order(direction: "asc" | "desc") {
+    if (this.search) throw new OnebaseError(`Search results are ordered by relevance; .order() can't be used with .withSearchIndex().`);
     if (direction !== "asc" && direction !== "desc") {
       throw new OnebaseError(`.order() takes "asc" or "desc", got ${describeValue(direction)}.`);
     }
@@ -374,20 +434,21 @@ class QueryImpl {
     return [...fields.map((f) => ({ sql: d.field(f), kind: (systemKind(f) ?? "json") as ValueKind })), { sql: "ct", kind: "ct" }, { sql: "id", kind: "id" }];
   }
 
+  private condSql(cond: Cond, params: unknown[]): string {
+    const d = this.db.dialect;
+    const kind = systemKind(cond.field) ?? "json";
+    const col = d.field(cond.field);
+    if (cond.op === "eq" && (cond.value === null || cond.value === undefined)) return d.isNull(col, kind);
+    params.push(d.encode(cond.value, kind));
+    return `${col} ${COND_SQL[cond.op]} ${d.placeholder(kind)}`;
+  }
+
   private async run(opts: { limit?: number; cursor?: string | null; endCursor?: string | null }) {
+    if (this.search) return this.runSearch(this.search, opts);
     const d = this.db.dialect;
     const params: unknown[] = [];
     const where = [`tbl = ${tableLiteral(this.table)}`];
-    for (const cond of this.rangeConds) {
-      const kind = systemKind(cond.field) ?? "json";
-      const col = d.field(cond.field);
-      if (cond.op === "eq" && (cond.value === null || cond.value === undefined)) {
-        where.push(d.isNull(col, kind));
-      } else {
-        where.push(`${col} ${{ eq: "=", gt: ">", gte: ">=", lt: "<", lte: "<=" }[cond.op]} ${d.placeholder(kind)}`);
-        params.push(d.encode(cond.value, kind));
-      }
-    }
+    for (const cond of this.rangeConds) where.push(this.condSql(cond, params));
     const compiler = new ExprCompiler(d, params);
     for (const f of this.filters) where.push(compiler.bool(f));
 
@@ -395,7 +456,7 @@ class QueryImpl {
     const dir = this.direction === "asc" ? "ASC" : "DESC";
     const bound = (cursor: string, op: string) => {
       const key = decodeCursor(cursor);
-      if (key.length !== keys.length) throw new OnebaseError("This cursor belongs to a different query.");
+      if (key.length !== keys.length || key[0] === "search") throw new OnebaseError("This cursor belongs to a different query.");
       where.push(`(${keys.map((k) => k.sql).join(", ")}) ${op} (${keys.map((k) => d.placeholder(k.kind)).join(", ")})`);
       params.push(...key.map((v, i) => d.encode(v, keys[i]!.kind)));
     };
@@ -420,6 +481,38 @@ class QueryImpl {
       until: opts.endCursor ? decodeCursor(opts.endCursor) : full ? rows[rows.length - 1]!.key : undefined,
     });
     return rows;
+  }
+
+  /** Relevance-ordered search; each row's key is its position, for cursors. */
+  private async runSearch(search: Search, opts: { limit?: number; cursor?: string | null; endCursor?: string | null }) {
+    const d = this.db.dialect;
+    const eq: [string, unknown][] = search.eq.map((c) => [c.field, c.value]);
+    for (const f of this.filters) eq.push(...equalityConditions(f));
+    // Any write to a matching document can change relevance order, so there's no narrower window.
+    this.db.readSet?.ranges.push({ table: this.table, eq });
+
+    const terms = searchTerms(search.text);
+    const offset = opts.cursor ? searchOffset(opts.cursor) : 0;
+    const end = Math.min(opts.endCursor ? searchOffset(opts.endCursor) : Infinity, MAX_SEARCH_RESULTS);
+    const limit = Math.min(opts.limit ?? Infinity, end - offset);
+    if (!terms.length || limit <= 0) return [];
+
+    const sql = d.searchSql(searchIndexName(this.table, search.index.name), search.index.searchField);
+    const query = d.searchQuery(terms);
+    const params: unknown[] = [query];
+    const where = [sql.match, `tbl = ${tableLiteral(this.table)}`];
+    for (const cond of search.eq) where.push(this.condSql(cond, params));
+    const compiler = new ExprCompiler(d, params);
+    for (const f of this.filters) where.push(compiler.bool(f));
+    if (sql.rankTakesQuery) params.push(query);
+    const rows = await this.db.tx.all(
+      `SELECT id, ct, doc FROM ${sql.from} WHERE ${where.join(" AND ")} ORDER BY ${sql.rank}, ct DESC, id LIMIT ${Math.floor(limit)} OFFSET ${offset}`,
+      params,
+    );
+    return rows.map((row, i) => ({
+      doc: { _id: row.id, _creationTime: Number(row.ct), ...d.parseDoc(row.doc) } as Doc,
+      key: ["search", offset + i + 1] as unknown[],
+    }));
   }
 
   private recordRead(scanned: { after?: unknown[]; until?: unknown[] }) {
@@ -538,6 +631,31 @@ export class DatabaseImpl {
 
   private readonly warned: Set<string>;
 
+  searchIndex(table: string, indexName: string): SearchIndexDef {
+    const indexes = (this.schema?.tables[table]?.searchIndexes ?? []) as SearchIndexDef[];
+    const index = indexes.find((i) => i.name === indexName);
+    if (!index) {
+      throw new OnebaseError(
+        `Search index "${indexName}" doesn't exist on "${table}". ` +
+          (indexes.length
+            ? `Available: ${indexes.map((i) => i.name).join(", ")}.`
+            : `Add one in schema.ts: defineTable({...}).searchIndex("${indexName}", { searchField: "body" }).`),
+      );
+    }
+    return index;
+  }
+
+  /** Keeps the table's search indexes in step with a write (a no-op where the database indexes documents itself). */
+  private async syncSearch(table: string, id: string, doc: Record<string, unknown> | null) {
+    const indexes = (this.schema?.tables[table]?.searchIndexes ?? []) as SearchIndexDef[];
+    if (!indexes.length || !this.dialect.syncSearch) return;
+    const entries = indexes.map((i) => {
+      const value = doc ? getPath(doc, i.searchField) : undefined;
+      return { name: searchIndexName(table, i.name), text: typeof value === "string" ? value : null };
+    });
+    await this.dialect.syncSearch(this.tx, id, entries);
+  }
+
   /** Warns once per query shape when filters can't use an index. */
   async checkPlan(sql: string, params: unknown[], table: string, filters: Expr[]) {
     if (!this.onWarning || filters.length === 0 || this.warned.has(sql)) return;
@@ -620,6 +738,7 @@ export class DatabaseImpl {
     const id = newId(t);
     const ct = this.nextCreationTime();
     await this.tx.run(`INSERT INTO documents (id, tbl, ct, doc) VALUES (?, ?, ?, ${this.dialect.docPlaceholder})`, [id, t, ct, JSON.stringify(doc)]);
+    await this.syncSearch(t, id, doc);
     this.writes?.push({ table: t, id, before: null, after: { _id: id, _creationTime: ct, ...doc } });
     return id;
   }
@@ -633,6 +752,7 @@ export class DatabaseImpl {
 
   private async writeDoc(table: string, before: Doc, fields: Record<string, unknown>) {
     await this.tx.run(`UPDATE documents SET doc = ${this.dialect.docPlaceholder} WHERE id = ?`, [JSON.stringify(fields), before._id]);
+    await this.syncSearch(table, before._id, fields);
     this.writes?.push({ table, id: before._id, before, after: { _id: before._id, _creationTime: before._creationTime, ...fields } });
   }
 
@@ -667,6 +787,7 @@ export class DatabaseImpl {
   async delete(id: unknown): Promise<void> {
     const { id: docId, table, doc } = await this.existing(id, "delete");
     await this.tx.run("DELETE FROM documents WHERE id = ?", [docId]);
+    await this.syncSearch(table, docId, null);
     this.writes?.push({ table, id: docId, before: doc, after: null });
   }
 }
@@ -698,13 +819,13 @@ export function writerView(db: DatabaseImpl) {
   };
 }
 
-/** Creates the indexes declared in the schema and drops the ones that were removed. */
+/** Creates the indexes (and search indexes) declared in the schema and drops the ones that were removed. */
 export async function applySchema(
   tx: Exec,
   dialect: Dialect,
   schema: SchemaDefinition<any> | null,
 ): Promise<{ created: string[]; dropped: string[] }> {
-  const wanted = new Map<string, string>();
+  const wanted = new Map<string, { def: string; create: string[] }>();
   for (const [table, def] of Object.entries(schema?.tables ?? {})) {
     for (const index of (def as any).indexes as { name: string; fields: string[] }[]) {
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(index.name)) {
@@ -712,25 +833,34 @@ export async function applySchema(
       }
       const name = `cl_${table}__${index.name}`;
       const columns = [...index.fields.map((f) => dialect.field(f)), "ct", "id"];
-      wanted.set(name, dialect.createIndex(name, table, columns));
+      const sql = dialect.createIndex(name, table, columns);
+      wanted.set(name, { def: sql, create: [sql] });
+    }
+    for (const index of ((def as any).searchIndexes ?? []) as SearchIndexDef[]) {
+      const name = searchIndexName(table, index.name);
+      wanted.set(name, dialect.searchIndex(name, table, index.searchField));
     }
   }
   const existing = new Map((await tx.all("SELECT name, def FROM _indexes")).map((r) => [r.name as string, r.def as string]));
   const created: string[] = [];
   const dropped: string[] = [];
   for (const [name, def] of existing) {
-    if (wanted.get(name) !== def) {
-      await tx.run(`DROP INDEX IF EXISTS "${name}"`);
+    if (wanted.get(name)?.def !== def) {
+      await tx.run(dialect.dropIndex(name));
       await tx.run("DELETE FROM _indexes WHERE name = ?", [name]);
       dropped.push(name);
     }
   }
-  for (const [name, def] of wanted) {
+  for (const [name, { def, create }] of wanted) {
     if (existing.get(name) === def) continue;
-    await tx.run(`DROP INDEX IF EXISTS "${name}"`); // left over from an older version
-    await tx.run(def);
+    await tx.run(dialect.dropIndex(name)); // left over from an older version
+    for (const sql of create) await tx.run(sql);
     await tx.run("INSERT INTO _indexes (name, def) VALUES (?, ?)", [name, def]);
     created.push(name);
+  }
+  // SQLite: with no search indexes left, their row id map is no longer needed.
+  if (dialect.syncSearch && dropped.some((n) => n.startsWith("sx_")) && ![...wanted.keys()].some((n) => n.startsWith("sx_"))) {
+    await tx.run("DELETE FROM _search_ids");
   }
   return { created, dropped };
 }

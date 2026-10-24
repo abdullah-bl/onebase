@@ -13,6 +13,7 @@
       header { display: flex; gap: 8px; align-items: center; justify-content: space-between; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
       h1 { font-size: 17px; margin: 0; }
       #status { font-size: 12px; color: var(--muted); }
+      #search { flex: 0 1 200px; padding: 4px 10px; }
       #status.open::before { content: "● "; color: #2b8a3e; }
       #status.connecting::before { content: "● "; color: #e67700; }
       #channels { display: flex; gap: 6px; padding: 10px 0; flex-wrap: wrap; }
@@ -38,6 +39,7 @@
     <main>
       <header>
         <h1>onebase chat</h1>
+        <input id="search" type="search" placeholder="Search this channel" autocomplete="off" />
         <span id="status" class="connecting">connecting</span>
       </header>
       <div id="channels"></div>
@@ -70,15 +72,35 @@
       function select(name) {
         current = ids[name];
         for (const b of $("channels").children) b.classList.toggle("active", b.textContent === "#" + name);
-        stopMessages();
-        stopMessages = client.onUpdate(api.messages.list, { channel: current }, render, (e) => ($("error").textContent = e.message));
+        subscribe();
       }
+
+      // The latest messages, or live search results while there's text in the search box.
+      function subscribe() {
+        const text = $("search").value.trim();
+        stopMessages();
+        stopMessages = text
+          ? client.onUpdate(api.messages.search, { channel: current, text }, render, (e) => ($("error").textContent = e.message))
+          : client.onUpdate(api.messages.list, { channel: current }, render, (e) => ($("error").textContent = e.message));
+      }
+      let searchTimer;
+      $("search").oninput = () => {
+        clearTimeout(searchTimer);
+        searchTimer = setTimeout(subscribe, 150);
+      };
 
       for (const n of names) {
         const b = document.createElement("button");
         b.textContent = "#" + n;
         b.onclick = () => select(n);
         $("channels").append(b);
+      }
+
+      // Show the like straight away; the server's count replaces it when the mutation finishes.
+      function likeNow(store, { id }) {
+        for (const { args, value } of store.getAllQueries(api.messages.list)) {
+          if (value) store.setQuery(api.messages.list, args, value.map((m) => (m._id === id ? { ...m, likes: (m.likes ?? 0) + 1 } : m)));
+        }
       }
 
       function render(messages) {
@@ -90,7 +112,7 @@
           const body = Object.assign(document.createElement("span"), { className: "body", textContent: m.body });
           if (m.imageUrl) body.append(Object.assign(document.createElement("img"), { src: m.imageUrl, alt: "" }));
           const like = Object.assign(document.createElement("button"), { className: "like", textContent: "♥ " + (m.likes ?? 0) });
-          like.onclick = () => client.mutation(api.messages.like, { id: m._id });
+          like.onclick = () => client.mutation(api.messages.like, { id: m._id }, { optimisticUpdate: likeNow });
           li.append(author, body, like);
           return li;
         }));

@@ -33,6 +33,8 @@ export default {
 client.setAuth(async () => await clerk.session?.getToken({ template: "onebase" }));
 ```
 
+Queries, mutations and subscriptions started while the token is being fetched wait for it, so they never run as a signed-out user by accident.
+
 Over HTTP, send `Authorization: Bearer <token>`.
 
 ## Use the identity

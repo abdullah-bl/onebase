@@ -3,6 +3,7 @@
 
 import {
   getFunctionName,
+  type ArgsAndOptions,
   type FunctionArgs,
   type FunctionLike,
   type FunctionReference,
@@ -25,8 +26,41 @@ export class ConvexError<Data = unknown> extends Error {
 
 export type QueryResult = { ok: true; value: unknown } | { ok: false; error: Error };
 type Listener = (result: QueryResult) => void;
-type Sub = { id: number; path: string; args: unknown; listeners: Set<Listener>; last: QueryResult | null };
-type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void; message: string; sent: boolean };
+/** Also told when a result goes back to loading (an optimistic update can do that). */
+type Watcher = (result: QueryResult | null) => void;
+type Sub = {
+  id: number;
+  path: string;
+  args: unknown;
+  /** Sent on the current connection. */
+  sent: boolean;
+  listeners: Set<Watcher>;
+  /** What the server last sent. */
+  server: QueryResult | null;
+  /** What callers see: the server result with pending optimistic updates applied. */
+  last: QueryResult | null;
+};
+
+/** The client's local query results, as an optimistic update sees and changes them. */
+export interface OptimisticLocalStore {
+  /** The current result of a subscribed query, or undefined if it isn't subscribed or is loading. */
+  getQuery<Q extends FunctionReference<"query">>(query: Q | string, ...args: OptionalRestArgs<Q>): FunctionReturnType<Q> | undefined;
+  /** Every subscribed instance of a query (one per set of args). */
+  getAllQueries<Q extends FunctionReference<"query">>(query: Q | string): { args: FunctionArgs<Q>; value: FunctionReturnType<Q> | undefined }[];
+  /** Replaces a subscribed query's result until the mutation finishes; undefined shows it as loading. */
+  setQuery<Q extends FunctionReference<"query">>(query: Q | string, args: FunctionArgs<Q>, value: FunctionReturnType<Q> | undefined): void;
+}
+
+/**
+ * Runs as soon as the mutation is called, and again whenever new results arrive while it's in
+ * flight. Treat results as immutable: build new arrays and objects instead of changing them.
+ */
+export type OptimisticUpdate<Args> = (localStore: OptimisticLocalStore, args: Args) => void;
+
+export type MutationOptions<Args> = { optimisticUpdate?: OptimisticUpdate<Args> };
+
+type Layer = { update: OptimisticUpdate<any>; args: unknown };
+type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void; message: string; sent: boolean; layer?: Layer };
 type TokenFetcher = () => Promise<string | null | undefined> | string | null | undefined;
 
 export type ClientOptions = {
@@ -47,6 +81,8 @@ function stableStringify(value: unknown): string {
   return JSON.stringify(value ?? null);
 }
 
+const subKey = (path: string, args: unknown) => `${path}|${stableStringify(args ?? {})}`;
+
 function toError(msg: { error: string; data?: unknown }): Error {
   return msg.data !== undefined && msg.data !== null ? new ConvexError(msg.error, msg.data) : new Error(msg.error);
 }
@@ -65,10 +101,20 @@ export class OnebaseClient {
   private subs = new Map<string, Sub>();
   private subsById = new Map<number, Sub>();
   private pending = new Map<number, Pending>();
+  /** Optimistic updates of mutations in flight, oldest first. */
+  private layers: Layer[] = [];
   private nextId = 1;
   private retryMs = 100;
   private closed = false;
   private fetchToken: TokenFetcher | null = null;
+  /**
+   * False while connecting or fetching a token. Calls and new subscriptions wait meanwhile, so
+   * nothing reaches the server ahead of the auth message and runs as a signed-out user.
+   */
+  private ready = false;
+  /** The current connection has an auth token set on the server. */
+  private authSent = false;
+  private authRun = 0;
   private stateListeners = new Set<(s: ConnectionState) => void>();
   private _state: ConnectionState = "connecting";
   private readonly url: string;
@@ -99,29 +145,30 @@ export class OnebaseClient {
     this.setState("connecting");
     const ws = new this.WS(this.url);
     this.ws = ws;
-    ws.onopen = async () => {
+    ws.onopen = () => {
       this.retryMs = 100;
-      if (this.fetchToken) this.raw({ type: "auth", token: (await this.fetchToken()) ?? null });
-      for (const sub of this.subs.values()) this.raw({ type: "sub", id: sub.id, path: sub.path, args: sub.args });
-      for (const p of this.pending.values()) {
-        if (!p.sent) {
-          this.ws!.send(p.message);
-          p.sent = true;
-        }
-      }
-      this.setState("open");
+      this.authSent = false;
+      for (const sub of this.subs.values()) sub.sent = false;
+      void this.authenticate();
     };
     ws.onmessage = (event) => this.handle(JSON.parse(String(event.data)));
     ws.onclose = () => {
       if (this.ws !== ws) return;
       this.ws = null;
+      this.ready = false;
       // A call that was sent but not answered may or may not have run; don't silently retry it.
+      const lost: Pending[] = [];
       for (const [requestId, p] of this.pending) {
         if (p.sent) {
-          p.reject(new Error("Connection lost before the server replied; the call may or may not have run."));
+          lost.push(p);
           this.pending.delete(requestId);
         }
       }
+      if (lost.some((p) => p.layer)) {
+        this.layers = this.layers.filter((l) => !lost.some((p) => p.layer === l));
+        this.applyLayers();
+      }
+      for (const p of lost) p.reject(new Error("Connection lost before the server replied; the call may or may not have run."));
       if (this.closed) return this.setState("closed");
       this.setState("connecting");
       setTimeout(() => this.connect(), this.retryMs);
@@ -133,31 +180,133 @@ export class OnebaseClient {
     if (this.ws?.readyState === 1) this.ws.send(JSON.stringify(msg));
   }
 
+  /**
+   * Sends the current token, then the subscriptions and calls that were waiting for it. Runs on
+   * every (re)connect and on setAuth(); if setAuth() is called again meanwhile, the newer run wins.
+   */
+  private async authenticate() {
+    const run = ++this.authRun;
+    this.ready = false;
+    let token: string | null = null;
+    if (this.fetchToken) {
+      try {
+        token = (await this.fetchToken()) ?? null;
+      } catch (err) {
+        console.warn("onebase: fetching the auth token failed; continuing signed out.", err);
+      }
+    }
+    if (run !== this.authRun || this.ws?.readyState !== 1) return;
+    if (token !== null || this.authSent) this.raw({ type: "auth", token });
+    this.authSent = token !== null;
+    for (const sub of this.subs.values()) {
+      if (!sub.sent) {
+        this.raw({ type: "sub", id: sub.id, path: sub.path, args: sub.args });
+        sub.sent = true;
+      }
+    }
+    for (const p of this.pending.values()) {
+      if (!p.sent) {
+        this.ws.send(p.message);
+        p.sent = true;
+      }
+    }
+    this.ready = true;
+    if (this._state !== "open") this.setState("open");
+  }
+
   private handle(msg: any) {
-    if (msg.type === "update") {
-      const sub = this.subsById.get(msg.id);
-      if (!sub) return;
-      sub.last = msg.ok ? { ok: true, value: msg.value } : { ok: false, error: toError(msg) };
-      for (const l of sub.listeners) l(sub.last);
-    } else if (msg.type === "result") {
-      const p = this.pending.get(msg.requestId);
-      if (!p) return;
-      this.pending.delete(msg.requestId);
-      if (msg.ok) p.resolve(msg.value);
-      else p.reject(toError(msg));
-    } else if (msg.type === "auth" && !msg.ok) {
-      console.warn(`onebase auth failed: ${msg.error}`);
+    if (msg.type === "update") this.apply([msg], []);
+    else if (msg.type === "result") this.apply([], [msg]);
+    else if (msg.type === "transition") this.apply(msg.updates, msg.results);
+    else if (msg.type === "auth" && !msg.ok) console.warn(`onebase auth failed: ${msg.error}`);
+  }
+
+  /**
+   * Applies query updates and call results in one step. The server sends a mutation's result
+   * together with the updates that reflect it, so its optimistic update is dropped exactly when
+   * the real data arrives.
+   */
+  private apply(updates: any[], results: any[]) {
+    const settled: [Pending, any][] = [];
+    for (const r of results) {
+      const p = this.pending.get(r.requestId);
+      if (!p) continue;
+      this.pending.delete(r.requestId);
+      settled.push([p, r]);
+    }
+    const finished = settled.map(([p]) => p.layer).filter((l): l is Layer => Boolean(l));
+    if (finished.length) this.layers = this.layers.filter((l) => !finished.includes(l));
+    const changed = new Set<Sub>();
+    for (const u of updates) {
+      const sub = this.subsById.get(u.id);
+      if (!sub) continue;
+      sub.server = u.ok ? { ok: true, value: u.value } : { ok: false, error: toError(u) };
+      changed.add(sub);
+    }
+    if (this.layers.length || finished.length) {
+      this.applyLayers();
+    } else {
+      for (const sub of changed) {
+        sub.last = sub.server;
+        for (const l of sub.listeners) l(sub.last);
+      }
+    }
+    for (const [p, r] of settled) {
+      if (r.ok) p.resolve(r.value);
+      else p.reject(toError(r));
     }
   }
 
   /** Sets a token (or a function returning one) sent with every request; re-runs subscriptions as that user. */
   setAuth(token: string | TokenFetcher | null) {
     this.fetchToken = token === null ? null : typeof token === "function" ? token : () => token;
-    void (async () => this.raw({ type: "auth", token: this.fetchToken ? ((await this.fetchToken()) ?? null) : null }))();
+    // Not connected yet: the next connection authenticates first anyway.
+    if (this.ws?.readyState === 1) void this.authenticate();
   }
 
   clearAuth() {
     this.setAuth(null);
+  }
+
+  /** Recomputes what callers see: server results with every pending optimistic update applied, in order. */
+  private applyLayers() {
+    const overrides = new Map<Sub, QueryResult | null>();
+    const current = (sub: Sub | undefined) => (sub ? (overrides.has(sub) ? overrides.get(sub)! : sub.server) : null);
+    const find = (query: FunctionLike, args: unknown) => this.subs.get(subKey(getFunctionName(query), args));
+    const store: OptimisticLocalStore = {
+      getQuery: (query: FunctionLike, ...args: unknown[]) => {
+        const r = current(find(query, args[0]));
+        return r?.ok ? (r.value as any) : undefined;
+      },
+      getAllQueries: (query: FunctionLike) => {
+        const path = getFunctionName(query);
+        return [...this.subs.values()]
+          .filter((s) => s.path === path)
+          .map((s) => {
+            const r = current(s);
+            return { args: s.args as any, value: r?.ok ? (r.value as any) : undefined };
+          });
+      },
+      setQuery: (query: FunctionLike, args: unknown, value: unknown) => {
+        const sub = find(query, args);
+        if (sub) overrides.set(sub, value === undefined ? null : { ok: true, value });
+      },
+    };
+    for (const layer of this.layers) {
+      try {
+        layer.update(store, layer.args);
+      } catch (err) {
+        console.error("onebase: an optimistic update threw; ignoring it.", err);
+      }
+    }
+    for (const sub of this.subs.values()) {
+      const next = current(sub);
+      if (next === sub.last) continue;
+      // An optimistic value the server has confirmed: keep the object, skip the re-render.
+      if (next?.ok && sub.last?.ok && stableStringify(next.value) === stableStringify(sub.last.value)) continue;
+      sub.last = next;
+      for (const l of sub.listeners) l(next);
+    }
   }
 
   /** Subscribes to a query; the callback runs with every new result. Returns an unsubscribe function. */
@@ -173,14 +322,22 @@ export class OnebaseClient {
 
   /** Low-level subscription shared by identical (query, args) pairs. */
   subscribe(query: FunctionLike, args: unknown, listener: Listener): () => void {
+    return this.watch(query, args, (r) => r && listener(r));
+  }
+
+  /** Like subscribe(), but also called with null when an optimistic update shows the query as loading. */
+  watch(query: FunctionLike, args: unknown, listener: Watcher): () => void {
     const path = getFunctionName(query);
-    const key = `${path}|${stableStringify(args ?? {})}`;
+    const key = subKey(path, args);
     let sub = this.subs.get(key);
     if (!sub) {
-      sub = { id: this.nextId++, path, args: args ?? {}, listeners: new Set(), last: null };
+      sub = { id: this.nextId++, path, args: args ?? {}, sent: false, listeners: new Set(), server: null, last: null };
       this.subs.set(key, sub);
       this.subsById.set(sub.id, sub);
-      this.raw({ type: "sub", id: sub.id, path, args: sub.args });
+      if (this.ready) {
+        this.raw({ type: "sub", id: sub.id, path, args: sub.args });
+        sub.sent = true;
+      }
     }
     sub.listeners.add(listener);
     const s = sub;
@@ -191,23 +348,23 @@ export class OnebaseClient {
       if (s.listeners.size === 0) {
         this.subs.delete(key);
         this.subsById.delete(s.id);
-        this.raw({ type: "unsub", id: s.id });
+        if (s.sent) this.raw({ type: "unsub", id: s.id });
       }
     };
   }
 
   /** Latest known result for a subscribed query, if any. */
   localQueryResult(query: FunctionLike, args: unknown): QueryResult | null {
-    return this.subs.get(`${getFunctionName(query)}|${stableStringify(args ?? {})}`)?.last ?? null;
+    return this.subs.get(subKey(getFunctionName(query), args))?.last ?? null;
   }
 
-  private call(kind: "query" | "mutation" | "action", fn: FunctionLike, args: unknown): Promise<any> {
+  private call(kind: "query" | "mutation" | "action", fn: FunctionLike, args: unknown, layer?: Layer): Promise<any> {
     const requestId = this.nextId++;
     const message = JSON.stringify({ type: "call", requestId, kind, path: getFunctionName(fn), args: args ?? {} });
     return new Promise((resolve, reject) => {
-      const p: Pending = { resolve, reject, message, sent: false };
+      const p: Pending = { resolve, reject, message, sent: false, layer };
       this.pending.set(requestId, p);
-      if (this.ws?.readyState === 1) {
+      if (this.ready && this.ws?.readyState === 1) {
         this.ws.send(message);
         p.sent = true;
       }
@@ -218,8 +375,17 @@ export class OnebaseClient {
     return this.call("query", query, args[0]);
   }
 
-  mutation<M extends FunctionReference<"mutation">>(mutation: M | string, ...args: OptionalRestArgs<M>): Promise<FunctionReturnType<M>> {
-    return this.call("mutation", mutation, args[0]);
+  /** Runs a mutation. With `optimisticUpdate`, subscribed queries show its expected effect until it finishes. */
+  mutation<M extends FunctionReference<"mutation">>(
+    mutation: M | string,
+    ...argsAndOptions: ArgsAndOptions<M, MutationOptions<FunctionArgs<M>>>
+  ): Promise<FunctionReturnType<M>> {
+    const [args, options] = argsAndOptions;
+    if (!options?.optimisticUpdate) return this.call("mutation", mutation, args);
+    const layer: Layer = { update: options.optimisticUpdate, args: args ?? {} };
+    this.layers.push(layer);
+    this.applyLayers();
+    return this.call("mutation", mutation, args, layer);
   }
 
   action<A extends FunctionReference<"action">>(action: A | string, ...args: OptionalRestArgs<A>): Promise<FunctionReturnType<A>> {

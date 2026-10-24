@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Runtime } from "../src/engine/runtime";
 import { createDriver, SqliteDriver, type Driver } from "../src/engine/driver";
-import { SubscriptionManager } from "../src/engine/sync";
+import { SubscriptionManager, type QueryUpdate } from "../src/engine/sync";
 import { defineSchema, defineTable, internalMutation, mutation, paginationOptsValidator, query } from "../src/server";
 import { ConvexError, v } from "../src/values";
 
@@ -298,6 +298,15 @@ for (const D of DRIVERS) describe(D.name, () => {
       await m("messages:send", { channel: "a", author: "x", body: "1" });
       expect(runs).toBe(2);
       expect(seen.filter((n) => n === 1)).toHaveLength(5);
+    });
+
+    test("a burst of new subscriptions all get results", async () => {
+      // More first runs at once than libsql-server takes concurrent requests (128 by default).
+      const subs = new SubscriptionManager(runtime);
+      const first = await Promise.all(
+        Array.from({ length: 300 }, (_, i) => new Promise<QueryUpdate>((resolve) => subs.subscribe("messages:list", { channel: `c${i}` }, null, resolve))),
+      );
+      expect(first.filter((u) => !u.ok)).toEqual([]);
     });
   });
 });

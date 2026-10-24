@@ -45,7 +45,12 @@ You can also loop with `for await (const post of ctx.db.query("posts")) { ... }`
 .withIndex("by_creation_time", (q) => q.gt("_creationTime", Date.now() - 86_400_000))
 ```
 
-Results come back in index order: by the index fields, then by `_creationTime`.
+Results come back in index order: by the index fields, then by `_creationTime`. Because every index ends with `_creationTime`, you can also put a range on it after the equality conditions:
+
+```ts
+// messages in a channel from the last hour
+.withIndex("by_channel", (q) => q.eq("channel", channel).gt("_creationTime", Date.now() - 3_600_000))
+```
 
 If you get the order wrong or use a field the index doesn't have, the error says which fields the index has and in what order.
 
@@ -76,6 +81,8 @@ The callback receives a filter builder, not a document. For logic the builder ca
 ```ts
 const posts = (await ctx.db.query("posts").collect()).filter((p) => p.title.includes("onebase"));
 ```
+
+For full-text search, use `.withSearchIndex(...)` instead of `.withIndex(...)`. See [Search](./search.md).
 
 ## Pagination
 

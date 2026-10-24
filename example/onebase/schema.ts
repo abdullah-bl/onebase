@@ -12,5 +12,7 @@ export default defineSchema({
     body: v.string(),
     likes: v.optional(v.number()),
     image: v.optional(v.id("_storage")),
-  }).index("by_channel", ["channel"]),
+  })
+    .index("by_channel", ["channel"])
+    .searchIndex("search_body", { searchField: "body", filterFields: ["channel"] }),
 });

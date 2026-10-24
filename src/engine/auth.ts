@@ -115,9 +115,8 @@ export class AuthService {
     return this.methods.map((m) => m.id);
   }
 
-  /** Startup check: sign-in creates documents in "users", so the schema must accept them. */
-  check() {
-    const schema = this.runtime.schema;
+  /** Startup (and deploy) check: sign-in creates documents in "users", so the schema must accept them. */
+  check(schema = this.runtime.schema) {
     if (!schema) return;
     const users = schema.tables.users as { validator: AnyValidator } | undefined;
     if (!users) {

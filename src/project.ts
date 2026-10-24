@@ -61,6 +61,33 @@ export async function listSourceFiles(dir: string): Promise<string[]> {
   return files.sort();
 }
 
+/**
+ * Source that statically imports every file in `dir`, for bundling: `imports` lines, and `fields`
+ * of an object literal shaped like { schema, modules, http, authConfig, crons }.
+ */
+export async function projectEntry(dir: string): Promise<{ imports: string[]; fields: string; files: number }> {
+  const files = await listSourceFiles(dir);
+  const imports: string[] = [];
+  const modules: string[] = [];
+  let schema = "null";
+  let http = "null";
+  let auth = "null";
+  let crons = "null";
+  files.forEach((file, i) => {
+    const modulePath = modulePathFor(dir, file);
+    imports.push(`import * as m${i} from ${JSON.stringify(file)};`);
+    if (modulePath === "schema") schema = `m${i}.default`;
+    else if (modulePath === "auth.config") auth = `m${i}.default`;
+    else {
+      modules.push(`${JSON.stringify(modulePath)}: m${i}`);
+      if (modulePath === "http") http = `(m${i}.default?.__onebase === "httpRouter" ? m${i}.default : null)`;
+      if (modulePath === "crons") crons = `(m${i}.default?.__onebase === "crons" ? m${i}.default : null)`;
+    }
+  });
+  const fields = `schema: ${schema}, modules: { ${modules.join(", ")} }, http: ${http}, authConfig: ${auth}, crons: ${crons}`;
+  return { imports, fields, files: files.length };
+}
+
 export class ProjectLoadError extends Error {
   constructor(
     readonly file: string,

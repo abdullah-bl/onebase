@@ -150,6 +150,7 @@ export const sqliteDialect: Dialect = {
     "CREATE TABLE IF NOT EXISTS _storage (id TEXT PRIMARY KEY, ct REAL NOT NULL, sha256 TEXT NOT NULL, size INTEGER NOT NULL, content_type TEXT)",
     "CREATE TABLE IF NOT EXISTS _upload_tokens (token TEXT PRIMARY KEY, expires REAL NOT NULL)",
     "CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS _deployments (id TEXT PRIMARY KEY, created REAL NOT NULL, code TEXT NOT NULL, assets TEXT)",
     // Integer row ids for FTS5 tables (documents has text ids).
     "CREATE TABLE IF NOT EXISTS _search_ids (rid INTEGER PRIMARY KEY, doc_id TEXT NOT NULL UNIQUE)",
     ...authDdl("REAL"),
@@ -222,6 +223,7 @@ export const postgresDialect: Dialect = {
     "CREATE TABLE IF NOT EXISTS _storage (id TEXT PRIMARY KEY, ct DOUBLE PRECISION NOT NULL, sha256 TEXT NOT NULL, size BIGINT NOT NULL, content_type TEXT)",
     "CREATE TABLE IF NOT EXISTS _upload_tokens (token TEXT PRIMARY KEY, expires DOUBLE PRECISION NOT NULL)",
     "CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS _deployments (id TEXT PRIMARY KEY, created DOUBLE PRECISION NOT NULL, code TEXT NOT NULL, assets TEXT)",
     ...authDdl("DOUBLE PRECISION"),
   ],
   createIndex: (name, table, columns) =>

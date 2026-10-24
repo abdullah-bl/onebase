@@ -1,5 +1,6 @@
-// The dashboard: served at /_admin, with a JSON API at /_admin/api/* and a live event
-// stream at /_admin/api/events. Every API call needs `Authorization: Bearer <admin key>`.
+// The dashboard: served at /_admin, with a JSON API at /_admin/api/* (which `onebase deploy` also
+// uses) and a live event stream at /_admin/api/events. Every API call needs
+// `Authorization: Bearer <admin key>`.
 
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -100,6 +101,7 @@ export function createAdmin(opts: { runtime: Runtime; key: string; assets: Dashb
         tables: t.map(({ name, count, inSchema }) => ({ name, count, inSchema })),
         schema: Boolean(runtime.schema),
         signIn: runtime.auth?.ids ?? [],
+        deployment: runtime.deployment ? { id: runtime.deployment.id, created: runtime.deployment.created } : null,
       };
     },
 
@@ -196,6 +198,14 @@ export function createAdmin(opts: { runtime: Runtime; key: string; assets: Dashb
           : await tx.all(`SELECT id, ct, sha256, size, content_type FROM _storage ORDER BY ct DESC LIMIT ${n}`);
         return rows.map((r) => ({ id: r.id, createdAt: Number(r.ct), size: Number(r.size), contentType: r.content_type, sha256: r.sha256 }));
       }),
+
+    // `onebase deploy`: the bundle's code, the frontend as { "/path": base64 } (or null), and dryRun.
+    deploy: ({ code, assets = null, dryRun = false }) => {
+      if (assets !== null && !isPlainObject(assets)) throw new OnebaseError("assets must be an object of { \"/path\": base64 }.");
+      return runtime.deploy({ code, assets, dryRun: dryRun === true });
+    },
+
+    rollback: () => runtime.rollback(),
 
     deleteFile: ({ id }) =>
       runtime.adminWrite(async (_db, state) => {

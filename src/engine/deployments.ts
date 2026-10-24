@@ -89,6 +89,29 @@ export function toDeployment(stored: StoredDeployment): Deployment {
   return { id: stored.id, created: stored.created, assets };
 }
 
+/** Deployments whose bundle module importBundle loaded here, as id → resolved module path. */
+const loadedModules = new Map<string, string>();
+
+/** Records a bundle module loaded through require(), so releaseModules can drop it once replaced. */
+export function rememberModule(id: string, resolvedPath: string): void {
+  loadedModules.set(id, resolvedPath);
+}
+
+/**
+ * Drops replaced deployments' bundle modules from the module cache, so their memory can be freed
+ * once no call is using them. (Bun's import() cache never releases a module; require()'s can be
+ * emptied entry by entry, which is why importBundle prefers require().)
+ */
+export function releaseModules(exceptId: string | null): void {
+  for (const [id, path] of loadedModules) {
+    if (id === exceptId) continue;
+    try {
+      delete require.cache[path];
+    } catch {}
+    loadedModules.delete(id);
+  }
+}
+
 /** Like a directory of files: /dir/ serves /dir/index.html, and unknown paths without an extension get /index.html. */
 export function serveAsset(assets: Map<string, Asset>, pathname: string): Response | null {
   let path: string;

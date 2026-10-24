@@ -49,6 +49,10 @@ export type AppOptions = {
   /** Per-IP limit on function calls, subscriptions and uploads. */
   rateLimit?: RateLimit | null;
   trustProxy?: boolean;
+  /** How often open connections re-check their auth token, in ms (default 60s; 0 disables). */
+  sessionRecheckMs?: number;
+  /** Refuse a pushed bundle that takes longer than this to load (default 30s). */
+  loadTimeoutMs?: number;
   quiet?: boolean;
 };
 
@@ -90,6 +94,7 @@ export async function startApp(opts: AppOptions) {
     dev: opts.dev,
     log: consoleLogger,
     loadCode: opts.deploys === false ? null : importBundle,
+    loadTimeoutMs: opts.loadTimeoutMs,
   });
   const { created, dropped } = await runtime.init();
   const adminKey = opts.dashboard === false ? null : loadAdminKey(opts.dataDir);
@@ -103,6 +108,7 @@ export async function startApp(opts: AppOptions) {
     cors: opts.cors,
     rateLimit: opts.rateLimit,
     trustProxy: opts.trustProxy,
+    sessionRecheckMs: opts.sessionRecheckMs,
     admin: adminKey ? createAdmin({ runtime, key: adminKey.key, assets: dashboardAssets, version: VERSION }) : null,
   });
   const host = opts.hostname === "0.0.0.0" ? "localhost" : opts.hostname;

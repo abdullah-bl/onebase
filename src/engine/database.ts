@@ -41,7 +41,7 @@ export class OnebaseError extends Error {
 
 // ---- Value helpers ----
 
-function getPath(doc: Record<string, unknown>, path: string): unknown {
+export function getPath(doc: Record<string, unknown>, path: string): unknown {
   let cur: any = doc;
   for (const part of path.split(".")) {
     if (cur === null || typeof cur !== "object") return undefined;

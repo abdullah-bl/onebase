@@ -55,6 +55,10 @@ const modules = {
         throw new ConvexError("nope");
       },
     }),
+    move: mutation({
+      args: { id: v.string(), channel: v.string() },
+      handler: (ctx, { id, channel }) => ctx.db.patch(id as any, { channel } as any),
+    }),
     like: mutation({
       args: { id: v.string() },
       handler: async (ctx, { id }) => {
@@ -235,6 +239,53 @@ for (const D of DRIVERS) describe(D.name, () => {
       // Writes to channel "a" never re-run the channel "b" query.
       expect(runsB).toBe(1);
       expect(updates.b).toEqual([0]);
+    });
+
+    test("reads see new commits after a dev-mode query plan check", async () => {
+      // Dev mode EXPLAINs filtered queries. A cached EXPLAIN statement used to pin the SQLite
+      // reader's snapshot, so every later read missed new commits until restart.
+      await m("messages:send", { channel: "a", author: "x", body: "1" });
+      expect(await q("messages:byAuthor", { author: "x" })).toHaveLength(1);
+      await m("messages:send", { channel: "a", author: "x", body: "2" });
+      expect(await q("messages:all")).toHaveLength(2);
+      expect(await q("messages:byAuthor", { author: "x" })).toHaveLength(2);
+    });
+
+    test("a write that moves a document between ranges updates both sides", async () => {
+      const subs = new SubscriptionManager(runtime);
+      const seen: Record<string, number[]> = { a: [], b: [], x: [], all: [] };
+      const push = (k: string) => (u: any) => seen[k]!.push(u.ok ? (u.value as any[]).length : -1);
+      subs.subscribe("messages:list", { channel: "a" }, null, push("a"));
+      subs.subscribe("messages:list", { channel: "b" }, null, push("b"));
+      subs.subscribe("messages:byAuthor", { author: "x" }, null, push("x")); // range from .filter()
+      subs.subscribe("messages:all", {}, null, push("all")); // range without equality conditions
+      await Bun.sleep(20);
+      const id = await m("messages:send", { channel: "a", author: "x", body: "1" });
+      await m("messages:move", { id, channel: "b" }); // matches "a" before the write, "b" after
+      // "x" and "all" still hold one message, but its channel changed, so they get a new result too.
+      expect(seen).toEqual({ a: [0, 1, 0], b: [0, 1], x: [0, 1, 1], all: [0, 1, 1] });
+    });
+
+    test("a commit only checks subscriptions that could match it", async () => {
+      const subs = new SubscriptionManager(runtime);
+      let checks = 0;
+      const affected = (subs as any).affected.bind(subs);
+      (subs as any).affected = (...a: unknown[]) => (checks++, affected(...a));
+      const seen: number[] = [];
+      const stops: (() => void)[] = [];
+      // Until its first result, a subscription is checked on every commit, so wait for all of them.
+      await Promise.all(
+        Array.from({ length: 500 }, (_, i) => new Promise((resolve) => stops.push(subs.subscribe("messages:list", { channel: `c${i}` }, null, resolve)))),
+      );
+      subs.subscribe("messages:list", { channel: "c7" }, null, (u) => seen.push(u.ok ? (u.value as any[]).length : -1));
+      checks = 0;
+      await m("messages:send", { channel: "c7", author: "x", body: "1" });
+      expect(seen.at(-1)).toBe(1);
+      expect(checks).toBe(1); // not 500
+      // Unsubscribing removes entries from the index.
+      stops.forEach((stop) => stop());
+      expect((subs as any).index.always.size + [...(subs as any).index.byKey.values()].reduce((n: number, s: Set<unknown>) => n + s.size, 0)).toBe(1);
+      expect([...(subs as any).index.paths.get("messages")]).toEqual([["channel", 1]]);
     });
 
     test("identical subscriptions share one execution", async () => {

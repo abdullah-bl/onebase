@@ -124,6 +124,13 @@ for (const [name, url] of URLS) {
       await a.authWrite(async ({ revoke }) => revoke(["session-1"]));
       for (let i = 0; i < 20 && !revoked.length; i++) await Bun.sleep(50);
       expect(revoked).toEqual(["session-1"]);
+
+      // Hundreds of sessions at once (sign out everywhere, a reset) don't fit in one NOTIFY payload.
+      revoked.length = 0;
+      const many = Array.from({ length: 350 }, (_, i) => `session-${i}`.padEnd(20, "x"));
+      await a.authWrite(async ({ revoke }) => revoke(many));
+      for (let i = 0; i < 20 && revoked.length < many.length; i++) await Bun.sleep(50);
+      expect(revoked.sort()).toEqual([...many].sort());
     });
   });
 }

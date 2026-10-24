@@ -169,6 +169,8 @@ export const myNotes = query({
 
 Users are ordinary documents, so you can read them, add fields and show them in the dashboard. To add your own fields, define `users` yourself instead of spreading `authTables`. Keep `name`, `email`, `image` and `emailVerificationTime`, and make new fields optional or fill them at sign-up with `password({ profile: (params) => ({ email: params.email, plan: "free" }) })`. The server checks at startup that the users table accepts new users.
 
+Don't let your own mutations change `email` or `emailVerificationTime`. An OAuth sign-in joins the user whose verified email matches, so a user who could set their email to someone else's would get that person's account. If users can change their email, clear `emailVerificationTime` in the same mutation and confirm the new address with a code. (`profile` can't set `emailVerificationTime`.)
+
 ### OAuth
 
 1. Register an OAuth app with the provider. Its callback URL is `<your public URL>/api/auth/callback/<method>`, e.g. `https://api.example.com/api/auth/callback/github`.

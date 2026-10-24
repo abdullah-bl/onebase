@@ -298,14 +298,11 @@ export class AuthService {
 
   private async passwordSignIn(method: PasswordMethod, email: string, password: string): Promise<SignInResult> {
     const key = `password:${email}`;
-    await this.checkAttempts(key, MAX_FAILURES, "failed sign-in attempts");
+    await this.countAttempt(key, MAX_FAILURES, "failed sign-in attempts");
     const found = await this.passwordUser(email);
     // Verify against a dummy hash for unknown emails, so timing doesn't reveal which emails have accounts.
     const valid = found ? await Bun.password.verify(password, found.secret) : (await Bun.password.verify(password, await this.dummy()), false);
-    if (!valid) {
-      await this.recordAttempt(key);
-      throw new AuthError("Invalid email or password.", 401);
-    }
+    if (!valid) throw new AuthError("Invalid email or password.", 401);
     await this.runtime.withWriter((tx) => tx.run("DELETE FROM _auth_attempts WHERE key = ?", [key]));
     const user = found!.user;
     if (method.verifyEmail && typeof user.emailVerificationTime !== "number") {
@@ -317,7 +314,8 @@ export class AuthService {
 
   private async signUp(method: PasswordMethod, email: string, password: string, params: Record<string, unknown>): Promise<SignInResult> {
     const name = typeof params.name === "string" && params.name.trim() ? params.name.trim() : undefined;
-    const fields = method.profile ? { ...method.profile(params), email } : defined({ email, name });
+    // Only a confirmed code marks an email verified (OAuth sign-ins join users by verified email).
+    const fields = method.profile ? { ...method.profile(params), email, emailVerificationTime: undefined } : defined({ email, name });
     const secret = await Bun.password.hash(password);
     const taken = () => new AuthError("An account with this email already exists. Sign in instead.", 409);
     let result: SignInResult;
@@ -358,9 +356,7 @@ export class AuthService {
 
   /** Counts a code sent to `email`; at most MAX_CODES_SENT an hour, so nobody can flood an inbox. */
   private async countCodeSent(email: string) {
-    const key = `send:${email}`;
-    await this.checkAttempts(key, MAX_CODES_SENT, "codes requested for this email");
-    await this.recordAttempt(key);
+    await this.countAttempt(`send:${email}`, MAX_CODES_SENT, "codes requested for this email");
   }
 
   /** Creates a code (replacing earlier ones for the same email and purpose) and hands it to sendCode. */
@@ -388,7 +384,7 @@ export class AuthService {
   /** Consumes a code; wrong guesses count toward a lockout, like failed passwords. */
   private async takeEmailCode(purpose: "verify" | "reset", email: string, code: unknown) {
     const key = `code:${email}`;
-    await this.checkAttempts(key, MAX_FAILURES, "wrong codes");
+    await this.countAttempt(key, MAX_FAILURES, "wrong codes");
     const entered = typeof code === "string" ? code.replace(/\s/g, "") : "";
     const valid =
       /^\d{8}$/.test(entered) &&
@@ -399,10 +395,7 @@ export class AuthService {
         await tx.run("DELETE FROM _auth_codes WHERE code_hash = ?", [hash]);
         return Number(row.expires) >= Date.now();
       }));
-    if (!valid) {
-      await this.recordAttempt(key);
-      throw new AuthError("That code is wrong or has expired. Request a new one.", 401);
-    }
+    if (!valid) throw new AuthError("That code is wrong or has expired. Request a new one.", 401);
     await this.runtime.withWriter((tx) => tx.run("DELETE FROM _auth_attempts WHERE key = ?", [key]));
   }
 
@@ -453,24 +446,30 @@ export class AuthService {
     return (this.dummyHash ??= Bun.password.hash(randomToken()));
   }
 
-  /** Throws once `key` has been counted `max` times within the last hour. */
-  private async checkAttempts(key: string, max: number, what: string) {
-    const row = await this.runtime.withReader((tx) => tx.get("SELECT count, window_start FROM _auth_attempts WHERE key = ?", [key]));
-    const resetAt = Number(row?.window_start ?? 0) + FAILURE_WINDOW;
-    if (row && resetAt > Date.now() && Number(row.count) >= max) {
-      const minutes = Math.ceil((resetAt - Date.now()) / 60_000);
+  /**
+   * Counts an attempt before it's made and throws once `key` has been counted more than `max` times
+   * within the hour. Counting first, in one write, means parallel requests can't all slip under the
+   * limit. A success clears the count.
+   */
+  private async countAttempt(key: string, max: number, what: string) {
+    const now = Date.now();
+    const { count, start } = await this.runtime.withWriter(async (tx) => {
+      const row = await tx.get("SELECT count, window_start FROM _auth_attempts WHERE key = ?", [key]);
+      if (!row) {
+        await tx.run("INSERT INTO _auth_attempts (key, count, window_start) VALUES (?, 1, ?)", [key, now]);
+        return { count: 1, start: now };
+      }
+      if (Number(row.window_start) < now - FAILURE_WINDOW) {
+        await tx.run("UPDATE _auth_attempts SET count = 1, window_start = ? WHERE key = ?", [now, key]);
+        return { count: 1, start: now };
+      }
+      await tx.run("UPDATE _auth_attempts SET count = count + 1 WHERE key = ?", [key]);
+      return { count: Number(row.count) + 1, start: Number(row.window_start) };
+    });
+    if (count > max) {
+      const minutes = Math.max(1, Math.ceil((start + FAILURE_WINDOW - now) / 60_000));
       throw new AuthError(`Too many ${what}. Try again in ${minutes} minute${minutes === 1 ? "" : "s"}.`, 429);
     }
-  }
-
-  private async recordAttempt(key: string) {
-    const now = Date.now();
-    await this.runtime.withWriter(async (tx) => {
-      const row = await tx.get("SELECT window_start FROM _auth_attempts WHERE key = ?", [key]);
-      if (!row) await tx.run("INSERT INTO _auth_attempts (key, count, window_start) VALUES (?, 1, ?)", [key, now]);
-      else if (Number(row.window_start) < now - FAILURE_WINDOW) await tx.run("UPDATE _auth_attempts SET count = 1, window_start = ? WHERE key = ?", [now, key]);
-      else await tx.run("UPDATE _auth_attempts SET count = count + 1 WHERE key = ?", [key]);
-    });
   }
 
   // ---- OAuth ----
@@ -491,9 +490,12 @@ export class AuthService {
     if (this.runtime.dev && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) return true;
     return [this.runtime.siteUrl, ...(origins ?? []), ...this.redirects].some((allowed) => {
       try {
+        // Compare parsed URLs, never the raw text: "https://App.example.com" must not allow
+        // "https://App.example.com.evil.test". An origin allows any page on it; a longer URL allows pages under its path.
         const a = new URL(allowed);
-        // An origin allows any page on it; a longer URL allows pages under that path.
-        return a.origin === allowed.replace(/\/+$/, "") ? a.origin === url.origin : target.startsWith(allowed);
+        if (a.origin !== url.origin) return false;
+        const path = a.pathname.replace(/\/+$/, "");
+        return path === "" || url.pathname === path || url.pathname.startsWith(`${path}/`);
       } catch {
         return false;
       }

@@ -80,6 +80,8 @@ type TxState = {
 
 /** Commit broadcasts above this size only list the tables (Postgres NOTIFY caps payloads at 8000 bytes). */
 const MAX_BROADCAST = 7000;
+/** Ended sessions per broadcast message; more go in extra messages, so the cap above holds. */
+const REVOKED_PER_MESSAGE = 100;
 
 export class Runtime {
   readonly driver: Driver;
@@ -565,7 +567,7 @@ export class Runtime {
         state.db = this.newDb(tx, { writes: state.writes });
         const value = await body(state);
         if (this.driver.shared && this.driver.publish && (state.writes.length || state.scheduled || state.revoked.length)) {
-          await this.driver.publish(tx, this.broadcastMessage(state));
+          for (const message of this.broadcastMessages(state)) await this.driver.publish(tx, message);
         }
         beforeCommit?.();
         return { value, writes: state.writes, scheduled: state.scheduled, afterCommit: state.afterCommit, revoked: state.revoked };
@@ -610,11 +612,14 @@ export class Runtime {
     );
   }
 
-  private broadcastMessage(state: TxState): string {
-    const extra = { s: state.scheduled || undefined, r: state.revoked.length ? state.revoked : undefined };
+  private broadcastMessages(state: TxState): string[] {
+    const revoked: string[][] = [];
+    for (let i = 0; i < state.revoked.length; i += REVOKED_PER_MESSAGE) revoked.push(state.revoked.slice(i, i + REVOKED_PER_MESSAGE));
+    const extra = { s: state.scheduled || undefined, r: revoked[0] };
     const full = JSON.stringify({ o: this.instanceId, w: state.writes, ...extra });
-    if (full.length <= MAX_BROADCAST) return full;
-    return JSON.stringify({ o: this.instanceId, t: [...new Set(state.writes.map((w) => w.table))], ...extra });
+    const first = full.length <= MAX_BROADCAST ? full : JSON.stringify({ o: this.instanceId, t: [...new Set(state.writes.map((w) => w.table))], ...extra });
+    // Signing out a user with many sessions ends them all; the rest of the ids follow on their own.
+    return [first, ...revoked.slice(1).map((r) => JSON.stringify({ o: this.instanceId, r }))];
   }
 
   async runAction(ref: FunctionLike, args: unknown, opts: CallOptions = {}): Promise<unknown> {

@@ -1,5 +1,6 @@
 import type { Server, ServerWebSocket } from "bun";
 import type { UserIdentity } from "../server";
+import { AuthError } from "./auth";
 import type { Runtime } from "./runtime";
 import { SubscriptionManager } from "./sync";
 
@@ -184,7 +185,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
       const sessionId = ws.data.identity?.sessionId;
       if (typeof sessionId !== "string" || !ended.has(sessionId)) continue;
       ws.data.identity = null;
-      send(ws, { type: "auth", ok: false, error: "You were signed out." });
+      send(ws, { type: "auth", ok: false, ended: true, error: "You were signed out." });
       for (const [id, sub] of ws.data.subs) subscribe(ws, id, sub.path, sub.args, false);
     }
   });
@@ -197,7 +198,9 @@ export function serve(opts: ServeOptions): Server<SocketData> {
           send(ws, { type: "auth", ok: true, identity: ws.data.identity ? { subject: ws.data.identity.subject } : null });
         } catch (err) {
           ws.data.identity = null;
-          send(ws, { type: "auth", ok: false, error: runtime.toClientError(err).message });
+          // `ended`: the session is gone for good. Anything else (say, the database timing out) may pass.
+          const ended = err instanceof AuthError && err.status === 401;
+          send(ws, { type: "auth", ok: false, ended, error: runtime.toClientError(err).message });
         }
         // Results depend on who is asking, so re-subscribe under the new identity.
         for (const [id, sub] of ws.data.subs) subscribe(ws, id, sub.path, sub.args, false);

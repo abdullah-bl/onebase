@@ -231,6 +231,13 @@ for (const DB of DATABASES) describe(`${DB.name}: built-in auth`, () => {
     expect(blocked.body.error).toContain("Too many failed sign-in attempts");
   });
 
+  test("parallel wrong passwords can't get past the lockout", async () => {
+    await signUp("burst@example.com");
+    const statuses = await Promise.all(Array.from({ length: 30 }, () => signIn("burst@example.com", "nope nope").then((r) => r.status)));
+    expect(statuses.filter((s) => s === 401)).toHaveLength(10);
+    expect(statuses.filter((s) => s === 429)).toHaveLength(20);
+  });
+
   test("signing out ends that session; everywhere ends all of them", async () => {
     const { userId } = (await signUp("multi@example.com")).body;
     const t1 = (await signIn("multi@example.com", "correct horse")).body.token;
@@ -306,6 +313,21 @@ for (const DB of DATABASES) describe(`${DB.name}: built-in auth`, () => {
       redirect: "manual",
     });
     expect(new URL(denied.headers.get("Location")!).searchParams.get("auth_error")).toBe("access_denied");
+
+    // Allowed URLs are compared parsed, never as text prefixes, however they're written.
+    const auth = app.runtime.auth as any;
+    const saved = auth.redirects;
+    auth.redirects = ["https://App.example.com", "https://other.example.com:443", "https://third.example.com/app/"];
+    try {
+      for (const ok of ["https://app.example.com/x", "https://other.example.com/y", "https://third.example.com/app", "https://third.example.com/app/z?q=1"]) {
+        expect(auth.redirectAllowed(ok, null)).toBe(true);
+      }
+      for (const bad of ["https://App.example.com.evil.test/x", "https://other.example.com:4433/y", "https://third.example.com/appx", "https://third.example.com/"]) {
+        expect(auth.redirectAllowed(bad, null)).toBe(false);
+      }
+    } finally {
+      auth.redirects = saved;
+    }
   });
 
   test("password reset: an emailed code, a new password, and every old session ends", async () => {
@@ -458,6 +480,25 @@ for (const DB of DATABASES) describe(`${DB.name}: built-in auth`, () => {
     expect((await ask("auth:whoami", token)).error).toContain("signed out");
     expect(states).toEqual([true, false, true, false]);
     await expect(client.signIn("password", { flow: "signIn", email: "erin@example.com", password: "bad password" })).rejects.toThrow("Invalid email or password.");
+    client.close();
+  });
+
+  test("the client keeps its session when the server can't check it for a moment", async () => {
+    const storage = memoryStorage();
+    const first = new OnebaseClient(base, { authStorage: storage });
+    await first.signIn("password", { flow: "signUp", email: "flaky@example.com", password: "correct horse" });
+    expect(await first.query("auth:whoami", {})).toBeString(); // its connection has checked the session
+    first.close();
+    const auth = app.runtime.auth as any;
+    const identify = auth.identifySession;
+    auth.identifySession = async () => {
+      auth.identifySession = identify;
+      throw new Error("database timed out");
+    };
+    const client = new OnebaseClient(base, { authStorage: storage });
+    for (let i = 0; i < 60 && !client.authState.isAuthenticated; i++) await Bun.sleep(50);
+    expect(client.authState.isAuthenticated).toBe(true);
+    expect(storage.data.size).toBe(1);
     client.close();
   });
 });

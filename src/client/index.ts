@@ -282,10 +282,18 @@ export class OnebaseClient {
     else if (msg.type === "auth") this.onAuthAnswer(msg);
   }
 
-  private onAuthAnswer(msg: { ok: boolean; identity?: unknown; error?: string }) {
+  private onAuthAnswer(msg: { ok: boolean; ended?: boolean; identity?: unknown; error?: string }) {
     if (this.authAcks > 0) this.authAcks--;
     if (this.authAcks > 0) return; // a newer token is on its way
     if (msg.ok) return this.updateAuth({ isLoading: false, isAuthenticated: Boolean(msg.identity), error: null });
+    if (this.fetchToken === this.sessionFetcher && !msg.ended) {
+      // The server couldn't check the session (say, its database was busy): keep it and try again.
+      console.warn(`onebase auth failed: ${msg.error}`);
+      setTimeout(() => {
+        if (this.fetchToken === this.sessionFetcher) void this.authenticate();
+      }, 1000);
+      return this.updateAuth({ isLoading: true, isAuthenticated: false });
+    }
     // Rejected, or signed out from elsewhere. A built-in session that ended is forgotten.
     if (this.fetchToken === this.sessionFetcher) {
       this.forgetSession();

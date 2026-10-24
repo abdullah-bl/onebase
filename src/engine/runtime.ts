@@ -16,6 +16,7 @@ import { AuthService, SESSION_PREFIX } from "./auth";
 import { createAuthenticate, type AuthConfig, type AuthenticateCtx } from "./jwt";
 import {
   activeDeployment,
+  activeDeploymentId,
   getDeployment,
   previousDeployment,
   saveDeployment,
@@ -183,29 +184,42 @@ export class Runtime {
    */
   async init(): Promise<{ created: string[]; dropped: string[] }> {
     await this.driver.init();
-    const stored = this.loadCode ? await this.driver.read((tx) => activeDeployment(tx)) : null;
-    if (stored) {
-      try {
-        this.setCode(this.prepare(await this.loadCode!(stored.code, stored.id)), toDeployment(stored));
-      } catch (err) {
-        throw new OnebaseError(
-          `Couldn't load deployment ${stored.id} (pushed ${new Date(stored.created).toISOString()}): ${err instanceof Error ? err.message : String(err)}\n` +
-            `Fix what it needs (often an environment variable) and restart, or start with --no-deploy to run the local code instead.`,
-        );
+    let applied: { result: { created: string[]; dropped: string[] }; warnings: string[] } | null = null;
+    while (!applied) {
+      const stored = this.loadCode ? await this.driver.read((tx) => activeDeployment(tx)) : null;
+      if (stored) {
+        try {
+          this.setCode(this.prepare(await this.loadCode!(stored.code, stored.id)), toDeployment(stored));
+        } catch (err) {
+          throw new OnebaseError(
+            `Couldn't load deployment ${stored.id} (pushed ${new Date(stored.created).toISOString()}): ${err instanceof Error ? err.message : String(err)}\n` +
+              `Fix what it needs (often an environment variable) and restart, or start with --no-deploy to run the local code instead.`,
+          );
+        }
       }
+      this.auth?.check();
+      // Null when another instance deployed in the meantime: start again with its code.
+      applied = await this.applyStartupSchema(stored?.id ?? null);
     }
-    this.auth?.check();
-    const { result, warnings } = await this.driver.write(async (tx) => {
-      const result = await applySchema(tx, this.driver.dialect, this.schema);
-      return { result, warnings: await this.checkDocuments(tx, this.schema) };
-    });
-    for (const w of warnings) this.log.warn(w);
+    for (const w of applied.warnings) this.log.warn(w);
     const row = await this.driver.read((tx) => tx.get("SELECT MAX(ct) AS ct FROM documents"));
     this.lastCreationTime = Math.max(this.lastCreationTime, Number(row?.ct ?? 0));
     if (this.driver.shared && this.driver.subscribe) {
       await this.driver.subscribe((message) => void this.onRemoteCommit(message));
+      // A deploy that committed before we were listening was never announced to us.
+      await this.syncDeployment();
     }
-    return result;
+    return applied.result;
+  }
+
+  /** Startup's index update and document check, unless the active deployment is no longer `expected`. */
+  private applyStartupSchema(expected: string | null) {
+    return this.driver.write(async (tx) => {
+      // Applying this schema after another instance deployed would drop that deployment's indexes.
+      if (this.loadCode && (await activeDeploymentId(tx)) !== expected) return null;
+      const result = await applySchema(tx, this.driver.dialect, this.schema);
+      return { result, warnings: await this.checkDocuments(tx, this.schema) };
+    });
   }
 
   /**
@@ -216,7 +230,7 @@ export class Runtime {
   private async checkDocuments(tx: Exec, schema: SchemaDefinition<any> | null, record = true): Promise<string[]> {
     if (!schema?.schemaValidation) {
       // Writes aren't validated now, so check everything again once validation is turned back on.
-      if (schema && record) await tx.run("DELETE FROM _meta WHERE key = 'schema'");
+      if (record) await tx.run("DELETE FROM _meta WHERE key = 'schema'");
       return [];
     }
     const tables = Object.entries(schema.tables) as [string, { validator: AnyValidator }][];
@@ -363,7 +377,7 @@ export class Runtime {
         return { current, previous: current ? await previousDeployment(tx, current) : null };
       });
       if (!current) throw new OnebaseError("Nothing to roll back: this server isn't running a deployment.");
-      if (!previous) throw new OnebaseError(`Nothing to roll back to: ${current.id} is the oldest deployment kept.`);
+      if (!previous) throw new OnebaseError(`Nothing to roll back to: no deployment that was live before ${current.id} is kept.`);
       return this.activate(previous, { save: false, dryRun: false });
     });
   }
@@ -376,7 +390,7 @@ export class Runtime {
       if (opts.dryRun) return { indexes: { created: [], dropped: [] }, warnings };
       const indexes = await applySchema(tx, this.driver.dialect, schema);
       if (opts.save) await saveDeployment(tx, stored);
-      await setActiveDeployment(tx, stored.id);
+      await setActiveDeployment(tx, stored.id, opts.save ? "deploy" : "rollback");
       if (this.driver.shared && this.driver.publish) await this.driver.publish(tx, JSON.stringify({ o: this.instanceId, d: stored.id }));
       return { indexes, warnings };
     };
@@ -405,9 +419,21 @@ export class Runtime {
       this.log.warn(`Another instance deployed ${id}, but this one has deploys turned off and keeps its own code.`);
       return;
     }
+    await this.syncDeployment();
+  }
+
+  /**
+   * Runs the deployment the database says is active, if it isn't already running here. Not the
+   * one a broadcast named: two instances deploying at once must both end up on the one that won.
+   */
+  private async syncDeployment() {
+    if (!this.loadCode) return;
+    let id: string | null = null;
     try {
       await this.deploys.run(async () => {
-        const stored = await this.driver.read((tx) => getDeployment(tx, id));
+        id = await this.driver.read((tx) => activeDeploymentId(tx));
+        if (!id || id === this.deployment?.id) return;
+        const stored = await this.driver.read((tx) => getDeployment(tx, id!));
         if (!stored) return;
         await this.install(this.prepare(await this.loadCode!(stored.code, stored.id)), toDeployment(stored));
         this.log.info(`Deployment ${id} is live (pushed to another instance).`);
@@ -860,7 +886,13 @@ export class Runtime {
     await this.withWriter((tx) => tx.run("DELETE FROM _scheduled WHERE state <> 'pending' AND run_at < ?", [Date.now() - 7 * 86400_000]));
     this.pokeScheduler();
     // With a shared database, pick up jobs left by instances that went away.
-    if (this.driver.shared) this.heartbeat = setInterval(() => this.pokeScheduler(), 30_000);
+    // Also catch up on a deploy whose broadcast was missed (say, while reconnecting).
+    if (this.driver.shared) {
+      this.heartbeat = setInterval(() => {
+        this.pokeScheduler();
+        void this.syncDeployment();
+      }, 30_000);
+    }
     this.schedulerStarted = true;
     await this.startCrons();
   }

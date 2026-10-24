@@ -123,3 +123,8 @@ test("values bun loaded on its own get onebase's order, not a real variable's", 
   loadEnv({ mode: "production", cwd, env: overridden, bunAutoloaded: true });
   expect(overridden.A).toBe("from the shell");
 });
+
+test("names like toString and __proto__ are ordinary variables", () => {
+  const env = parseEnv("A=x$toString\n__proto__=p\nB=${constructor:-fallback}\nC=$hasOwnProperty");
+  expect(Object.entries(env)).toEqual([["A", "x"], ["__proto__", "p"], ["B", "fallback"], ["C", ""]]);
+});

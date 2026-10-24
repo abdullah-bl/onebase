@@ -22,7 +22,14 @@ export async function bundleProject(dirInput: string): Promise<{ code: string; f
   writeFileSync(entry, `${imports.join("\n")}\nexport default { ${fields} };\n`);
   let result: Bun.BuildOutput;
   try {
-    result = await Bun.build({ entrypoints: [entry], target: "bun", format: "esm", external: ["onebase", "onebase/*"] });
+    result = await Bun.build({
+      entrypoints: [entry],
+      target: "bun",
+      format: "esm",
+      external: ["onebase", "onebase/*"],
+      // Bun would bake in this machine's NODE_ENV; the server's own should apply, as for a functions folder.
+      define: { "process.env.NODE_ENV": "process.env.NODE_ENV" },
+    });
   } catch (err) {
     const logs = (err as AggregateError)?.errors;
     throw new Error(`Bundling failed:\n${Array.isArray(logs) && logs.length ? logs.map(String).join("\n") : String(err)}`);

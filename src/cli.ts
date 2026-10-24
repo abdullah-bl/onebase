@@ -86,6 +86,14 @@ const COMPILED = Bun.main.includes("$bunfs") || Bun.main.includes("~BUN");
 
 const enabled = (value: string | undefined) => value !== undefined && ["1", "true", "yes", "on"].includes(value.toLowerCase());
 
+/** For switches that default to on, like ONEBASE_DEPLOY: an unknown value is an error, so a typo can't leave it on. */
+function off(name: string, value: string | undefined): boolean {
+  if (value === undefined || value === "") return false;
+  if (["0", "false", "no", "off"].includes(value.toLowerCase())) return true;
+  if (enabled(value)) return false;
+  throw new Error(`${name}=${value} isn't understood: use on or off.`);
+}
+
 /** Flags, then .env files, then environment variables, then defaults. */
 function options(argv: string[]) {
   const { values, positionals } = parseArgs({
@@ -148,8 +156,8 @@ function options(argv: string[]) {
     cors: values.cors ?? env.ONEBASE_CORS,
     "rate-limit": values["rate-limit"] ?? env.ONEBASE_RATE_LIMIT,
     "trust-proxy": values["trust-proxy"] ?? enabled(env.ONEBASE_TRUST_PROXY),
-    "no-dashboard": values["no-dashboard"] ?? env.ONEBASE_DASHBOARD === "off",
-    "no-deploy": values["no-deploy"] ?? env.ONEBASE_DEPLOY === "off",
+    "no-dashboard": values["no-dashboard"] ?? off("ONEBASE_DASHBOARD", env.ONEBASE_DASHBOARD),
+    "no-deploy": values["no-deploy"] ?? off("ONEBASE_DEPLOY", env.ONEBASE_DEPLOY),
   };
 }
 

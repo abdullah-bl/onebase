@@ -62,13 +62,13 @@ onebase deploy --dry-run    # check the code against the server's data, change n
 ```
 
 ```bash
-onebase deploy --rollback   # go back to the previous deployment (the last 10 are kept)
+onebase deploy --rollback   # go back to the deployment that was live before this one (the last 10 are kept)
 ```
 
 Things to know:
 
-- **Where it's kept:** in the database. A restart keeps running the deployment, backups include it, and with [several instances](./databases.md) on Postgres or Turso they all switch to it together.
-- **It replaces the local code:** a deployment runs instead of the server's `onebase/` folder or the code built into the binary. Start with `--no-deploy` (or `ONEBASE_DEPLOY=off`) to run the local code and refuse pushes. `onebase dev` servers always refuse them.
+- **Where it's kept:** in the database. A restart keeps running the deployment, backups include it, and with [several instances](./databases.md) on Postgres or Turso they all switch to it together. The other instances switch a moment after the deploy commits (under a second), and until then they check writes against the old schema. So with several instances, a write that lands on another instance in that moment isn't checked against a validator the deploy tightened.
+- **It replaces the local code:** a deployment runs instead of the server's `onebase/` folder or the code built into the binary. Start with `--no-deploy` (or `ONEBASE_DEPLOY=off`; `0`, `false` and `no` work too) to run the local code and refuse pushes. `onebase dev` servers always refuse them.
 - **Secrets stay on the server:** a deploy ships code, not environment variables. Functions read `process.env` on the server, so put API keys in the server's `.env`.
 - **The key:** `ONEBASE_DEPLOY_KEY` is the server's [admin key](./dashboard.md): `ONEBASE_ADMIN_KEY` there, or the contents of its `onebase_data/admin.key`. Anyone with it can run code on the server. Deploy over `https://`.
 - **The admin API:** deploys go to `/_admin/api/deploy`, so `--no-dashboard` turns them off too. If you block `/_admin` at the proxy, deploy through an SSH tunnel (`--url http://localhost:8090`) or allow that path from your CI's addresses.

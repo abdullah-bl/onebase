@@ -23,7 +23,8 @@ const KEY = /^[A-Za-z_][A-Za-z0-9_.-]*$/;
  * $ references are left for `expand`.
  */
 function parseRaw(text: string): Record<string, string> {
-  const out: Record<string, string> = {};
+  // No prototype: keys like __proto__ or toString are ordinary names here.
+  const out: Record<string, string> = Object.create(null);
   const src = text.replace(/\r\n?/g, "\n");
   let i = 0;
   while (i < src.length) {
@@ -67,7 +68,7 @@ function expand(raw: Record<string, string>, lookup: (key: string) => string | u
     const result = raw[key]!.replace(REFERENCE, (m, braced, fallback, bare) => {
       if (m === "\\$") return "$";
       const name = braced ?? bare;
-      const v = lookup(name) ?? (name in raw ? value(name) : undefined);
+      const v = lookup(name) ?? (Object.hasOwn(raw, name) ? value(name) : undefined);
       return fallback !== undefined && !v ? fallback : (v ?? "");
     });
     resolving.delete(key);
@@ -84,7 +85,7 @@ export function parseEnv(text: string, lookup: (key: string) => string | undefin
 
 /** Every file's values merged (later files win), then expanded. */
 function readFiles(cwd: string, names: string[], lookup: (key: string) => string | undefined, required: boolean) {
-  const raw: Record<string, string> = {};
+  const raw: Record<string, string> = Object.create(null);
   const loaded: string[] = [];
   for (const name of names) {
     const file = readFile(cwd, name);
@@ -128,7 +129,7 @@ function readFile(cwd: string, name: string) {
  */
 export function withoutBunEnv(env: Record<string, string | undefined>, cwd = process.cwd()): Record<string, string | undefined> {
   const real = { ...env };
-  const { values } = readFiles(cwd, bunAutoloadFiles(env), (k) => env[k], false);
+  const { values } = readFiles(cwd, bunAutoloadFiles(env), (k) => (Object.hasOwn(env, k) ? env[k] : undefined), false);
   for (const [key, value] of Object.entries(values)) if (env[key] === value) delete real[key];
   return real;
 }
@@ -139,9 +140,9 @@ export function loadEnv(opts: LoadEnvOptions): string[] {
   const cwd = opts.cwd ?? process.cwd();
   // Undo bun's own loading, so its files get onebase's precedence like the rest.
   const real = opts.bunAutoloaded ? withoutBunEnv(env, cwd) : { ...env };
-  for (const key of Object.keys(env)) if (!(key in real)) delete env[key];
+  for (const key of Object.keys(env)) if (!Object.hasOwn(real, key)) delete env[key];
 
-  const { values, loaded } = readFiles(cwd, opts.files ?? envFilesFor(opts.mode), (k) => real[k], Boolean(opts.files));
+  const { values, loaded } = readFiles(cwd, opts.files ?? envFilesFor(opts.mode), (k) => (Object.hasOwn(real, k) ? real[k] : undefined), Boolean(opts.files));
   for (const [key, value] of Object.entries(values)) if (real[key] === undefined) env[key] = value;
   return loaded;
 }

@@ -173,3 +173,46 @@ test("dev servers refuse deploys", async () => {
   await runtime.init();
   await expect(runtime.deploy({ code: "export default {}" })).rejects.toThrow("dev mode");
 });
+
+test("--rollback returns to what was live before, even after an earlier rollback", async () => {
+  const good = await push(v1);
+  await push(v2);
+  expect((await push(v1, { rollback: true })).id).toBe(good.id);
+  await push(v2);
+  expect((await push(v1, { rollback: true })).id).toBe(good.id); // not the v2 rolled away from the first time
+  expect(app.runtime.functions.has("notes:count")).toBe(false);
+});
+
+test("a deploy broadcast from another instance runs the active deployment, not the one it names", async () => {
+  const older = await push(v2);
+  const current = await push(v1);
+  // Two instances deploying at once: this one hears about the deploy that lost after its own won.
+  await (app.runtime as any).onRemoteCommit(JSON.stringify({ o: "another-instance", d: older.id }));
+  expect(app.runtime.deployment?.id).toBe(current.id);
+});
+
+test("after a deploy without a schema, the next schema checks every document again", async () => {
+  const RAW = `
+import { mutation } from "onebase/server";
+import { v } from "onebase/values";
+export const add = mutation({ args: { text: v.any() }, handler: (ctx, { text }) => ctx.db.insert("notes", { text }) });
+export const tidy = mutation({ args: {}, handler: async (ctx) => {
+  for (const n of await ctx.db.query("notes").collect()) if (typeof n.text !== "string") await ctx.db.delete(n._id);
+} });
+`;
+  const bare = project("bare", { "notes.ts": RAW });
+  await push(v1);
+  await push(bare);
+  const client = new OnebaseClient(url);
+  await client.mutation("notes:add" as any, { text: 123 });
+  await expect(push(v1)).rejects.toThrow("schema.ts doesn't match 1 existing document");
+  await client.mutation("notes:tidy" as any, {});
+  client.close();
+  await push(v1);
+});
+
+test("bundles read NODE_ENV on the server, not on the machine that built them", async () => {
+  const dir = project("mode", { "mode.ts": `import { query } from "onebase/server";\nexport const get = query({ args: {}, handler: () => process.env.NODE_ENV ?? null });` });
+  const { code } = await bundleProject(join(dir, "onebase"));
+  expect(code).toContain("process.env.NODE_ENV");
+});

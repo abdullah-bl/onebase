@@ -36,9 +36,30 @@ export async function getDeployment(tx: Exec, id: string): Promise<StoredDeploym
   return toStored(await tx.get(`SELECT ${COLUMNS} FROM _deployments d WHERE d.id = ?`, [id]));
 }
 
-/** The deployment pushed just before `current`, for --rollback. */
+export async function activeDeploymentId(tx: Exec): Promise<string | null> {
+  return ((await tx.get("SELECT value FROM _meta WHERE key = 'deployment'"))?.value as string | undefined) ?? null;
+}
+
+/** Ids of the deployments that were made active, oldest first: a deploy adds one, a rollback goes back one. */
+async function activations(tx: Exec): Promise<string[]> {
+  const row = await tx.get("SELECT value FROM _meta WHERE key = 'deployments'");
+  try {
+    const ids = row ? JSON.parse(String(row.value)) : [];
+    return Array.isArray(ids) ? ids.map(String) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** The deployment that was active before `current`, for --rollback (not just the one pushed before it). */
 export async function previousDeployment(tx: Exec, current: StoredDeployment): Promise<StoredDeployment | null> {
-  return toStored(await tx.get(`SELECT ${COLUMNS} FROM _deployments d WHERE d.created < ? ORDER BY d.created DESC LIMIT 1`, [current.created]));
+  const ids = await activations(tx);
+  for (let i = ids.length - 1; i >= 0; i--) {
+    if (ids[i] === current.id) continue;
+    const found = await getDeployment(tx, ids[i]!);
+    if (found) return found;
+  }
+  return null;
 }
 
 /** Stores a new deployment, deleting all but the newest KEEP_DEPLOYMENTS. */
@@ -48,8 +69,14 @@ export async function saveDeployment(tx: Exec, d: StoredDeployment): Promise<voi
   for (const row of rows.slice(KEEP_DEPLOYMENTS)) await tx.run("DELETE FROM _deployments WHERE id = ?", [row.id]);
 }
 
-export async function setActiveDeployment(tx: Exec, id: string): Promise<void> {
-  await tx.run("INSERT INTO _meta (key, value) VALUES ('deployment', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [id]);
+export async function setActiveDeployment(tx: Exec, id: string, how: "deploy" | "rollback"): Promise<void> {
+  let ids = await activations(tx);
+  const at = ids.lastIndexOf(id);
+  // A rollback forgets what came after the deployment it goes back to, so the next one goes back further.
+  ids = how === "rollback" && at >= 0 ? ids.slice(0, at + 1) : [...ids, id];
+  const upsert = "INSERT INTO _meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value";
+  await tx.run(upsert, ["deployment", id]);
+  await tx.run(upsert, ["deployments", JSON.stringify(ids.slice(-KEEP_DEPLOYMENTS * 2))]);
 }
 
 /** Decodes a stored deployment's static files for serving from memory. */

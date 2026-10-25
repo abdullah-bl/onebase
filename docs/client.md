@@ -128,6 +128,28 @@ The `store` covers the queries this client is subscribed to:
 - **It may run more than once:** first when you call the mutation, then again on top of each new server result that arrives while the mutation is in flight. Keep it a pure function of `store` and `args`.
 - **No flicker:** the server sends a mutation's result together with the query updates that include its writes, and the client applies them in one step.
 
+## Offline
+
+Opt in, and the client keeps working through drops in connectivity and reloads while offline:
+
+```ts
+const client = new OnebaseClient("https://api.example.com", { offline: true });
+```
+
+| | |
+|---|---|
+| Cached results | the newest 100 query results (set `offline: { maxCachedQueries }`) are kept in `localStorage`, so a reload while offline shows them immediately; live data replaces them when it arrives |
+| Queued mutations | mutations made while disconnected are stored and sent, in the order they were made, once the connection returns — across reloads too |
+| `client.queuedMutations` | how many are still queued |
+| `client.clearQueuedMutations()` | drops them (the promises from when they were made reject) |
+
+Details worth knowing:
+
+- **Each queued mutation is sent at most once per session.** One that was sent but lost with the connection is never silently re-sent — it may or may not have run — matching how every other call behaves. Make such mutations idempotent if that matters, or send them from an action with its own deduping.
+- **Cached results belong to the signed-in user.** With a token configured they're held back until the server confirms the same user is asking, and the cache is cleared when the user changes: one user never sees another's data.
+- **Optimistic updates don't survive a reload.** They cover what happens while the page is open.
+- Pass `offline: { storage }` to store elsewhere (any object with `getItem`/`setItem`/`removeItem`); in browsers the default is `localStorage`. The [Swift client](./swift.md) works the same way with a directory on disk.
+
 ## Authentication
 
 With [built-in sign-in](./auth.md#built-in-sign-in):
@@ -179,6 +201,8 @@ curl -X POST http://localhost:8090/api/mutation \
 | `POST /api/query`, `/api/mutation`, `/api/action` | `{ path, args }` → `{ status, value }` or `{ status: "error", errorMessage, errorData }` |
 | `POST /api/run` | same, for any function type |
 | `GET /api/health` | `{ ok, functions, subscriptions }` |
-| `WS /api/sync` | the live protocol used by the clients |
+| `WS /api/sync` | the live protocol used by the clients ([spec](./client-protocol.md)) |
 
-Send `Authorization: Bearer <token>` to call as a user.
+Send `Authorization: Bearer <token>` to call as a user. Writing a client for another platform?
+The [client protocol spec](./client-protocol.md) is the contract; the Swift client
+([docs](./swift.md)) is a full example, with offline support and optimistic updates.

@@ -234,6 +234,87 @@ final class IntegrationTests: XCTestCase {
         XCTAssertEqual(calls as? [String], ["notes:add|queued-1", "notes:add|queued-2"])
     }
 
+    /// Starts a server on `port`, waits until `client` is connected and has been answered (its
+    /// queued calls, if any survived, were sent in that same exchange), and returns the paths
+    /// of the calls the server received.
+    private func callsReceived(on port: UInt16, by client: OnebaseClient, server: FakeSyncServer) async throws -> [String] {
+        let calls: NSMutableArray = [] // appended on the server queue
+        server.onCall = { _, _, path, args, reply in
+            calls.add("\(path)|\(args["text"]?.string ?? "")")
+            reply(true, .null, nil)
+        }
+        try server.start(onPort: port)
+        let connected = expectation(description: "connected and answered")
+        var sawFirst = false
+        let subscription = client.subscribe("ping", [:]) { _ in
+            if !sawFirst {
+                sawFirst = true
+                connected.fulfill()
+            }
+        }
+        defer { subscription.cancel() }
+        await fulfillment(of: [connected], timeout: 15) // the client is backing off between retries
+        try await Task.sleep(nanoseconds: 300_000_000) // anything it was going to send has arrived
+        return calls as? [String] ?? []
+    }
+
+    func testClearedQueuedMutationsAreNeverSent() async throws {
+        let blocker = FakeSyncServer()
+        try blocker.start()
+        let port = blocker.port
+        blocker.stop()
+
+        let directory = tempDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let client = OnebaseClient(url: "http://127.0.0.1:\(port)", tokenStore: tokenStore(directory), offlineDirectory: directory)
+        defer { client.close() }
+        try await Task.sleep(nanoseconds: 300_000_000) // not connected
+
+        let outcomes: NSMutableArray = [] // appended by the tasks below
+        Task {
+            do { _ = try await client.mutation("notes:add", ["text": "queued"]); outcomes.add("sent") }
+            catch { outcomes.add("\(error)") }
+        }
+        try await waitUntil("the mutation queued") { client.queuedMutationCount == 1 }
+
+        client.clearQueuedMutations()
+        XCTAssertEqual(client.queuedMutationCount, 0)
+        try await waitUntil("the caller to hear it was dropped") { outcomes.count == 1 }
+        XCTAssertEqual(outcomes.firstObject as? String, "Dropped: cleared while queued.")
+
+        let server = FakeSyncServer()
+        defer { server.stop() }
+        let received = try await callsReceived(on: port, by: client, server: server)
+        XCTAssertEqual(received, [], "a cleared mutation must not reach the server")
+    }
+
+    func testClearingMutationsQueuedByAnEarlierRunStopsThemToo() async throws {
+        let blocker = FakeSyncServer()
+        try blocker.start()
+        let port = blocker.port
+        blocker.stop()
+
+        let directory = tempDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let earlier = OnebaseClient(url: "http://127.0.0.1:\(port)", tokenStore: tokenStore(directory), offlineDirectory: directory)
+        try await Task.sleep(nanoseconds: 300_000_000)
+        Task { _ = try? await earlier.mutation("notes:add", ["text": "from-before"]) }
+        try await waitUntil("the mutation queued") { earlier.queuedMutationCount == 1 }
+        earlier.close() // the app goes away
+
+        // The next run loads it from disk (nobody is waiting on it) and clears it before connecting.
+        let client = OnebaseClient(url: "http://127.0.0.1:\(port)", tokenStore: tokenStore(directory), offlineDirectory: directory)
+        defer { client.close() }
+        XCTAssertEqual(client.queuedMutationCount, 1)
+        client.clearQueuedMutations()
+        XCTAssertEqual(client.queuedMutationCount, 0)
+
+        let server = FakeSyncServer()
+        defer { server.stop() }
+        let received = try await callsReceived(on: port, by: client, server: server)
+        XCTAssertEqual(received, [], "a cleared mutation must not reach the server")
+    }
+
     func testCachedResultHydratesTheNextClientBeforeTheServerAnswers() async throws {
         let server = FakeSyncServer()
         try server.start()

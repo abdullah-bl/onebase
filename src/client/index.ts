@@ -76,7 +76,8 @@ type Pending = {
   restored?: boolean;
 };
 type TokenFetcher = () => Promise<string | null | undefined> | string | null | undefined;
-type OutboxEntry = { path: string; args: unknown; ref?: object };
+/** `subject` is who made the call; absent while unknown (made before the server confirmed who is asking). */
+type OutboxEntry = { path: string; args: unknown; subject?: string | null; ref?: object };
 
 export type ClientOptions = {
   /** Provide for environments without a global WebSocket. */
@@ -195,6 +196,8 @@ export class OnebaseClient {
   private cache = new Map<string, { value: unknown; at: number }>();
   private cacheSubject: string | null | undefined = undefined;
   private authSubject: string | null | undefined = undefined;
+  /** The server has answered the current connection's auth message: queued mutations may be sent. */
+  private authConfirmed = false;
   private outbox: OutboxEntry[] = [];
   private cacheTimer: ReturnType<typeof setTimeout> | null = null;
   private stateListeners = new Set<(s: ConnectionState) => void>();
@@ -256,6 +259,7 @@ export class OnebaseClient {
       if (this.ws !== ws) return;
       this.ws = null;
       this.ready = false;
+      this.authConfirmed = false;
       // A call that was sent but not answered may or may not have run; don't silently retry it.
       const lost: Pending[] = [];
       for (const [requestId, p] of this.pending) {
@@ -288,6 +292,7 @@ export class OnebaseClient {
   private async authenticate() {
     const run = ++this.authRun;
     this.ready = false;
+    this.authConfirmed = false;
     let token: string | null = null;
     if (this.fetchToken) {
       try {
@@ -297,7 +302,9 @@ export class OnebaseClient {
       }
     }
     if (run !== this.authRun || this.ws?.readyState !== 1) return;
-    if (token !== null || this.authSent) {
+    // Offline support always sends it: the answer says who is asking, which decides whose cached
+    // results may be shown and whose queued mutations may be sent.
+    if (token !== null || this.authSent || this.offline) {
       this.authAcks++;
       this.raw({ type: "auth", token });
     }
@@ -313,7 +320,7 @@ export class OnebaseClient {
       }
     }
     for (const p of this.pending.values()) {
-      if (!p.sent) {
+      if (!p.sent && !p.outbox) {
         this.ws.send(p.message);
         p.sent = true;
       }
@@ -334,9 +341,10 @@ export class OnebaseClient {
     if (this.authAcks > 0) return; // a newer token is on the way
     if (msg.ok) {
       const subject = ((msg.identity as { subject?: string } | null)?.subject as string | null) ?? null;
-      this.releaseHydrations(subject);
       this.authAnswered(subject);
-      return this.updateAuth({ isLoading: false, isAuthenticated: Boolean(msg.identity), error: null });
+      this.releaseHydrations(subject);
+      this.releaseOutbox(subject);
+      return this.updateAuth({ isLoading: !this.fetchToken && this.exchanging, isAuthenticated: Boolean(msg.identity), error: null });
     }
     this.dropHydrations();
     if (this.fetchToken === this.sessionFetcher && !msg.ended) {
@@ -533,9 +541,10 @@ export class OnebaseClient {
     });
   }
 
-  /** Cache and outbox belong to whoever is signed in; a different user starts empty. */
+  /** The cache belongs to whoever is signed in; a different user starts empty. */
   private authAnswered(subject: string | null) {
     this.authSubject = subject;
+    this.authConfirmed = true;
     if (!this.offline) return;
     if (this.cacheSubject === undefined) this.cacheSubject = subject;
     else if (this.cacheSubject !== subject) {
@@ -556,6 +565,36 @@ export class OnebaseClient {
       sub.last = sub.server;
       for (const l of sub.listeners) l(sub.last!);
     }
+  }
+
+  /**
+   * The server confirmed who is asking: queued mutations made by that user (or by nobody known
+   * yet) are sent in order; ones made by someone else are dropped, never sent as this user.
+   */
+  private releaseOutbox(subject: string | null) {
+    if (!this.offline) return;
+    let changed = false;
+    for (const [requestId, p] of [...this.pending]) {
+      const entry = p.outbox ? this.outbox.find((e) => e.ref === p.outbox) : undefined;
+      if (!entry || p.sent) continue;
+      if (entry.subject === undefined) {
+        entry.subject = subject;
+        changed = true;
+      } else if (entry.subject !== subject) {
+        this.pending.delete(requestId);
+        this.outbox.splice(this.outbox.indexOf(entry), 1);
+        changed = true;
+        const error = new Error("Dropped: queued by a different user than the one now signed in.");
+        if (p.restored) console.warn(`onebase: a queued ${entry.path} mutation was dropped: ${error.message}`);
+        else p.reject(error);
+        continue;
+      }
+      if (this.ws?.readyState === 1) {
+        this.ws.send(p.message);
+        p.sent = true;
+      }
+    }
+    if (changed) this.writeOfflineStorage(this.outboxKey, this.outbox);
   }
 
   private dropHydrations() {
@@ -639,6 +678,7 @@ export class OnebaseClient {
   /** Sets a token (or a function returning one) sent with every request; re-runs subscriptions as that user. */
   setAuth(token: string | TokenFetcher | null) {
     this.fetchToken = token === null ? null : typeof token === "function" ? token : () => token;
+    this.authSubject = undefined; // unknown until the server answers for this token
     // Not connected yet: the next connection authenticates first anyway.
     if (this.ws?.readyState === 1) void this.authenticate();
   }
@@ -717,7 +757,8 @@ export class OnebaseClient {
       // With a token configured it's held back until the server confirms the same user is asking.
       const cached = this.cache.get(key);
       if (cached) {
-        if (this.fetchToken) sub.pendingHydration = { value: cached.value, subject: this.cacheSubject ?? null };
+        // A cache that belongs to a user is never shown to anyone else, signed out included.
+        if (this.fetchToken || this.cacheSubject != null) sub.pendingHydration = { value: cached.value, subject: this.cacheSubject ?? null };
         else {
           sub.server = { ok: true, value: cached.value };
           sub.last = sub.server;
@@ -756,13 +797,13 @@ export class OnebaseClient {
       // Offline: mutations persist until the server answers, so a disconnect (or a reload while
       // disconnected) doesn't lose them. They're sent in the order they were made.
       if (kind === "mutation" && this.offline) {
-        const entry: OutboxEntry = { path, args: args ?? {}, ref: {} };
+        const entry: OutboxEntry = { path, args: args ?? {}, subject: this.authSubject, ref: {} };
         p.outbox = entry.ref;
         this.outbox.push(entry);
         this.writeOfflineStorage(this.outboxKey, this.outbox);
       }
       this.pending.set(requestId, p);
-      if (this.ready && this.ws?.readyState === 1) {
+      if (this.ready && this.ws?.readyState === 1 && (!p.outbox || this.authConfirmed)) {
         this.ws.send(message);
         p.sent = true;
       }

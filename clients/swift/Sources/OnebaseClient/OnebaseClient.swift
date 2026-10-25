@@ -444,18 +444,19 @@ public final class OnebaseClient {
         offlineStore?.queuedCount ?? 0
     }
 
-    /// Drops every queued mutation. Calls still waiting for a connection throw.
+    /// Drops every queued mutation, so none is sent when the connection returns. Calls still
+    /// waiting for a connection throw. (One already sent is waiting on the server's answer; that
+    /// one still settles normally.)
     public func clearQueuedMutations() {
-        let ids = Set(offlineStore?.queuedMutations().map(\.id) ?? [])
-        state.async {
+        state.sync {
             for id in self.orderedPending {
-                guard let pending = self.pendingCalls[id], let queuedId = pending.queuedId, ids.contains(queuedId) else { continue }
-                pending.queuedId = nil
+                guard let pending = self.pendingCalls[id], pending.queuedId != nil, !pending.sent else { continue }
+                self.pendingCalls[id] = nil
                 pending.continuation?.resume(throwing: OnebaseError("Dropped: cleared while queued."))
-                pending.continuation = nil
             }
+            self.orderedPending.removeAll { self.pendingCalls[$0] == nil }
+            self.offlineStore?.clearQueuedMutations()
         }
-        offlineStore?.clearQueuedMutations()
     }
 
     // ---- Built-in auth over HTTP ----

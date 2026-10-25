@@ -147,6 +147,7 @@ Details worth knowing:
 
 - **Each queued mutation is sent at most once per session.** One that was sent but lost with the connection is never silently re-sent — it may or may not have run — matching how every other call behaves. Make such mutations idempotent if that matters, or send them from an action with its own deduping.
 - **Cached results belong to the signed-in user.** With a token configured they're held back until the server confirms the same user is asking, and the cache is cleared when the user changes: one user never sees another's data.
+- **Queued mutations belong to the user who made them.** They're sent only once the server confirms that same user is asking; if someone else is signed in by then they're dropped, never sent as the new user. (One made before the server ever confirmed who is asking is sent for whoever is confirmed first.)
 - **Optimistic updates don't survive a reload.** They cover what happens while the page is open.
 - Pass `offline: { storage }` to store elsewhere (any object with `getItem`/`setItem`/`removeItem`); in browsers the default is `localStorage`. The [Swift client](./swift.md) works the same way with a directory on disk.
 

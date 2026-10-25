@@ -115,7 +115,14 @@ describe("offline support", () => {
 
 describe("offline cache is held back until the server confirms who is asking", () => {
   const whoami = async (ctx: any) => (await ctx.auth.getUserIdentity())?.subject ?? null;
-  const who = { auth: { who: query({ args: {}, handler: whoami }) } };
+  const who = {
+    auth: { who: query({ args: {}, handler: whoami }) },
+    notes: {
+      add: mutation({ args: { text: v.string() }, handler: async (ctx: any, { text }) => ctx.db.insert("notes", { text, by: await whoami(ctx) }) }),
+      list: query({ args: {}, handler: async (ctx: any) => (await ctx.db.query("notes").collect()).map((n: any) => `${n.by}:${n.text}`) }),
+    },
+  };
+  const authenticate = (token: string) => ({ subject: token, tokenIdentifier: `test|${token}` });
   let app: Awaited<ReturnType<typeof startApp>>;
   let dataDir: string;
   let url: string;
@@ -125,7 +132,7 @@ describe("offline cache is held back until the server confirms who is asking", (
     app = await startApp({
       schema: null,
       modules: who as any,
-      authenticate: (token) => ({ subject: token, tokenIdentifier: `test|${token}` }),
+      authenticate,
       dataDir,
       port: 0,
       hostname: "127.0.0.1",
@@ -167,5 +174,99 @@ describe("offline cache is held back until the server confirms who is asking", (
     expect(seenB[0]).toBe("bob");
     expect(seenB).not.toContain("alice");
     bob.close();
+  });
+
+  test("a signed-out client never sees the cache of the user who was signed in", async () => {
+    const storage = memoryStorage();
+    const alice = new OnebaseClient(url, { offline: { storage }, authStorage: null });
+    alice.setAuth(() => "alice");
+    const seenA: (string | null)[] = [];
+    alice.onUpdate("auth:who", {}, (v) => seenA.push(v));
+    for (let i = 0; i < 100 && !seenA.includes("alice"); i++) await Bun.sleep(50);
+    alice.close(); // the cache is written under alice
+
+    const anonymous = new OnebaseClient(url, { offline: { storage }, authStorage: null });
+    const seen: (string | null)[] = [];
+    anonymous.onUpdate("auth:who", {}, (v) => seen.push(v));
+    for (let i = 0; i < 100 && seen.length === 0; i++) await Bun.sleep(50);
+    expect(seen[0]).toBeNull(); // the live, signed-out answer
+    expect(seen).not.toContain("alice");
+    anonymous.close();
+    expect(entries(storage, `onebase:cache:${url}`).length).toBeGreaterThan(0); // still cached, but now as anonymous
+    expect(JSON.parse(storage.data.get(`onebase:cache:${url}`)!).subject).toBeNull();
+  });
+
+  test("a mutation queued by one user is never sent as another", async () => {
+    const holder = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {}, open() {}, close() {} } });
+    const port = holder.port;
+    holder.stop();
+    const offlineUrl = `http://127.0.0.1:${port}`;
+    const start = (dataDir: string) =>
+      startApp({ schema: null, modules: who as any, authenticate, dataDir, port, hostname: "127.0.0.1", dev: false, quiet: true });
+
+    const dir = mkdtempSync(join(tmpdir(), "onebase-offline-users-"));
+    let server = await start(dir);
+    try {
+      // Alice is confirmed by the server, then loses the connection and queues a mutation.
+      const storage = memoryStorage();
+      const alice = new OnebaseClient(offlineUrl, { offline: { storage }, authStorage: null });
+      alice.setAuth(() => "alice");
+      const seenA: (string | null)[] = [];
+      alice.onUpdate("auth:who", {}, (v) => seenA.push(v));
+      for (let i = 0; i < 100 && !seenA.includes("alice"); i++) await Bun.sleep(50);
+      await server.close();
+      for (let i = 0; i < 100 && alice.connectionState === "open"; i++) await Bun.sleep(50);
+      void alice.mutation("notes:add", { text: "alice-private" } as any).catch(() => {});
+      expect(alice.queuedMutations).toBe(1);
+      alice.close(); // the page goes away; the queue lives in storage
+
+      server = await start(dir);
+      // Bob signs in on the same storage: alice's queued mutation is dropped, not sent as bob.
+      const bob = new OnebaseClient(offlineUrl, { offline: { storage }, authStorage: null });
+      bob.setAuth(() => "bob");
+      for (let i = 0; i < 100 && bob.queuedMutations > 0; i++) await Bun.sleep(50);
+      expect(bob.queuedMutations).toBe(0);
+      expect(await bob.query("notes:list", {})).toEqual([]);
+      bob.close();
+
+      // Nothing was left behind to replay later: alice signing back in sends nothing of the old queue.
+      const again = new OnebaseClient(offlineUrl, { offline: { storage }, authStorage: null });
+      again.setAuth(() => "alice");
+      await again.mutation("notes:add", { text: "alice-live" } as any);
+      expect(await again.query("notes:list", {})).toEqual(["alice:alice-live"]);
+      again.close();
+    } finally {
+      await server.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a user's queued mutations are sent, as that user, once the server confirms them", async () => {
+    const holder = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {}, open() {}, close() {} } });
+    const port = holder.port;
+    holder.stop();
+    const offlineUrl = `http://127.0.0.1:${port}`;
+
+    const storage = memoryStorage();
+    const first = new OnebaseClient(offlineUrl, { offline: { storage }, authStorage: null });
+    first.setAuth(() => "carol");
+    await Bun.sleep(200);
+    void first.mutation("notes:add", { text: "one" } as any).catch(() => {});
+    void first.mutation("notes:add", { text: "two" } as any).catch(() => {});
+    first.close();
+
+    const dir = mkdtempSync(join(tmpdir(), "onebase-offline-same-"));
+    const late = await startApp({ schema: null, modules: who as any, authenticate, dataDir: dir, port, hostname: "127.0.0.1", dev: false, quiet: true });
+    try {
+      const reloaded = new OnebaseClient(offlineUrl, { offline: { storage }, authStorage: null });
+      reloaded.setAuth(() => "carol");
+      for (let i = 0; i < 100 && reloaded.queuedMutations > 0; i++) await Bun.sleep(50);
+      expect(reloaded.queuedMutations).toBe(0);
+      expect(await reloaded.query("notes:list", {})).toEqual(["carol:one", "carol:two"]);
+      reloaded.close();
+    } finally {
+      await late.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

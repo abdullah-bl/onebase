@@ -19,8 +19,8 @@ final class ValueTests: XCTestCase {
         let data = try JSONEncoder().encode(original)
         let decoded = try JSONDecoder().decode(OnebaseValue.self, from: data)
         XCTAssertEqual(decoded, original)
-        XCTAssertEqual(decoded["list"]?.array?[0]?.int, 1)
-        XCTAssertEqual(decoded["list"]?.array?[1]?.double, 2.5)
+        XCTAssertEqual(decoded["list"]?.array?[0].int, 1)
+        XCTAssertEqual(decoded["list"]?.array?[1].double, 2.5)
     }
 
     func testWholeNumbersDecodeAsInts() throws {

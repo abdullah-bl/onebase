@@ -499,11 +499,11 @@ public final class OnebaseClient {
     // ---- Close ----
 
     public func close() {
+        offlineStore?.flush() // synchronous: the state is on disk before close() returns
         state.async {
             guard !self.closed else { return }
             self.closed = true
             self.keepAlive?.cancel()
-            self.offlineStore?.flush()
             self.task?.cancel(with: .goingAway, reason: nil)
             self.task = nil
             self.ready = false

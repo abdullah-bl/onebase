@@ -207,10 +207,12 @@ final class IntegrationTests: XCTestCase {
 
         let offline = OnebaseClient(url: "http://127.0.0.1:\(port)", tokenStore: tokenStore(directory), offlineDirectory: directory)
         try await Task.sleep(nanoseconds: 300_000_000) // clearly in its retry loop, not connected
-        Task {
-            _ = try? await offline.mutation("notes:add", ["text": "queued-1"])
-            _ = try? await offline.mutation("notes:add", ["text": "queued-2"])
-        }
+        // Each mutation is its own task: the first never finishes while offline, so awaiting
+        // them in one task would never even start the second. The entry order in the offline
+        // store is what must come out in order.
+        Task { _ = try? await offline.mutation("notes:add", ["text": "queued-1"]) }
+        try await waitUntil("the first mutation queued") { offline.queuedMutationCount == 1 }
+        Task { _ = try? await offline.mutation("notes:add", ["text": "queued-2"]) }
         try await waitUntil("two mutations queued") { offline.queuedMutationCount == 2 }
         offline.close() // the app goes away; the queue lives in the offline store
 

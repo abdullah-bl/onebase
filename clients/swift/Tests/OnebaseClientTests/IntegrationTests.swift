@@ -17,6 +17,8 @@ final class FakeSyncServer {
     var onCall: ((Int64, String, String, [String: OnebaseValue], @escaping (Bool, OnebaseValue?, String?) -> Void) -> Void)?
     /// Called for each subscription: (id, path, reply). `reply(value)` sends the first update.
     var onSub: ((Int64, String, @escaping (OnebaseValue) -> Void) -> Void)?
+    /// Who the server says is asking in its auth answers (nil: anonymous).
+    var subject: String?
 
     private static func encode(_ object: [String: OnebaseValue]) -> String {
         let encoder = JSONEncoder()
@@ -67,7 +69,8 @@ final class FakeSyncServer {
               let object = value.object else { return }
         switch object["type"]?.string {
         case "auth":
-            send(Self.encode(["type": .string("auth"), "ok": .bool(true), "identity": .null]))
+            let identity: OnebaseValue = subject.map { .object(["subject": .string($0)]) } ?? .null
+            send(Self.encode(["type": .string("auth"), "ok": .bool(true), "identity": identity]))
         case "sub":
             guard let id = object["id"]?.int, let path = object["path"]?.string else { return }
             let reply: (OnebaseValue) -> Void = { [weak self] value in
@@ -313,6 +316,71 @@ final class IntegrationTests: XCTestCase {
         defer { server.stop() }
         let received = try await callsReceived(on: port, by: client, server: server)
         XCTAssertEqual(received, [], "a cleared mutation must not reach the server")
+    }
+
+    /// `subject` signs in (as far as the fake server's answers go), is confirmed by the server, then
+    /// loses the connection and queues a mutation; its app then goes away. Returns the port used.
+    private func queueWhileOfflineAs(_ subject: String, directory: URL) async throws -> UInt16 {
+        let blocker = FakeSyncServer()
+        try blocker.start()
+        let port = blocker.port
+        blocker.stop()
+
+        let server = FakeSyncServer()
+        server.subject = subject
+        try server.start(onPort: port)
+        let client = OnebaseClient(url: "http://127.0.0.1:\(port)", tokenStore: tokenStore(directory), offlineDirectory: directory)
+        let confirmed = expectation(description: "connected and confirmed as \(subject)")
+        var sawFirst = false
+        client.subscribe("who", [:]) { _ in
+            if !sawFirst {
+                sawFirst = true
+                confirmed.fulfill()
+            }
+        }
+        await fulfillment(of: [confirmed], timeout: 5)
+
+        var connection = OnebaseClient.ConnectionState.open
+        client.onConnectionChange = { connection = $0 }
+        server.stop()
+        try await waitUntil("the connection to drop") { connection == .connecting }
+
+        Task { _ = try? await client.mutation("notes:add", ["text": .string("from-\(subject)")]) }
+        try await waitUntil("the mutation queued") { client.queuedMutationCount == 1 }
+        client.close() // the app goes away; the queue lives in the offline store
+        try await Task.sleep(nanoseconds: 300_000_000)
+        return port
+    }
+
+    func testQueuedMutationIsNeverSentAsAnotherUser() async throws {
+        let directory = tempDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let port = try await queueWhileOfflineAs("alice", directory: directory)
+
+        // Bob signs in on the same device: alice's queued mutation is dropped, not sent as bob.
+        let server = FakeSyncServer()
+        server.subject = "bob"
+        defer { server.stop() }
+        let bob = OnebaseClient(url: "http://127.0.0.1:\(port)", tokenStore: tokenStore(directory), offlineDirectory: directory)
+        defer { bob.close() }
+        XCTAssertEqual(bob.queuedMutationCount, 1)
+        let received = try await callsReceived(on: port, by: bob, server: server)
+        XCTAssertEqual(received, [], "alice's mutation must not reach the server as bob")
+        XCTAssertEqual(bob.queuedMutationCount, 0, "and it is not left queued")
+    }
+
+    func testQueuedMutationIsSentOnceItsOwnUserIsConfirmedAgain() async throws {
+        let directory = tempDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let port = try await queueWhileOfflineAs("alice", directory: directory)
+
+        let server = FakeSyncServer()
+        server.subject = "alice"
+        defer { server.stop() }
+        let alice = OnebaseClient(url: "http://127.0.0.1:\(port)", tokenStore: tokenStore(directory), offlineDirectory: directory)
+        defer { alice.close() }
+        let received = try await callsReceived(on: port, by: alice, server: server)
+        XCTAssertEqual(received, ["notes:add|from-alice"])
     }
 
     func testCachedResultHydratesTheNextClientBeforeTheServerAnswers() async throws {

@@ -60,4 +60,24 @@ final class OfflineStoreTests: XCTestCase {
         reloaded.flush()
         XCTAssertEqual(OfflineStore(directory: directory).queuedCount, 0)
     }
+
+    func testQueuedMutationsRememberWhoMadeThemAndOldEntriesAreUnknown() throws {
+        let store = OfflineStore(directory: directory)
+        _ = store.enqueueMutation("notes:add", ["text": "mine"], subject: "alice", subjectKnown: true)
+        let unknown = store.enqueueMutation("notes:add", ["text": "early"])
+        store.setMutationSubject(unknown, "bob")
+
+        let queued = OfflineStore(directory: directory).queuedMutations()
+        XCTAssertEqual(queued.map(\.subject), ["alice", "bob"])
+        XCTAssertEqual(queued.map(\.subjectKnown), [true, true])
+
+        // A file written before queued mutations had an owner still loads; nobody owns its entries yet.
+        let legacy = FileManager.default.temporaryDirectory.appendingPathComponent("onebase-legacy-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: legacy, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: legacy) }
+        try Data(#"[{"id":"x","path":"notes:add","args":{"text":"old"}}]"#.utf8).write(to: legacy.appendingPathComponent("mutation-outbox.json"))
+        let old = OfflineStore(directory: legacy).queuedMutations()
+        XCTAssertEqual(old.map(\.id), ["x"])
+        XCTAssertEqual(old.first?.subjectKnown, false)
+    }
 }

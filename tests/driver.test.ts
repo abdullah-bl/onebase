@@ -7,7 +7,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { applySchema } from "../src/engine/database";
 import { LibsqlDriver, SqliteDriver } from "../src/engine/driver";
-import { defineSchema, defineTable } from "../src/server";
+import { Runtime } from "../src/engine/runtime";
+import { defineSchema, defineTable, mutation, query } from "../src/server";
 import { v } from "../src/values";
 
 /** Shaped like @libsql/client's error when the server answers HTTP 429. */
@@ -127,6 +128,41 @@ describe("sqlite planner statistics", () => {
       await driver.write((tx) => applySchema(tx, driver.dialect, schema)); // as a deploy would
       await driver.optimize();
       expect(await usesIndex(driver)).toBe(true);
+      await driver.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("an eq + range index query reads the index in order, without sorting the rows", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "onebase-planner-"));
+    try {
+      const authors = defineSchema({ posts: defineTable({ author: v.string() }).index("by_author", ["author"]) });
+      const modules = {
+        posts: {
+          add: mutation({ args: { n: v.number() }, handler: async (ctx, { n }) => void (await Promise.all(Array.from({ length: n }, (_, i) => ctx.db.insert("posts", { author: `a${i % 20}` })))) }),
+          newest: query({
+            args: { author: v.string() },
+            handler: async (ctx, { author }) => (await ctx.db.query("posts").withIndex("by_author", (q) => q.eq("author", author).gt("_creationTime", 0)).take(10)).length,
+          }),
+        },
+      };
+      const driver = new SqliteDriver(join(dir, "db.sqlite"));
+      const quiet = { info() {}, warn() {}, error() {} };
+      const runtime = new Runtime({ driver, log: quiet, schema: authors, modules });
+      await runtime.init();
+      await runtime.runMutation("posts:add", { n: 2000 });
+      await driver.optimize();
+
+      const seen: string[] = [];
+      const open = driver.reader.query.bind(driver.reader);
+      (driver.reader as any).query = (sql: string) => (sql.includes("FROM documents WHERE") && seen.push(sql), open(sql));
+      expect(((await runtime.runQuery("posts:newest", { author: "a3" })) as any).value).toBe(10);
+      expect(seen).toHaveLength(1);
+      const plan = (await driver.read((tx) => driver.explain(tx, seen[0]!, ["a3", 0]))).join(" | ");
+      expect(plan).toContain("cl_posts__by_author");
+      expect(plan).not.toContain("TEMP B-TREE"); // the equality-pinned author is not part of the ORDER BY
+      runtime.stop();
       await driver.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });

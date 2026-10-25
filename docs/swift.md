@@ -10,13 +10,20 @@ dependencies): one WebSocket carries live queries, calls and the auth token. It 
 [`clients/swift`](https://github.com/abdullah-bl/onebase/tree/main/clients/swift) in the
 repository.
 
+Add it by URL — released versions are published to
+[onebase-swift](https://github.com/abdullah-bl/onebase-swift), because SwiftPM needs the package
+at the root of a repository:
+
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/abdullah-bl/onebase.git", branch: "main"),
+    .package(url: "https://github.com/abdullah-bl/onebase-swift.git", from: "0.1.0"),
 ]
-// target: .product(name: "OnebaseClient", package: "onebase")
+// target: .product(name: "OnebaseClient", package: "onebase-swift")
 ```
+
+Working from a clone of onebase, or before the first release? Use the folder directly:
+`.package(path: "../onebase/clients/swift")`, with `package: "swift"` in the product.
 
 ## Connect and use
 

@@ -7,17 +7,20 @@ dependencies beyond the system frameworks. iOS 15+ / macOS 12+.
 ```swift
 let package = Package(
     dependencies: [
-        .package(url: "https://github.com/abdullah-bl/onebase.git", branch: "main"),
+        .package(url: "https://github.com/abdullah-bl/onebase-swift.git", from: "0.1.0"),
     ],
     targets: [
         .target(name: "MyApp", dependencies: [
-            .product(name: "OnebaseClient", package: "onebase"),
+            .product(name: "OnebaseClient", package: "onebase-swift"),
         ]),
     ]
 )
 ```
 
-(Until a tagged release exists, point at the repository; the package lives in `clients/swift`.)
+This folder is developed in the [onebase](https://github.com/abdullah-bl/onebase) repository and
+published to `onebase-swift` on every release (SwiftPM needs a package at the root of a
+repository). From a clone of onebase, or before the first release, depend on the folder instead:
+`.package(path: "../onebase/clients/swift")`, with `package: "swift"` in the product.
 
 ## Use
 

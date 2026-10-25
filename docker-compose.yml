@@ -1,0 +1,19 @@
+# A bare onebase server. Set ONEBASE_ADMIN_KEY in .env (or the shell); it is
+# the dashboard sign-in and the key for `onebase deploy`.
+#
+#   docker compose up -d --build
+#   ONEBASE_DEPLOY_URL=http://localhost:8090 ONEBASE_DEPLOY_KEY=<key> onebase deploy
+services:
+  onebase:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    environment:
+      ONEBASE_URL: ${ONEBASE_URL:-http://localhost:8090}
+      ONEBASE_ADMIN_KEY: ${ONEBASE_ADMIN_KEY:?set ONEBASE_ADMIN_KEY in .env}
+    volumes:
+      - onebase_data:/app/onebase_data
+
+volumes:
+  onebase_data:

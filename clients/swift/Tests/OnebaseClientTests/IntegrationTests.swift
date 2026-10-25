@@ -345,7 +345,7 @@ final class IntegrationTests: XCTestCase {
         server.stop()
         try await waitUntil("the connection to drop") { connection == .connecting }
 
-        Task { _ = try? await client.mutation("notes:add", ["text": "from-\(subject)"]) }
+        Task { _ = try? await client.mutation("notes:add", ["text": .string("from-\(subject)")]) }
         try await waitUntil("the mutation queued") { client.queuedMutationCount == 1 }
         client.close() // the app goes away; the queue lives in the offline store
         try await Task.sleep(nanoseconds: 300_000_000)

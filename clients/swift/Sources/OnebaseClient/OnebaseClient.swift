@@ -214,9 +214,11 @@ public final class OnebaseClient {
             self.setConnectionMain(.connecting)
             task.resume()
             // WebSocket tasks buffer sends until the handshake completes, and preserve order,
-            // so the auth token, subscriptions and queued calls can go out right away.
+            // so the auth token, subscriptions and queued calls can go out right away. The auth
+            // message always goes out (even with no token): its answer is what releases any
+            // offline results held for this user.
             self.authAcked = false
-            if self.token != nil { self.sendLocked(Outgoing.auth(token: self.token)) }
+            self.sendLocked(Outgoing.auth(token: self.token))
             for subscription in self.subscriptions.values where !subscription.sent {
                 self.sendLocked(Outgoing.sub(id: subscription.id, path: subscription.path, args: subscription.args))
                 subscription.sent = true

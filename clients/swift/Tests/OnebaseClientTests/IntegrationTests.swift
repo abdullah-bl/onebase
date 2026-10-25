@@ -138,9 +138,13 @@ final class IntegrationTests: XCTestCase {
 
         let firstResult = expectation(description: "the subscription's first result")
         var received: OnebaseValue?
+        var sawFirst = false
         client.subscribe("notes:list", [:]) { value in
             received = value
-            firstResult.fulfill()
+            if !sawFirst {
+                sawFirst = true
+                firstResult.fulfill()
+            }
         }
         await fulfillment(of: [firstResult], timeout: 5)
         XCTAssertEqual(received?.object?["subscribed"]?.string, "notes:list")
@@ -170,9 +174,13 @@ final class IntegrationTests: XCTestCase {
 
         let seen: NSMutableArray = [] // appended on the main queue by client callbacks
         let first = expectation(description: "server value 1")
+        var sawFirst = false
         client.subscribe("counter", [:]) { value in
             seen.add(value?.int ?? -1)
-            if value?.int == 1 { first.fulfill() }
+            if value?.int == 1, !sawFirst {
+                sawFirst = true
+                first.fulfill()
+            }
         }
         await fulfillment(of: [first], timeout: 5)
 
@@ -234,8 +242,12 @@ final class IntegrationTests: XCTestCase {
         server.onSub = { _, _, reply in reply(.object(["greeting": .string("cached hello")])) }
         let first = OnebaseClient(url: "http://127.0.0.1:\(server.port)", tokenStore: tokenStore(directory), offlineDirectory: directory)
         let gotIt = expectation(description: "got a server value")
+        var sawIt = false
         first.subscribe("greeting", [:]) { value in
-            if value?.object?["greeting"]?.string != nil { gotIt.fulfill() }
+            if value?.object?["greeting"]?.string != nil, !sawIt {
+                sawIt = true
+                gotIt.fulfill()
+            }
         }
         await fulfillment(of: [gotIt], timeout: 5)
         first.close() // flushes the cache to disk
@@ -249,11 +261,18 @@ final class IntegrationTests: XCTestCase {
         var deliveries: [String] = []
         let cached = expectation(description: "the cached value arrived first")
         let fresh = expectation(description: "then the fresh value")
+        var sawCached = false
+        var sawFresh = false
         second.subscribe("greeting", [:]) { value in
-            if let greeting = value?.object?["greeting"]?.string {
-                deliveries.append(greeting)
-                if greeting == "cached hello" { cached.fulfill() }
-                if greeting == "fresh hello" { fresh.fulfill() }
+            guard let greeting = value?.object?["greeting"]?.string else { return }
+            deliveries.append(greeting)
+            if greeting == "cached hello", !sawCached {
+                sawCached = true
+                cached.fulfill()
+            }
+            if greeting == "fresh hello", !sawFresh {
+                sawFresh = true
+                fresh.fulfill()
             }
         }
         await fulfillment(of: [cached], timeout: 2) // well before the delayed server answer

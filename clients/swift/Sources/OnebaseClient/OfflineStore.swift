@@ -6,6 +6,28 @@ public struct QueuedMutation: Codable, Equatable {
     public let id: String
     public let path: String
     public let args: OnebaseValue
+    /// Who made it (the server-confirmed auth subject; nil means anonymous), once known.
+    public var subject: String?
+    /// False while unknown: made before the server confirmed who is asking. The next confirmed
+    /// user then owns it. Entries written by older versions decode as unknown.
+    public var subjectKnown: Bool
+
+    init(id: String, path: String, args: OnebaseValue, subject: String?, subjectKnown: Bool) {
+        self.id = id
+        self.path = path
+        self.args = args
+        self.subject = subject
+        self.subjectKnown = subjectKnown
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        path = try container.decode(String.self, forKey: .path)
+        args = try container.decode(OnebaseValue.self, forKey: .args)
+        subject = try container.decodeIfPresent(String.self, forKey: .subject)
+        subjectKnown = try container.decodeIfPresent(Bool.self, forKey: .subjectKnown) ?? false
+    }
 }
 
 /// The persisted half of offline support: the newest query results (so a cold start can show
@@ -109,9 +131,10 @@ public final class OfflineStore {
 
     // ---- Mutation outbox ----
 
-    /// Queues a mutation (persisted immediately) and returns its id.
-    public func enqueueMutation(_ path: String, _ args: [String: OnebaseValue]) -> String {
-        let entry = QueuedMutation(id: UUID().uuidString, path: path, args: .object(args))
+    /// Queues a mutation (persisted immediately) and returns its id. `subject` is who made it, when
+    /// the server has confirmed that (`subjectKnown`); otherwise the next confirmed user owns it.
+    public func enqueueMutation(_ path: String, _ args: [String: OnebaseValue], subject: String? = nil, subjectKnown: Bool = false) -> String {
+        let entry = QueuedMutation(id: UUID().uuidString, path: path, args: .object(args), subject: subject, subjectKnown: subjectKnown)
         queue.sync {
             outbox.append(entry)
             writeLocked(Self.outboxURL(directory), outbox)
@@ -126,6 +149,16 @@ public final class OfflineStore {
 
     public var queuedCount: Int {
         queue.sync { outbox.count }
+    }
+
+    /// Records who owns a queued mutation that was made before that was known.
+    public func setMutationSubject(_ id: String, _ subject: String?) {
+        queue.sync {
+            guard let at = self.outbox.firstIndex(where: { $0.id == id }) else { return }
+            self.outbox[at].subject = subject
+            self.outbox[at].subjectKnown = true
+            self.writeLocked(Self.outboxURL(self.directory), self.outbox)
+        }
     }
 
     /// Removes a queued mutation (the server answered it, or it was lost with the connection).

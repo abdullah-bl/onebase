@@ -62,6 +62,9 @@ public final class OnebaseClient {
         var continuation: CheckedContinuation<OnebaseValue, Error>?
         /// Present while this call is persisted as a queued mutation.
         var queuedId: String?
+        /// Who made the queued mutation, once known (see `QueuedMutation`).
+        var subject: String?
+        var subjectKnown = false
         var layer: Layer?
 
         init(id: Int64, message: String) {
@@ -128,6 +131,8 @@ public final class OnebaseClient {
     private var authAcked = false
     /// The subject of the last accepted auth answer; held offline results are matched against it.
     private var lastAuthSubject: String?
+    /// `lastAuthSubject` belongs to the current token (false after `setToken`, until the server answers).
+    private var subjectKnown = false
     private var subscriptions: [Int64: Subscription] = [:]
     private var subscriptionsByKey: [String: Subscription] = [:]
     private var pendingCalls: [Int64: PendingCall] = [:]
@@ -179,6 +184,8 @@ public final class OnebaseClient {
                 nextId += 1
                 let pending = PendingCall(id: nextId, message: Outgoing.call(requestId: nextId, kind: "mutation", path: queued.path, args: argsOf(queued.args)))
                 pending.queuedId = queued.id
+                pending.subject = queued.subject
+                pending.subjectKnown = queued.subjectKnown
                 pendingCalls[nextId] = pending
                 orderedPending.append(nextId)
             }
@@ -237,11 +244,44 @@ public final class OnebaseClient {
             subscription.sent = true
         }
         for id in orderedPending {
-            guard let pending = pendingCalls[id], !pending.sent, let task else { continue }
-            task.send(.string(pending.message)) { [weak self] _ in
-                self?.state.async { self?.pendingCalls[id]?.sent = true }
-            }
+            // Queued mutations wait for the auth answer: they're sent only for the user who made them.
+            guard let pending = pendingCalls[id], !pending.sent, pending.queuedId == nil || authAcked else { continue }
+            sendLocked(pending)
         }
+    }
+
+    /// Must run on `state`.
+    private func sendLocked(_ pending: PendingCall) {
+        guard let task else { return }
+        // Handed to the connection: from here on it may have run, whatever happens to the
+        // connection, so it is never sent again (a failed send drops the connection anyway).
+        pending.sent = true
+        task.send(.string(pending.message)) { _ in }
+    }
+
+    /// The server confirmed who is asking: queued mutations made by that user (or by nobody known
+    /// yet) are sent in order; ones made by someone else are dropped, never sent as this user.
+    private func releaseQueuedLocked(subject: String?) {
+        for id in orderedPending {
+            guard let pending = pendingCalls[id], let queuedId = pending.queuedId, !pending.sent else { continue }
+            if !pending.subjectKnown {
+                pending.subject = subject
+                pending.subjectKnown = true
+                offlineStore?.setMutationSubject(queuedId, subject)
+            } else if pending.subject != subject {
+                pendingCalls[id] = nil
+                offlineStore?.removeQueuedMutation(queuedId)
+                let message = "Dropped: queued by a different user than the one now signed in."
+                if let continuation = pending.continuation {
+                    continuation.resume(throwing: OnebaseError(message))
+                } else {
+                    DispatchQueue.main.async { [weak self] in self?.onQueuedMutationFailure?(String(id), message) }
+                }
+                continue
+            }
+            sendLocked(pending)
+        }
+        orderedPending.removeAll { pendingCalls[$0] == nil }
     }
 
     private func receiveLoop(_ task: URLSessionWebSocketTask) {
@@ -300,6 +340,7 @@ public final class OnebaseClient {
         state.async {
             self.token = newToken
             self.authAcked = false
+            self.subjectKnown = false // unknown until the server answers for this token
             self.sendLocked(Outgoing.auth(token: newToken))
         }
         if newToken == nil {
@@ -424,14 +465,14 @@ public final class OnebaseClient {
                 pending.continuation = continuation
                 pending.layer = layer
                 if kind == "mutation", let offline = self.offlineStore {
-                    pending.queuedId = offline.enqueueMutation(path, args)
+                    pending.subject = self.subjectKnown ? self.lastAuthSubject : nil
+                    pending.subjectKnown = self.subjectKnown
+                    pending.queuedId = offline.enqueueMutation(path, args, subject: pending.subject, subjectKnown: pending.subjectKnown)
                 }
                 self.pendingCalls[id] = pending
                 self.orderedPending.append(id)
-                if self.ready, let task = self.task {
-                    task.send(.string(pending.message)) { [weak self] _ in
-                        self?.state.async { self?.pendingCalls[id]?.sent = true }
-                    }
+                if self.ready, pending.queuedId == nil || self.authAcked {
+                    self.sendLocked(pending)
                 }
             }
         }
@@ -523,8 +564,10 @@ public final class OnebaseClient {
             authAcked = true
             if ok {
                 lastAuthSubject = subject
+                subjectKnown = true
                 releaseHeldCachesLocked(subject: subject)
                 offlineStore?.setSubject(subject)
+                releaseQueuedLocked(subject: subject)
                 let authenticated = subject != nil
                 isAuthenticated = authenticated
                 onAuthChangeMain(authenticated)

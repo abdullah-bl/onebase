@@ -131,16 +131,16 @@ public final class OfflineStore {
     /// Removes a queued mutation (the server answered it, or it was lost with the connection).
     public func removeQueuedMutation(_ id: String) {
         queue.async {
-            outbox.removeAll { $0.id == id }
-            writeLocked(Self.outboxURL(directory), outbox)
+            self.outbox.removeAll { $0.id == id }
+            self.writeLocked(Self.outboxURL(self.directory), self.outbox)
         }
     }
 
     /// Drops every queued mutation.
     public func clearQueuedMutations() {
         queue.async {
-            outbox.removeAll()
-            writeLocked(Self.outboxURL(directory), outbox)
+            self.outbox.removeAll()
+            self.writeLocked(Self.outboxURL(self.directory), self.outbox)
         }
     }
 }

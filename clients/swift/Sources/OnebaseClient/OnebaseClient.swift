@@ -126,6 +126,8 @@ public final class OnebaseClient {
     private var reconnectDelay: TimeInterval = 0.5
     private var token: String?
     private var authAcked = false
+    /// The subject of the last accepted auth answer; held offline results are matched against it.
+    private var lastAuthSubject: String?
     private var subscriptions: [Int64: Subscription] = [:]
     private var subscriptionsByKey: [String: Subscription] = [:]
     private var pendingCalls: [Int64: PendingCall] = [:]
@@ -213,26 +215,32 @@ public final class OnebaseClient {
             self.ready = false
             self.setConnectionMain(.connecting)
             task.resume()
-            // WebSocket tasks buffer sends until the handshake completes, and preserve order,
-            // so the auth token, subscriptions and queued calls can go out right away. The auth
-            // message always goes out (even with no token): its answer is what releases any
-            // offline results held for this user.
+            // Only the auth message goes out until the connection proves itself with an answer
+            // (WebSocket tasks buffer sends): its reply both releases any offline results held
+            // for this user and gates subscriptions and queued calls, so nothing counts as
+            // "sent" — with the at-most-once semantics that brings — before the connection is
+            // really up.
             self.authAcked = false
             self.sendLocked(Outgoing.auth(token: self.token))
-            for subscription in self.subscriptions.values where !subscription.sent {
-                self.sendLocked(Outgoing.sub(id: subscription.id, path: subscription.path, args: subscription.args))
-                subscription.sent = true
-            }
-            for id in self.orderedPending {
-                guard let pending = self.pendingCalls[id], !pending.sent else { continue }
-                task.send(.string(pending.message)) { [weak self] _ in
-                    self?.state.async { self?.pendingCalls[id]?.sent = true }
-                }
-            }
-            self.ready = true
-            self.reconnectDelay = 0.5
-            self.setConnectionMain(.open)
             self.receiveLoop(task)
+        }
+    }
+
+    /// The connection is really up (the server answered something): send everything waiting.
+    private func establishLocked() {
+        guard !ready else { return }
+        ready = true
+        reconnectDelay = 0.5
+        setConnectionMain(.open)
+        for subscription in subscriptions.values where !subscription.sent {
+            sendLocked(Outgoing.sub(id: subscription.id, path: subscription.path, args: subscription.args))
+            subscription.sent = true
+        }
+        for id in orderedPending {
+            guard let pending = pendingCalls[id], !pending.sent, let task else { continue }
+            task.send(.string(pending.message)) { [weak self] _ in
+                self?.state.async { self?.pendingCalls[id]?.sent = true }
+            }
         }
     }
 
@@ -325,13 +333,17 @@ public final class OnebaseClient {
                 subscriptions[subscription.id] = subscription
                 subscriptionsByKey[subKey] = subscription
                 if let cached = offlineStore?.cachedValue(subKey) {
-                    if token == nil && tokenStore == nil {
+                    let cacheSubject = offlineStore?.cacheSubject
+                    if authAcked, cacheSubject == lastAuthSubject {
+                        subscription.value = cached // the server already confirmed this user
+                        immediate = cached
+                    } else if token == nil && tokenStore == nil {
                         subscription.value = cached // no token anywhere: show it right away
                         immediate = cached
                     } else {
                         // Held until the server confirms the same user is asking.
                         subscription.heldCache = cached
-                        subscription.heldSubject = offlineStore?.cacheSubject
+                        subscription.heldSubject = cacheSubject
                     }
                 }
                 if ready {
@@ -504,10 +516,12 @@ public final class OnebaseClient {
     /// Must run on `state`.
     private func handle(_ text: String) {
         guard let message = Incoming.parse(text) else { return }
+        establishLocked() // the server answered: the connection is really up
         switch message {
         case .auth(let ok, let ended, let subject, let error):
             authAcked = true
             if ok {
+                lastAuthSubject = subject
                 releaseHeldCachesLocked(subject: subject)
                 offlineStore?.setSubject(subject)
                 let authenticated = subject != nil

@@ -72,7 +72,7 @@ public final class OfflineStore {
 
     /// Cached results belong to whoever is signed in; a different subject starts empty.
     public func setSubject(_ subject: String?) {
-        queue.async {
+        queue.sync {
             guard self.cache.subject != subject else { return }
             self.cache.subject = subject
             self.cache.entries = [:]
@@ -82,7 +82,7 @@ public final class OfflineStore {
 
     /// Writes any unsaved state now (also called by the client on close).
     public func flush() {
-        queue.async { self.flushLocked() }
+        queue.sync { self.flushLocked() }
     }
 
     private func scheduleFlushLocked() {
@@ -130,7 +130,7 @@ public final class OfflineStore {
 
     /// Removes a queued mutation (the server answered it, or it was lost with the connection).
     public func removeQueuedMutation(_ id: String) {
-        queue.async {
+        queue.sync {
             self.outbox.removeAll { $0.id == id }
             self.writeLocked(Self.outboxURL(self.directory), self.outbox)
         }
@@ -138,7 +138,7 @@ public final class OfflineStore {
 
     /// Drops every queued mutation.
     public func clearQueuedMutations() {
-        queue.async {
+        queue.sync {
             self.outbox.removeAll()
             self.writeLocked(Self.outboxURL(self.directory), self.outbox)
         }

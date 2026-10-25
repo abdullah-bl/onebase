@@ -428,10 +428,10 @@ class QueryImpl {
   }
 
   /** Ordering key: the index fields, then creation time, then id as a tiebreaker. */
-  private keys(): { sql: string; kind: ValueKind }[] {
+  private keys(): { sql: string; kind: ValueKind; field?: string }[] {
     const d = this.db.dialect;
     const fields = this.indexFields.filter((f) => f !== "_creationTime");
-    return [...fields.map((f) => ({ sql: d.field(f), kind: (systemKind(f) ?? "json") as ValueKind })), { sql: "ct", kind: "ct" }, { sql: "id", kind: "id" }];
+    return [...fields.map((f) => ({ sql: d.field(f), kind: (systemKind(f) ?? "json") as ValueKind, field: f })), { sql: "ct", kind: "ct" as ValueKind }, { sql: "id", kind: "id" as ValueKind }];
   }
 
   private condSql(cond: Cond, params: unknown[]): string {
@@ -464,7 +464,11 @@ class QueryImpl {
     if (opts.endCursor) bound(opts.endCursor, this.direction === "asc" ? "<=" : ">=");
 
     const select = keys.map((k, i) => `${k.sql} AS k${i}`).join(", ");
-    let sql = `SELECT id, ct, doc, ${select} FROM documents WHERE ${where.join(" AND ")} ORDER BY ${keys.map((k) => `${k.sql} ${dir}`).join(", ")}`;
+    // A field pinned by q.eq() is the same in every row, so it can't change the order; leaving it
+    // out lets the planner read the index in order (with it SQLite sorts the rows instead).
+    const pinned = new Set(this.rangeConds.filter((c) => c.op === "eq").map((c) => c.field));
+    const ordering = keys.filter((k) => !(k.field && pinned.has(k.field)));
+    let sql = `SELECT id, ct, doc, ${select} FROM documents WHERE ${where.join(" AND ")} ORDER BY ${ordering.map((k) => `${k.sql} ${dir}`).join(", ")}`;
     if (opts.limit !== undefined) {
       sql += ` LIMIT ${Math.floor(opts.limit)}`;
     }

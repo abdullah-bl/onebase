@@ -2,7 +2,7 @@ import type { Server, ServerWebSocket } from "bun";
 import type { UserIdentity } from "../server";
 import { AuthError } from "./auth";
 import type { Runtime } from "./runtime";
-import { SubscriptionManager } from "./sync";
+import { stableStringify, SubscriptionManager } from "./sync";
 
 export type AssetResolver = (pathname: string) => Promise<Response | null> | Response | null;
 
@@ -22,6 +22,8 @@ export type ServeOptions = {
   trustProxy?: boolean;
   /** Handles /_admin requests (the dashboard). */
   admin?: ((req: Request, url: URL) => Promise<Response> | Response) | null;
+  /** How often open connections re-check their auth token, in ms (default 60s; 0 disables). */
+  sessionRecheckMs?: number;
 };
 
 export type RateLimit = { max: number; windowMs: number };
@@ -79,6 +81,8 @@ type ClientMessage =
 type SocketData = {
   ip: string;
   identity: UserIdentity | null;
+  /** The token behind that identity, re-checked while the connection stays open. */
+  token: string | null;
   ready: Promise<void>;
   /** `failed`: the query couldn't start (unknown function, rate limit), so a deploy retries it. */
   subs: Map<number, { path: string; args: unknown; unsubscribe: () => void; failed?: boolean }>;
@@ -178,6 +182,14 @@ export function serve(opts: ServeOptions): Server<SocketData> {
     }
   };
 
+  /** A connection whose identity is gone: signed out live, and its queries re-run anonymously. */
+  const signOutSocket = (ws: ServerWebSocket<SocketData>, error: string) => {
+    ws.data.identity = null;
+    ws.data.token = null;
+    send(ws, { type: "auth", ok: false, ended: true, error });
+    for (const [id, sub] of ws.data.subs) subscribe(ws, id, sub.path, sub.args, false);
+  };
+
   // A signed-out session stops working at once on every connection using it, here or (via the
   // commit broadcast) on another instance.
   runtime.onSessionsRevoked((ids) => {
@@ -185,9 +197,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
     for (const ws of sockets) {
       const sessionId = ws.data.identity?.sessionId;
       if (typeof sessionId !== "string" || !ended.has(sessionId)) continue;
-      ws.data.identity = null;
-      send(ws, { type: "auth", ok: false, ended: true, error: "You were signed out." });
-      for (const [id, sub] of ws.data.subs) subscribe(ws, id, sub.path, sub.args, false);
+      signOutSocket(ws, "You were signed out.");
     }
   });
 
@@ -201,8 +211,47 @@ export function serve(opts: ServeOptions): Server<SocketData> {
     await rerun;
   });
 
+  // A token checked when the connection opened can stop checking out later: sessions expire, and
+  // accounts are deleted. While a connection is open, its identity is re-checked every
+  // `sessionRecheckMs`; a still-valid session also has its expiry extended, like any other use.
+  const recheckMs = opts.sessionRecheckMs ?? 60_000;
+  let recheckTimer: ReturnType<typeof setInterval> | null = null;
+  const recheckAll = async () => {
+    for (const ws of sockets) {
+      const { token, identity } = ws.data;
+      if (!token || !identity) continue;
+      try {
+        const fresh = await runtime.identify(token);
+        if (!fresh) {
+          signOutSocket(ws, "You were signed out.");
+        } else if (stableStringify(fresh) !== stableStringify(identity)) {
+          // The identity changed (say, the email was verified or the account switched): re-run
+          // the queries under the new one, exactly like a new auth message.
+          ws.data.identity = fresh;
+          for (const [id, sub] of ws.data.subs) subscribe(ws, id, sub.path, sub.args, false);
+        } else {
+          ws.data.identity = fresh;
+        }
+      } catch (err) {
+        // `ended`: the session is gone for good. Anything else (say, the database timing out)
+        // may pass, like on the auth message.
+        if (err instanceof AuthError && err.status === 401) signOutSocket(ws, err.message);
+      }
+    }
+  };
+  const startRechecks = () => {
+    recheckTimer ??= setInterval(() => void recheckAll(), recheckMs);
+  };
+  const stopRechecksIfIdle = () => {
+    if (sockets.size === 0 && recheckTimer) {
+      clearInterval(recheckTimer);
+      recheckTimer = null;
+    }
+  };
+
   const handleMessage = async (ws: ServerWebSocket<SocketData>, msg: ClientMessage) => {
     if (msg.type === "auth") {
+      ws.data.token = msg.token ?? null;
       ws.data.ready = (async () => {
         try {
           ws.data.identity = await runtime.identify(msg.token);
@@ -283,6 +332,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
         const data: SocketData = {
           ip: clientIp(req, server),
           identity: null,
+          token: null,
           ready: Promise.resolve(),
           subs: new Map(),
           committed: new Set(),
@@ -314,7 +364,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
           return res;
         }
         if (path.startsWith("/api/auth/")) {
-          const res = runtime.auth ? await runtime.auth.handle(req, url, origins) : null;
+          const res = runtime.auth ? await runtime.auth.handle(req, url, origins, clientIp(req, server)) : null;
           if (!res) {
             const hint = runtime.auth ? "" : " Built-in auth is off: add methods: [password(), ...] to auth.config.ts.";
             return json(req, { error: `Unknown endpoint ${req.method} ${path}.${hint}` }, 404);
@@ -351,6 +401,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
       open(ws) {
         sockets.add(ws);
         runtime.stats.connections++;
+        if (recheckMs > 0) startRechecks();
       },
       message(ws, raw) {
         let msg: ClientMessage;
@@ -366,6 +417,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
         runtime.stats.connections--;
         for (const sub of ws.data.subs.values()) sub.unsubscribe();
         ws.data.subs.clear();
+        stopRechecksIfIdle();
       },
     },
   });

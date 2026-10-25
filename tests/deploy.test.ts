@@ -216,3 +216,65 @@ test("bundles read NODE_ENV on the server, not on the machine that built them", 
   const { code } = await bundleProject(join(dir, "onebase"));
   expect(code).toContain("process.env.NODE_ENV");
 });
+
+test("a dry run never runs the pushed code on the server", async () => {
+  const probe = `onebase-probe-${crypto.randomUUID()}`;
+  const dir = project("probe", {
+    "schema.ts": SCHEMA("v.string()"),
+    "notes.ts": NOTES_V1 + `\n(globalThis as any)[${JSON.stringify(probe)}] = ((globalThis as any)[${JSON.stringify(probe)}] ?? 0) + 1;\n`,
+  });
+  const count = () => (globalThis as any)[probe] ?? 0;
+  // The CLI loads the project locally to check it (like onebase dev would); the server doesn't.
+  await push(dir, { dryRun: true });
+  expect(count()).toBe(1);
+  await push(dir, { dryRun: true });
+  expect(count()).toBe(1); // nothing new ran anywhere
+  // A real deploy does run the bundle, once, on the server.
+  await push(dir);
+  expect(count()).toBe(2);
+});
+
+test("a dry run without the schema and function count is refused", async () => {
+  await expect(app.runtime.deploy({ code: "export default {}", dryRun: true })).rejects.toThrow("Update the onebase CLI");
+});
+
+test("a replaced deployment's module is freed; a rollback reloads it from the database", async () => {
+  const a = await push(v1);
+  const b = await push(v2);
+  const cached = Object.keys(require.cache).filter((k) => k.includes("onebase-deploys-"));
+  expect(cached).toHaveLength(1); // a's module left the cache when b went live
+  expect(cached[0]!.endsWith(`${b.id}.js`)).toBe(true);
+
+  const back = await deploy({ dir: join(v2, "onebase"), url, key, public: null, rollback: true, log: () => {} });
+  expect(back.id).toBe(a.id);
+  const client = new OnebaseClient(url);
+  expect(await client.query("notes:list" as any, {})).toEqual(["first"]); // v1: no .toUpperCase()
+  client.close();
+});
+
+test("a bundle whose top level never finishes is refused, and later deploys still work", async () => {
+  const hang = project("hang", {
+    "notes.ts": `import { query } from "onebase/server";\nawait new Promise(() => {});\nexport const list = query({ args: {}, handler: () => "never" });`,
+  });
+  const { code } = await bundleProject(join(hang, "onebase"));
+  const app2 = await startApp({
+    schema: null,
+    modules: {},
+    dataDir: join(root, "hang-data"),
+    port: 0,
+    hostname: "127.0.0.1",
+    dev: false,
+    quiet: true,
+    loadTimeoutMs: 300,
+  });
+  Object.assign(app2.runtime, { log: quiet }); // keep test output quiet
+  try {
+    await expect(app2.runtime.deploy({ code })).rejects.toThrow("didn't finish loading");
+    // The deploy queue isn't stuck: a good deploy after it goes through.
+    const good = project("good-after-hang", { "notes.ts": NOTES_V1 });
+    const r = await app2.runtime.deploy({ code: (await bundleProject(join(good, "onebase"))).code });
+    expect(r.functions).toBe(2);
+  } finally {
+    await app2.close();
+  }
+});

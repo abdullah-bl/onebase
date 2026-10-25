@@ -1,14 +1,16 @@
 // `onebase deploy`: bundles the functions (and the frontend) on your machine and pushes them to a
 // running server, which checks them against its data and swaps them in without a restart.
 
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { codegen } from "./codegen";
 import { doctor, printFindings } from "./doctor";
 import { OnebaseError } from "./engine/database";
+import { rememberModule } from "./engine/deployments";
 import type { DeployResult, ProjectCode } from "./engine/runtime";
 import { projectEntry, registerVirtualModules } from "./project";
+import { isRegisteredFunction } from "./server";
 
 /**
  * Bundles the functions in `dir` and the npm packages they import into one ES module. The
@@ -40,13 +42,27 @@ export async function bundleProject(dirInput: string): Promise<{ code: string; f
 
 let bundleDir: string | null = null;
 
-/** Server side: imports a bundle from bundleProject. Each deployment is a new file, so a new module. */
+/**
+ * Server side: loads a bundle from bundleProject. Each deployment is a new file, so a new module.
+ * Loads through require() where possible: unlike import(), its module cache can be emptied (see
+ * releaseModules), so a replaced deployment's code can actually be freed. Bundles that need
+ * top-level await can't be required and fall back to import(), which keeps them for the process's
+ * lifetime.
+ */
 export async function importBundle(source: string, id: string): Promise<ProjectCode> {
   registerVirtualModules();
   bundleDir ??= mkdtempSync(join(tmpdir(), "onebase-deploys-"));
   const file = join(bundleDir, `${id}.js`);
   writeFileSync(file, source);
-  const project = ((await import(file)) as { default?: any }).default;
+  let loaded: { default?: any };
+  try {
+    loaded = require(file) as { default?: any };
+    rememberModule(id, require.resolve(file));
+  } catch {
+    loaded = (await import(file)) as { default?: any };
+  }
+  rmSync(file, { force: true }); // the code lives in the database; a rollback rewrites it
+  const project = loaded.default;
   if (!project || typeof project !== "object" || typeof project.modules !== "object") {
     throw new OnebaseError("This isn't a onebase deploy bundle. Push code with onebase deploy.");
   }
@@ -70,6 +86,27 @@ async function readPublic(dir: string): Promise<Record<string, string>> {
     files["/" + rel.replace(/\\/g, "/")] = Buffer.from(await Bun.file(join(root, rel)).arrayBuffer()).toString("base64");
   }
   return files;
+}
+
+/**
+ * The schema and function count of the project that was just bundled, read by importing its entry
+ * here (the developer's own machine, like onebase dev and doctor). A dry run ships them as data,
+ * so the server can check the schema against its data without ever running the pushed code.
+ */
+async function dryRunFacts(entry: string): Promise<{ schema: string | null; functions: number }> {
+  const project = ((await import(entry)) as { default?: any }).default ?? {};
+  const schema = project.schema ?? null;
+  const json = schema
+    ? JSON.stringify({
+        schemaValidation: schema.schemaValidation ?? true,
+        tables: Object.fromEntries(Object.entries(schema.tables ?? {}).map(([name, table]: [string, any]) => [name, { validator: table.validator }])),
+      })
+    : null;
+  let functions = 0;
+  for (const exports of Object.values(project.modules ?? {}) as Record<string, unknown>[]) {
+    for (const value of Object.values(exports ?? {})) if (isRegisteredFunction(value)) functions++;
+  }
+  return { schema: json, functions };
 }
 
 export type DeployOptions = {
@@ -148,7 +185,12 @@ export async function deploy(opts: DeployOptions): Promise<DeployResult> {
   const frontend = assets ? ` and ${Object.keys(assets).length} static file(s) from ${relative(process.cwd(), opts.public!) || "."}/ (${kb(assetBytes)})` : "";
   log(`${opts.dryRun ? "Checking" : "Deploying"} ${what}${frontend} to ${url}…`);
 
-  const r: DeployResult = await adminCall(url, opts.key, "deploy", { code: bundle.code, assets, dryRun: opts.dryRun ?? false });
+  const r: DeployResult = await adminCall(url, opts.key, "deploy", {
+    code: bundle.code,
+    assets,
+    dryRun: opts.dryRun ?? false,
+    ...(opts.dryRun ? await dryRunFacts(join(dirname(dir), ".onebase", "deploy.ts")) : {}),
+  });
   for (const w of r.warnings) log(`\x1b[33mwarn\x1b[0m ${w}`);
   const ms = performance.now() - start;
   const took = ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`;

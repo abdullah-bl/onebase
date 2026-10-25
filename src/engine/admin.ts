@@ -199,10 +199,11 @@ export function createAdmin(opts: { runtime: Runtime; key: string; assets: Dashb
         return rows.map((r) => ({ id: r.id, createdAt: Number(r.ct), size: Number(r.size), contentType: r.content_type, sha256: r.sha256 }));
       }),
 
-    // `onebase deploy`: the bundle's code, the frontend as { "/path": base64 } (or null), and dryRun.
-    deploy: ({ code, assets = null, dryRun = false }) => {
+    // `onebase deploy`: the bundle's code, the frontend as { "/path": base64 } (or null), dryRun,
+    // and for a dry run the schema and function count as data (so the pushed code is never run).
+    deploy: ({ code, assets = null, dryRun = false, schema = null, functions }) => {
       if (assets !== null && !isPlainObject(assets)) throw new OnebaseError("assets must be an object of { \"/path\": base64 }.");
-      return runtime.deploy({ code, assets, dryRun: dryRun === true });
+      return runtime.deploy({ code, assets, dryRun: dryRun === true, schema, functions });
     },
 
     rollback: () => runtime.rollback(),

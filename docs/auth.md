@@ -90,6 +90,8 @@ function App() {
 | `useOnebaseAuth()` | `{ isLoading, isAuthenticated, error }` (also exported as `useConvexAuth`) |
 | `<Authenticated>`, `<Unauthenticated>`, `<AuthLoading>` | render their children only in that state |
 
+Signing up an address that already has an account never says so. With the right password it signs in (the same reply a new account gets); with a wrong one it fails exactly like sign-in. With `verifyEmail`, a code is emailed either way, and confirming it signs into the existing account. Without `verifyEmail`, the only remaining difference is that sign-up of an *unregistered* address succeeds — turn on `verifyEmail` if that distinction matters to you.
+
 Without React, the same methods are on the client: `client.signIn(...)`, `client.signOut()`, `client.authState` and `client.onAuthChange(listener)`.
 
 The session token is kept in `localStorage`, so a reload stays signed in. To keep it somewhere else, pass `new OnebaseClient(url, { authStorage })` with any object that has `getItem`, `setItem` and `removeItem`, or `null` to keep it in memory.
@@ -146,9 +148,12 @@ Confirmed emails are stored in `users.emailVerificationTime`, which also lets an
 | | |
 |---|---|
 | Codes | 8 digits, valid for 15 minutes, work once; a new code replaces the previous one |
-| Wrong codes | 10 per email per hour, then that email is blocked for the rest of the hour |
+| Wrong codes | 10 per email per network per hour, then that email is blocked from that network for the rest of the hour |
+| Wrong passwords | 10 per email per network per hour, then sign-in for that email is blocked from that network |
 | Codes sent | 5 per email per hour, so nobody can flood an inbox |
 | Unknown emails | a reset request answers `{ codeSent: true }` either way, so it doesn't reveal which emails have accounts |
+
+Wrong passwords and wrong codes are counted per email *and* per network (the client IP), so guessing at someone's address from elsewhere can't lock them out. Everyone signing in through one proxy or office NAT shares that network's count; pass `--trust-proxy` behind a reverse proxy so real client IPs are used.
 
 ### Use the user in functions
 
@@ -208,8 +213,8 @@ oauth({
 
 ### Sessions and security
 
-- **Sessions** last 30 days from their last use (`sessionDays` in `auth.config.ts`). Signing out ends the session at once, including for open WebSocket connections on every server instance. `POST /api/auth/signout` with `{ "everywhere": true }` ends all of a user's sessions.
-- **Passwords** are hashed with argon2id and must be at least 8 characters (`password({ minLength })`). After 10 failed attempts for an email in an hour, sign-in for that email is blocked for the rest of the hour. `--rate-limit` also applies to sign-in requests.
+- **Sessions** last 30 days from their last use (`sessionDays` in `auth.config.ts`). Signing out ends the session at once, including for open WebSocket connections on every server instance. Open connections also re-check their identity about once a minute, so a session that expires (or whose user is deleted) signs its connection out without waiting for a reconnect. `POST /api/auth/signout` with `{ "everywhere": true }` ends all of a user's sessions.
+- **Passwords** are hashed with argon2id and must be at least 8 characters (`password({ minLength })`). After 10 failed attempts for an email from one network in an hour, sign-in for that email is blocked from that network for the rest of the hour. `--rate-limit` also applies to sign-in requests.
 - **Tokens and codes** are stored only as SHA-256 hashes. OAuth uses PKCE, and the one-time code the provider's redirect brings back only works with a verifier kept by the browser that started the sign-in.
 - **Stored separately:** password hashes, OAuth links, sessions and email codes are in system tables that functions and the dashboard can't read.
 

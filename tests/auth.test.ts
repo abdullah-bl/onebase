@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { startApp } from "../src/app";
 import { oauth, password } from "../src/auth";
 import { OnebaseClient, type AuthStorage } from "../src/client/index";
-import { sha256 } from "../src/engine/auth";
+import { AuthService, sha256 } from "../src/engine/auth";
 import { createDriver } from "../src/engine/driver";
 import { Runtime } from "../src/engine/runtime";
 import { authTables, defineSchema, defineTable, getAuthUserId, mutation, query } from "../src/server";
@@ -210,7 +210,13 @@ for (const DB of DATABASES) describe(`${DB.name}: built-in auth`, () => {
     expect(await ask("auth:me", created.body.token)).toEqual({ userId: created.body.userId, subject: created.body.userId, email: "ann@example.com", name: "Ann" });
     expect(await app.runtime.adminRead((db) => db.get(created.body.userId))).toMatchObject({ email: "ann@example.com", name: "Ann" });
 
-    expect(await signUp("ann@example.com")).toMatchObject({ status: 409, body: { error: "An account with this email already exists. Sign in instead." } });
+    // Sign-up never says an account exists: the right password signs in (the reply a new address
+    // gets), a wrong one fails exactly like sign-in does.
+    const retaken = await signUp("ann@example.com");
+    expect(retaken.status).toBe(200);
+    expect(retaken.body.userId).toBe(created.body.userId);
+    expect(retaken.body.token).toStartWith("ob_s_");
+    expect(await signUp("ann@example.com", "wrong password")).toMatchObject({ status: 401, body: { error: "Invalid email or password." } });
     expect(await signUp("new@example.com", "short")).toMatchObject({ status: 400, body: { error: "Use a password with at least 8 characters." } });
     expect(await signUp("not-an-email")).toMatchObject({ status: 400 });
     expect(await signIn("ann@example.com", "wrong password")).toMatchObject({ status: 401, body: { error: "Invalid email or password." } });
@@ -369,6 +375,27 @@ for (const DB of DATABASES) describe(`${DB.name}: built-in auth`, () => {
     expect(blocked).toMatchObject({ status: 429, body: { error: expect.stringContaining("Too many wrong codes") } });
   });
 
+  test("expired sessions, codes and attempts are tidied as auth writes happen", async () => {
+    const chance = AuthService.cleanupChance;
+    AuthService.cleanupChance = 1; // normally each write tidies with a small chance
+    try {
+      await app.runtime.withWriter(async (tx) => {
+        await tx.run("INSERT INTO _auth_sessions (id, token_hash, user_id, created, expires, last_used) VALUES ('tidy1', 'tidy-hash', 'tidy-user', 0, 1, 0)");
+        await tx.run("INSERT INTO _auth_codes (code_hash, kind, data, expires) VALUES ('tidy2', 'k', '{}', 1)");
+        await tx.run("INSERT INTO _auth_attempts (key, count, window_start) VALUES ('tidy3', 5, 1)");
+      });
+      await signIn("tidy@example.com", "nope nope"); // any auth write will do
+      const left = await app.runtime.adminRead((_db, tx) =>
+        tx.get(
+          "SELECT (SELECT COUNT(*) FROM _auth_sessions WHERE id = 'tidy1') + (SELECT COUNT(*) FROM _auth_codes WHERE code_hash = 'tidy2') + (SELECT COUNT(*) FROM _auth_attempts WHERE key = 'tidy3') AS n",
+        ),
+      );
+      expect(Number(left?.n)).toBe(0);
+    } finally {
+      AuthService.cleanupChance = chance;
+    }
+  });
+
   describe("with verifyEmail", () => {
     let app2: Awaited<ReturnType<typeof startApp>>;
     let dataDir2: string;
@@ -431,6 +458,17 @@ for (const DB of DATABASES) describe(`${DB.name}: built-in auth`, () => {
       const back = await fetch(`${base2}/api/auth/callback/fake?code=${code}&state=${authorize.searchParams.get("state")}`, { redirect: "manual" });
       const done = await post2("signin", { code: new URL(back.headers.get("Location")!).searchParams.get("onebase_code"), verifier });
       expect(done.body.userId).toBe(userId);
+    });
+
+    test("signing up a taken address answers exactly like a new one", async () => {
+      await flow2("signUp", { email: "taken@example.com", password: "correct horse" });
+      const existing = (await flow2("email-verification", { email: "taken@example.com", code: await inbox.codeFor("taken@example.com", "verify") })).body.userId;
+
+      // A wrong password still gets the same reply (and the same emailed code) as a new address.
+      expect(await flow2("signUp", { email: "taken@example.com", password: "totally wrong" })).toEqual({ status: 200, body: { codeSent: true } });
+      const confirmed = await flow2("email-verification", { email: "taken@example.com", code: await inbox.codeFor("taken@example.com", "verify") });
+      expect(confirmed.status).toBe(200);
+      expect(confirmed.body.userId).toBe(existing); // the code signs into the existing account
     });
 
     test("a code that can't be sent is reported", async () => {
@@ -531,5 +569,113 @@ describe("built-in auth checks the schema at startup", () => {
     await expect(start(defineSchema({ notes: defineTable({ text: v.string() }) }))).rejects.toThrow('keeps users in a "users" table');
     await expect(start(defineSchema({ users: defineTable({ email: v.string(), plan: v.string() }) }))).rejects.toThrow("user.plan is required");
     await start(defineSchema({ users: defineTable({ email: v.string(), plan: v.optional(v.string()) }) }));
+  });
+});
+
+for (const DB of DATABASES) describe(`${DB.name}: lockouts are per network, so nobody can lock anyone else out`, () => {
+  let app: Awaited<ReturnType<typeof startApp>>;
+  let base: string;
+  let dataDir: string;
+
+  beforeAll(async () => {
+    dataDir = mkdtempSync(join(tmpdir(), "onebase-auth-ip-"));
+    app = await startApp({
+      schema: defineSchema({ ...authTables }),
+      modules: {},
+      db: DB.url,
+      dataDir,
+      port: 0,
+      hostname: "127.0.0.1",
+      dev: false,
+      quiet: true,
+      trustProxy: true,
+      auth: { methods: [password()] },
+    });
+    base = `http://127.0.0.1:${app.server.port}`;
+  });
+  afterAll(async () => {
+    await app.close();
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  test("guessing from another network can't lock the account for its owner", async () => {
+    // Behind a proxy (trustProxy), each X-Forwarded-For is its own network.
+    const withIp = (body: unknown, ip: string | null) =>
+      fetch(`${base}/api/auth/signin`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(ip ? { "X-Forwarded-For": ip } : {}) },
+        body: JSON.stringify(body),
+      }).then((r) => r.json().then((j) => ({ status: r.status, body: j })));
+    const signUp = (email: string) => withIp({ provider: "password", params: { flow: "signUp", email, password: "correct horse" } }, null);
+    expect((await signUp("victim@example.com")).status).toBe(200);
+
+    // An attacker burns through the lockout from their own address…
+    for (let i = 0; i < 10; i++) await withIp({ provider: "password", params: { flow: "signIn", email: "victim@example.com", password: "wrong password" } }, "203.0.113.9");
+    const attacker = await withIp({ provider: "password", params: { flow: "signIn", email: "victim@example.com", password: "wrong password" } }, "203.0.113.9");
+    expect(attacker.status).toBe(429);
+
+    // …but the owner, signing in from their own network, is unaffected.
+    const owner = await withIp({ provider: "password", params: { flow: "signIn", email: "victim@example.com", password: "correct horse" } }, "198.51.100.7");
+    expect(owner.status).toBe(200);
+    expect(owner.body.token).toStartWith("ob_s_");
+
+    // From the same network as the attacker, the lockout does apply.
+    const accomplice = await withIp({ provider: "password", params: { flow: "signIn", email: "victim@example.com", password: "correct horse" } }, "203.0.113.9");
+    expect(accomplice.status).toBe(429);
+  });
+});
+
+describe("open connections re-check their session", () => {
+  const modules = { auth: { whoami: query({ args: {}, handler: async (ctx) => (await ctx.auth.getUserIdentity())?.subject ?? null }) } };
+  let app: Awaited<ReturnType<typeof startApp>>;
+  let base: string;
+  let dataDir: string;
+
+  beforeAll(async () => {
+    dataDir = mkdtempSync(join(tmpdir(), "onebase-auth-recheck-"));
+    app = await startApp({
+      schema: defineSchema({ ...authTables }),
+      modules,
+      dataDir,
+      port: 0,
+      hostname: "127.0.0.1",
+      dev: false,
+      quiet: true,
+      sessionRecheckMs: 150,
+      auth: { methods: [password()] },
+    });
+    base = `http://127.0.0.1:${app.server.port}`;
+  });
+  afterAll(async () => {
+    await app.close();
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  test("a session that expires or is deleted signs the open connection out, without reconnecting", async () => {
+    const storage = memoryStorage();
+    const client = new OnebaseClient(base, { authStorage: storage });
+    await client.signIn("password", { flow: "signUp", email: "stale@example.com", password: "correct horse" });
+    const seen: (string | null)[] = [];
+    client.onUpdate("auth:whoami", {}, (v) => seen.push(v));
+    const userId = await client.query("auth:whoami", {});
+    expect(userId).toBeString();
+    expect(client.authState.isAuthenticated).toBe(true);
+
+    // The session expires while the connection stays open.
+    await app.runtime.withWriter((tx) => tx.run("UPDATE _auth_sessions SET expires = ? WHERE user_id = ?", [Date.now() - 1, userId]));
+    for (let i = 0; i < 100 && seen.at(-1) !== null; i++) await Bun.sleep(50);
+    expect(seen.at(-1)).toBeNull(); // its queries re-ran signed out
+    expect(client.authState.isAuthenticated).toBe(false);
+    expect(storage.data.size).toBe(0); // the client forgot the dead session
+
+    // A connection whose user is deleted is signed out the same way.
+    await client.signIn("password", { flow: "signUp", email: "gone@example.com", password: "correct horse" });
+    const gone = await client.query("auth:whoami", {});
+    seen.length = 0;
+    await app.runtime.adminWrite((db) => db.delete(gone));
+    for (let i = 0; i < 100 && seen.at(-1) !== null; i++) await Bun.sleep(50);
+    expect(seen.at(-1)).toBeNull();
+    expect(client.authState.isAuthenticated).toBe(false);
+    client.close();
   });
 });

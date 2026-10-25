@@ -19,6 +19,7 @@ import {
   activeDeploymentId,
   getDeployment,
   previousDeployment,
+  releaseModules,
   saveDeployment,
   setActiveDeployment,
   toDeployment,
@@ -80,6 +81,8 @@ export type RuntimeOptions = {
    * deployments and refuses new ones; dev mode always does.
    */
   loadCode?: ((source: string, id: string) => Promise<ProjectCode>) | null;
+  /** A bundle that takes longer than this to load is refused (default 30s). */
+  loadTimeoutMs?: number;
 };
 
 export type CallOptions = {
@@ -150,6 +153,7 @@ export class Runtime {
   siteUrl: string;
   private readonly customAuthenticate: Authenticate | null;
   private readonly loadCode: RuntimeOptions["loadCode"];
+  private readonly loadTimeoutMs: number;
   private revokeListeners: ((sessionIds: string[]) => void)[] = [];
   private deployListeners: (() => Promise<void> | void)[] = [];
   private cronRunner: CronRunner | null = null;
@@ -172,6 +176,7 @@ export class Runtime {
     this.dev = opts.dev ?? false;
     this.log = opts.log ?? consoleLogger;
     this.loadCode = this.dev ? null : opts.loadCode;
+    this.loadTimeoutMs = opts.loadTimeoutMs ?? 30_000;
     this.files = new FileStore(opts.blobs ?? new LocalBlobs(mkdtempSync(join(tmpdir(), "onebase-files-"))), () => this.nextCreationTime());
     this.siteUrl = (opts.siteUrl ?? "http://localhost:8090").replace(/\/$/, "");
     const code = { schema: opts.schema, modules: opts.modules, http: opts.http ?? null, auth: opts.auth ?? null, crons: opts.crons ?? [] };
@@ -189,7 +194,8 @@ export class Runtime {
       const stored = this.loadCode ? await this.driver.read((tx) => activeDeployment(tx)) : null;
       if (stored) {
         try {
-          this.setCode(this.prepare(await this.loadCode!(stored.code, stored.id)), toDeployment(stored));
+          this.setCode(await this.load(stored), toDeployment(stored));
+          releaseModules(stored.id); // anything left from an earlier deployment is replaced
         } catch (err) {
           throw new OnebaseError(
             `Couldn't load deployment ${stored.id} (pushed ${new Date(stored.created).toISOString()}): ${err instanceof Error ? err.message : String(err)}\n` +
@@ -308,6 +314,9 @@ export class Runtime {
   /** Swaps in new code, restarts crons, and lets the HTTP layer re-run live queries. */
   private async install(prepared: PreparedCode, deployment: Deployment) {
     this.setCode(prepared, deployment);
+    // The replaced deployment's module is dropped from the module cache, so its memory can be
+    // freed once the calls already running with it finish.
+    releaseModules(deployment.id);
     if (this.schedulerStarted) {
       this.cronRunner?.stop();
       this.cronRunner = null;
@@ -334,11 +343,42 @@ export class Runtime {
     );
   }
 
+  /**
+   * Loads a stored deployment's code, refusing one that doesn't finish loading in time: a bundle
+   * whose top level never settles (an awaited promise that never resolves) would otherwise block
+   * this queue — and every later deploy — forever.
+   */
+  private loadStored(stored: StoredDeployment): Promise<ProjectCode> {
+    const loader = this.codeLoader();
+    return new Promise<ProjectCode>((resolve, reject) => {
+      const timer = setTimeout(
+        () =>
+          reject(
+            new OnebaseError(
+              `The deployed code didn't finish loading within ${Math.max(1, Math.round(this.loadTimeoutMs / 1000))}s. ` +
+                `A module whose top level never settles (an import or awaited promise that never resolves) does this.`,
+            ),
+          ),
+        this.loadTimeoutMs,
+      );
+      loader(stored.code, stored.id).then(
+        (code) => {
+          clearTimeout(timer);
+          resolve(code);
+        },
+        (err) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+      );
+    });
+  }
+
   /** The checks startup would do, so a deploy that can't start is refused while the old code keeps running. */
   private async load(stored: StoredDeployment): Promise<PreparedCode> {
     let code: ProjectCode;
     try {
-      code = await this.codeLoader()(stored.code, stored.id);
+      code = await this.loadStored(stored);
     } catch (err) {
       if (err instanceof OnebaseError) throw err;
       throw new OnebaseError(`The deployed code failed to load: ${err instanceof Error ? err.message : String(err)}`);
@@ -355,11 +395,19 @@ export class Runtime {
    * Replaces the running code with a bundle from `onebase deploy`, without a restart. Like a
    * Convex push, the new schema is checked against every document first, in the same transaction
    * that updates indexes, and nothing changes if anything fails. Live queries re-run on the new code.
+   *
+   * A dry run only checks: it ships the schema as data (with the function count) and never runs
+   * the pushed code, so checking a bundle is safe even when its top level has side effects.
    */
-  async deploy(input: { code: string; assets?: Record<string, string> | null; dryRun?: boolean }): Promise<DeployResult> {
+  async deploy(input: { code: string; assets?: Record<string, string> | null; dryRun?: boolean; schema?: unknown; functions?: unknown }): Promise<DeployResult> {
     if (typeof input.code !== "string" || !input.code) throw new OnebaseError("A deploy needs the bundle's code.");
     if (input.assets && Object.values(input.assets).some((v) => typeof v !== "string")) {
       throw new OnebaseError('assets must map paths to base64 strings: { "/index.html": "PCFkb2N0eXBl..." }.');
+    }
+    if (input.dryRun && (typeof input.schema !== "string" || typeof input.functions !== "number" || input.functions < 0)) {
+      throw new OnebaseError(
+        "A dry run needs the schema (as JSON) and the function count alongside the bundle, so the code is never run just to check it. Update the onebase CLI and try again.",
+      );
     }
     const stored: StoredDeployment = {
       id: newId(),
@@ -367,7 +415,9 @@ export class Runtime {
       code: input.code,
       assets: input.assets && Object.keys(input.assets).length ? JSON.stringify(input.assets) : null,
     };
-    return this.deploys.run(() => this.activate(stored, { save: true, dryRun: input.dryRun ?? false }));
+    return this.deploys.run(() =>
+      this.activate(stored, { save: true, dryRun: input.dryRun === true, schema: input.schema as string | null, functions: Number(input.functions) }),
+    );
   }
 
   /** Goes back to the deployment pushed before the current one. */
@@ -380,13 +430,32 @@ export class Runtime {
       });
       if (!current) throw new OnebaseError("Nothing to roll back: this server isn't running a deployment.");
       if (!previous) throw new OnebaseError(`Nothing to roll back to: no deployment that was live before ${current.id} is kept.`);
-      return this.activate(previous, { save: false, dryRun: false });
+      return this.activate(previous, { save: false, dryRun: false, schema: null, functions: 0 });
     });
   }
 
-  private async activate(stored: StoredDeployment, opts: { save: boolean; dryRun: boolean }): Promise<DeployResult> {
-    const prepared = await this.load(stored);
-    const schema = prepared.code.schema;
+  /** The schema a dry run ships as JSON, checked against the data without running the bundle. */
+  private dryRunSchema(input: string | null): SchemaDefinition<any> | null {
+    if (input === null || input === "") return null;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(input);
+    } catch {
+      throw new OnebaseError("A dry run's schema must be JSON (as the onebase CLI sends it).");
+    }
+    const tables = (parsed as { tables?: unknown })?.tables;
+    if (!parsed || typeof parsed !== "object" || !tables || typeof tables !== "object") {
+      throw new OnebaseError("A dry run's schema must be { schemaValidation, tables: { name: { validator } } }.");
+    }
+    return { ...(parsed as object), __isOnebaseSchema: true } as SchemaDefinition<any>;
+  }
+
+  private async activate(
+    stored: StoredDeployment,
+    opts: { save: boolean; dryRun: boolean; schema: string | null; functions: number },
+  ): Promise<DeployResult> {
+    const prepared = opts.dryRun ? null : await this.load(stored);
+    const schema = opts.dryRun ? this.dryRunSchema(opts.schema) : prepared!.code.schema;
     const apply = async (tx: Exec) => {
       const warnings = await this.checkDocuments(tx, schema, !opts.dryRun);
       if (opts.dryRun) return { indexes: { created: [], dropped: [] }, warnings };
@@ -400,15 +469,15 @@ export class Runtime {
     const { indexes, warnings } = opts.dryRun ? await this.driver.read(apply) : await this.withWriter(apply);
     const deployment = toDeployment(stored);
     if (!opts.dryRun) {
-      await this.install(prepared, deployment);
-      this.log.info(`Deployment ${stored.id} is live: ${prepared.functions.size} function(s).`);
+      await this.install(prepared!, deployment);
+      this.log.info(`Deployment ${stored.id} is live: ${prepared!.functions.size} function(s).`);
     }
     if (!opts.dryRun && indexes.created.length) await this.driver.optimize?.();
     for (const w of warnings) this.log.warn(w);
     return {
       id: stored.id,
       created: stored.created,
-      functions: prepared.functions.size,
+      functions: opts.dryRun ? opts.functions : prepared!.functions.size,
       indexes,
       files: deployment.assets?.size ?? 0,
       warnings,
@@ -438,7 +507,7 @@ export class Runtime {
         if (!id || id === this.deployment?.id) return;
         const stored = await this.driver.read((tx) => getDeployment(tx, id!));
         if (!stored) return;
-        await this.install(this.prepare(await this.loadCode!(stored.code, stored.id)), toDeployment(stored));
+        await this.install(await this.load(stored), toDeployment(stored));
         this.log.info(`Deployment ${id} is live (pushed to another instance).`);
       });
     } catch (err) {

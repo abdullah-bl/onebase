@@ -1,0 +1,34 @@
+# SwiftPM resolves a package from the root of a repository, and the Swift client lives in
+# clients/swift here. On every release tag, publish that folder's history to its own repository
+# (abdullah-bl/onebase-swift), tagged the same, so apps can depend on it by URL.
+#
+# One-time setup: create the empty repository, then add a token that can push to it as the
+# SWIFT_MIRROR_TOKEN secret. Without the secret this job does nothing.
+name: Swift mirror
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    env:
+      MIRROR_TOKEN: ${{ secrets.SWIFT_MIRROR_TOKEN }}
+      MIRROR_REPO: abdullah-bl/onebase-swift
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Push clients/swift to the mirror
+        run: |
+          if [ -z "$MIRROR_TOKEN" ]; then
+            echo "::notice::SWIFT_MIRROR_TOKEN is not set; skipping the Swift mirror."
+            exit 0
+          fi
+          split=$(git subtree split --prefix=clients/swift HEAD)
+          git push "https://x-access-token:${MIRROR_TOKEN}@github.com/${MIRROR_REPO}.git" \
+            "$split:refs/heads/main" "$split:refs/tags/$GITHUB_REF_NAME"

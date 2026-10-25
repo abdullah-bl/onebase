@@ -2,7 +2,13 @@
 // without a libsql-server (CI only runs SQLite).
 
 import { describe, expect, test } from "bun:test";
-import { LibsqlDriver } from "../src/engine/driver";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { applySchema } from "../src/engine/database";
+import { LibsqlDriver, SqliteDriver } from "../src/engine/driver";
+import { defineSchema, defineTable } from "../src/server";
+import { v } from "../src/values";
 
 /** Shaped like @libsql/client's error when the server answers HTTP 429. */
 function tooManyRequests() {
@@ -62,5 +68,68 @@ describe("libsql driver", () => {
       .catch((e) => e);
     expect(err.message).toBe("Too many requests (429)");
     expect(calls).toBe(1);
+  });
+});
+
+describe("sqlite planner statistics", () => {
+  const schema = defineSchema({ posts: defineTable({ score: v.number() }).index("by_score", ["score"]) });
+  const rangeQuery = `SELECT id FROM documents WHERE tbl = 'posts' AND json_extract(doc, '$.score') > ? ORDER BY json_extract(doc, '$.score'), ct, id LIMIT 10`;
+
+  /** 99% of documents share a hot band, like real data: the index is only worth using for the cold rest. */
+  async function seed(driver: SqliteDriver, n: number) {
+    await driver.write(async (tx) => {
+      for (let i = 0; i < n; i++) {
+        const score = i % 100 === 0 ? 5000 + (i % 1000) : i % 100;
+        await tx.run("INSERT INTO documents (id, tbl, ct, doc) VALUES (?, 'posts', ?, ?)", [`id${i}`, i, JSON.stringify({ score, body: "x".repeat(500) })]);
+      }
+    });
+  }
+
+  const usesIndex = async (driver: SqliteDriver) =>
+    (await driver.read((tx) => driver.explain(tx, rangeQuery, [5999]))).some((line) => line.includes("cl_posts__by_score"));
+
+  test("a range query on an index uses it after a restart, not a scan and sort", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "onebase-planner-"));
+    try {
+      const first = new SqliteDriver(join(dir, "db.sqlite"));
+      await first.write((tx) => applySchema(tx, first.dialect, schema));
+      await seed(first, 5000);
+      await first.close();
+
+      const reopened = new SqliteDriver(join(dir, "db.sqlite"));
+      expect(await usesIndex(reopened)).toBe(true);
+      await reopened.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a reader that was already open plans with the new statistics", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "onebase-planner-"));
+    try {
+      const driver = new SqliteDriver(join(dir, "db.sqlite"));
+      await driver.write((tx) => applySchema(tx, driver.dialect, schema)); // the table is still empty
+      expect(await usesIndex(driver)).toBe(false); // the reader has now loaded the schema, with no statistics
+      await seed(driver, 5000);
+      await driver.optimize();
+      expect(await usesIndex(driver)).toBe(true);
+      await driver.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("an index created over existing data is used once the driver is told to optimize", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "onebase-planner-"));
+    try {
+      const driver = new SqliteDriver(join(dir, "db.sqlite"));
+      await seed(driver, 5000);
+      await driver.write((tx) => applySchema(tx, driver.dialect, schema)); // as a deploy would
+      await driver.optimize();
+      expect(await usesIndex(driver)).toBe(true);
+      await driver.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

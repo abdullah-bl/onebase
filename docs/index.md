@@ -44,7 +44,9 @@ onebase follows [Convex](https://convex.dev)'s programming model and API, and ma
 | [Functions](./functions.md) | Queries, mutations, actions and internal functions, with argument validation |
 | [Database](./database.md) | `ctx.db`, indexes, filters, ordering and pagination |
 | [Search](./search.md) | Full-text search indexes, live like any query |
-| [Live queries](./client.md) | WebSocket subscriptions that update only when relevant data changes |
+| [Live queries](./client.md) | WebSocket subscriptions that update only when relevant data changes, with offline support |
+| [Client protocol](./client-protocol.md) | The wire contract every client implements — JS, [Swift](./swift.md), and yours |
+| [Swift client](./swift.md) | iOS and macOS apps: live queries, auth, optimistic updates, offline |
 | [Scheduling](./scheduling.md) | `runAfter` / `runAt`, plus cron jobs that survive restarts |
 | [File storage](./file-storage.md) | Uploads and downloads, on local disk or in S3 / R2 / MinIO |
 | [Auth](./auth.md) | Built-in password and OAuth sign-in with sessions, or tokens from Clerk, Auth0, WorkOS and any OIDC provider |

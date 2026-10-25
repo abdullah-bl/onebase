@@ -34,6 +34,8 @@ export interface Driver {
   subscribe?(onMessage: (message: string) => void): Promise<void>;
   /** Query plan lines, used for missing-index warnings (SQLite only). */
   explain?(tx: Exec, sql: string, params: unknown[]): Promise<string[]>;
+  /** Refreshes the planner's statistics (SQLite only); called after indexes are created. */
+  optimize?(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -99,14 +101,20 @@ async function retrying<T>(fn: () => Promise<T>, isConflict: (err: unknown) => b
  * Local SQLite file in WAL mode. A separate reader connection gives queries a committed
  * snapshot while a mutation's transaction is still open.
  */
+const OPTIMIZE_INTERVAL_MS = 60 * 60 * 1000;
+/** Also optimize after this many write transactions: a database that starts empty grows fast. */
+const OPTIMIZE_EVERY_WRITES = 1000;
+
 export class SqliteDriver implements Driver {
   readonly dialect = sqliteDialect;
   readonly kind = "sqlite";
   readonly shared = false;
   readonly writer: Database;
-  readonly reader: Database;
+  reader: Database;
   private readonly reads = new SerialQueue();
   private readonly writes = new SerialQueue();
+  private optimizeTimer: ReturnType<typeof setInterval> | null = null;
+  private writeCount = 0;
 
   constructor(readonly path: string) {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
@@ -115,16 +123,57 @@ export class SqliteDriver implements Driver {
     this.writer.run("PRAGMA synchronous = NORMAL");
     this.writer.run("PRAGMA busy_timeout = 5000");
     for (const sql of this.dialect.ddl) this.writer.run(sql);
+    // Without statistics SQLite can't tell a selective index from a useless one, and a range
+    // query on an expression index falls back to scanning the table and sorting it. Analyze what
+    // was never analyzed now, and keep the statistics fresh as the data grows.
+    this.writer.run("PRAGMA analysis_limit = 1000");
+    this.writer.run("PRAGMA optimize = 0x10002");
+    if (path !== ":memory:") {
+      this.optimizeTimer = setInterval(() => void this.optimize().catch(() => {}), OPTIMIZE_INTERVAL_MS);
+      this.optimizeTimer.unref?.();
+    }
     if (path === ":memory:") {
       this.reader = this.writer;
     } else {
-      this.reader = new Database(path, { readonly: true, strict: true });
-      this.reader.run("PRAGMA busy_timeout = 5000");
+      this.reader = this.openReader();
     }
+  }
+
+  private openReader(): Database {
+    const reader = new Database(this.path, { readonly: true, strict: true });
+    reader.run("PRAGMA busy_timeout = 5000");
+    return reader;
   }
 
   get description() {
     return this.path;
+  }
+
+  /**
+   * Refreshes the planner's statistics. Queued with the writes, since they only change when
+   * nothing is mid-transaction. A connection keeps the statistics it loaded along with the
+   * schema, so when they changed the reader is reopened (between reads) to plan with them.
+   */
+  async optimize(): Promise<void> {
+    const changed = await this.writes.run(async () => {
+      const before = this.statistics();
+      this.writer.run("PRAGMA optimize");
+      return this.statistics() !== before;
+    });
+    if (!changed || this.reader === this.writer) return;
+    await this.reads.run(async () => {
+      this.reader.close();
+      this.reader = this.openReader();
+    });
+  }
+
+  private statistics(): string {
+    try {
+      const row = this.writer.query("SELECT group_concat(idx || ':' || stat) AS s FROM (SELECT idx, stat FROM sqlite_stat1 ORDER BY idx)").get() as { s: string | null } | null;
+      return row?.s ?? "";
+    } catch {
+      return ""; // never analyzed: no statistics table yet
+    }
   }
 
   private exec(db: Database): Exec {
@@ -156,6 +205,7 @@ export class SqliteDriver implements Driver {
       try {
         const result = await fn(this.exec(this.writer));
         this.writer.run("COMMIT");
+        if (++this.writeCount % OPTIMIZE_EVERY_WRITES === 0) void this.optimize().catch(() => {}); // queued behind this write
         return result;
       } catch (err) {
         this.writer.run("ROLLBACK");
@@ -184,6 +234,10 @@ export class SqliteDriver implements Driver {
   }
 
   async close() {
+    if (this.optimizeTimer) clearInterval(this.optimizeTimer);
+    try {
+      await this.optimize();
+    } catch {}
     if (this.reader !== this.writer) this.reader.close();
     this.writer.close();
   }

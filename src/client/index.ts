@@ -30,6 +30,8 @@ type Listener = (result: QueryResult) => void;
 type Watcher = (result: QueryResult | null) => void;
 type Sub = {
   id: number;
+  /** Subscription key (path + args), also the offline cache key. */
+  key: string;
   path: string;
   args: unknown;
   /** Sent on the current connection. */
@@ -39,6 +41,8 @@ type Sub = {
   server: QueryResult | null;
   /** What callers see: the server result with pending optimistic updates applied. */
   last: QueryResult | null;
+  /** Offline cache for this query, held until the server confirms who is asking. */
+  pendingHydration?: { value: unknown; subject: string | null };
 };
 
 /** The client's local query results, as an optimistic update sees and changes them. */
@@ -60,8 +64,20 @@ export type OptimisticUpdate<Args> = (localStore: OptimisticLocalStore, args: Ar
 export type MutationOptions<Args> = { optimisticUpdate?: OptimisticUpdate<Args> };
 
 type Layer = { update: OptimisticUpdate<any>; args: unknown };
-type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void; message: string; sent: boolean; layer?: Layer };
+type Pending = {
+  resolve: (v: unknown) => void;
+  reject: (e: Error) => void;
+  message: string;
+  sent: boolean;
+  layer?: Layer;
+  /** Present while this call is persisted as a queued mutation (offline). */
+  outbox?: object;
+  /** True when restored from a previous session's outbox: no caller is waiting for it. */
+  restored?: boolean;
+};
 type TokenFetcher = () => Promise<string | null | undefined> | string | null | undefined;
+/** `subject` is who made the call; absent while unknown (made before the server confirmed who is asking). */
+type OutboxEntry = { path: string; args: unknown; subject?: string | null; ref?: object };
 
 export type ClientOptions = {
   /** Provide for environments without a global WebSocket. */
@@ -71,6 +87,20 @@ export type ClientOptions = {
    * to keep it in memory only, or any object with getItem / setItem / removeItem.
    */
   authStorage?: AuthStorage | null;
+  /**
+   * Offline support (default off): the newest query results are cached and served stale while
+   * disconnected (and after a reload), and mutations made while disconnected are queued and sent
+   * in order once the connection returns. Set to true for localStorage, or pass options.
+   */
+  offline?: boolean | OfflineOptions;
+};
+
+/** Tunes offline support; `offline: true` uses the defaults. */
+export type OfflineOptions = {
+  /** Where the query cache and queued mutations persist (localStorage in browsers by default). */
+  storage?: AuthStorage | null;
+  /** How many of the newest query results to keep (default 100). */
+  maxCachedQueries?: number;
 };
 
 export type AuthStorage = { getItem(key: string): string | null; setItem(key: string, value: string): void; removeItem(key: string): void };
@@ -159,6 +189,17 @@ export class OnebaseClient {
   private authAcks = 0;
   /** An OAuth redirect's code is being exchanged for a session. */
   private exchanging = false;
+  /** Offline support, when enabled: the persisted query cache and the queued mutations. */
+  private readonly offline: { storage: AuthStorage; maxCached: number } | null = null;
+  private readonly cacheKey: string;
+  private readonly outboxKey: string;
+  private cache = new Map<string, { value: unknown; at: number }>();
+  private cacheSubject: string | null | undefined = undefined;
+  private authSubject: string | null | undefined = undefined;
+  /** The server has answered the current connection's auth message: queued mutations may be sent. */
+  private authConfirmed = false;
+  private outbox: OutboxEntry[] = [];
+  private cacheTimer: ReturnType<typeof setTimeout> | null = null;
   private stateListeners = new Set<(s: ConnectionState) => void>();
   private _state: ConnectionState = "connecting";
   private readonly url: string;
@@ -170,6 +211,14 @@ export class OnebaseClient {
     this.WS = opts.webSocketConstructor ?? WebSocket;
     this.storage = opts.authStorage !== undefined ? opts.authStorage : defaultStorage();
     this.storageKey = `onebase:auth:${this.httpUrl}`;
+    if (opts.offline) {
+      const o = opts.offline === true ? {} : opts.offline;
+      const storage = o.storage !== undefined ? o.storage : defaultStorage();
+      if (storage) this.offline = { storage, maxCached: o.maxCachedQueries ?? 100 };
+    }
+    this.cacheKey = `onebase:cache:${this.httpUrl}`;
+    this.outboxKey = `onebase:outbox:${this.httpUrl}`;
+    this.loadOfflineState();
     const saved = this.readStorage(this.storageKey);
     if (saved) {
       this.sessionToken = saved;
@@ -210,10 +259,12 @@ export class OnebaseClient {
       if (this.ws !== ws) return;
       this.ws = null;
       this.ready = false;
+      this.authConfirmed = false;
       // A call that was sent but not answered may or may not have run; don't silently retry it.
       const lost: Pending[] = [];
       for (const [requestId, p] of this.pending) {
         if (p.sent) {
+          if (p.outbox) this.outboxDone(p.outbox); // sent but never answered: not resent, like any other call
           lost.push(p);
           this.pending.delete(requestId);
         }
@@ -241,6 +292,7 @@ export class OnebaseClient {
   private async authenticate() {
     const run = ++this.authRun;
     this.ready = false;
+    this.authConfirmed = false;
     let token: string | null = null;
     if (this.fetchToken) {
       try {
@@ -250,7 +302,9 @@ export class OnebaseClient {
       }
     }
     if (run !== this.authRun || this.ws?.readyState !== 1) return;
-    if (token !== null || this.authSent) {
+    // Offline support always sends it: the answer says who is asking, which decides whose cached
+    // results may be shown and whose queued mutations may be sent.
+    if (token !== null || this.authSent || this.offline) {
       this.authAcks++;
       this.raw({ type: "auth", token });
     }
@@ -266,7 +320,7 @@ export class OnebaseClient {
       }
     }
     for (const p of this.pending.values()) {
-      if (!p.sent) {
+      if (!p.sent && !p.outbox) {
         this.ws.send(p.message);
         p.sent = true;
       }
@@ -284,8 +338,15 @@ export class OnebaseClient {
 
   private onAuthAnswer(msg: { ok: boolean; ended?: boolean; identity?: unknown; error?: string }) {
     if (this.authAcks > 0) this.authAcks--;
-    if (this.authAcks > 0) return; // a newer token is on its way
-    if (msg.ok) return this.updateAuth({ isLoading: false, isAuthenticated: Boolean(msg.identity), error: null });
+    if (this.authAcks > 0) return; // a newer token is on the way
+    if (msg.ok) {
+      const subject = ((msg.identity as { subject?: string } | null)?.subject as string | null) ?? null;
+      this.authAnswered(subject);
+      this.releaseHydrations(subject);
+      this.releaseOutbox(subject);
+      return this.updateAuth({ isLoading: !this.fetchToken && this.exchanging, isAuthenticated: Boolean(msg.identity), error: null });
+    }
+    this.dropHydrations();
     if (this.fetchToken === this.sessionFetcher && !msg.ended) {
       // The server couldn't check the session (say, its database was busy): keep it and try again.
       console.warn(`onebase auth failed: ${msg.error}`);
@@ -426,6 +487,156 @@ export class OnebaseClient {
     } catch {}
   }
 
+  // ---- Offline: cached query results and queued mutations ----
+
+  /** Restores the cache and queued mutations written by an earlier session, if any. */
+  private loadOfflineState() {
+    if (!this.offline) return;
+    try {
+      const saved = JSON.parse(this.offline.storage.getItem(this.cacheKey) ?? "{}") as {
+        subject?: string | null;
+        entries?: Record<string, { value: unknown; at: number }>;
+      };
+      this.cacheSubject = saved.subject ?? null;
+      this.cache = new Map(Object.entries(saved.entries ?? {}));
+    } catch {}
+    try {
+      const queued = JSON.parse(this.offline.storage.getItem(this.outboxKey) ?? "[]") as OutboxEntry[];
+      for (const entry of queued) {
+        // Nobody is waiting for these (the caller's page is gone): results are reported, not returned.
+        entry.ref = {};
+        const requestId = this.nextId++;
+        this.pending.set(requestId, {
+          resolve: () => {},
+          reject: (e) => console.warn(`onebase: a queued ${entry.path} mutation failed: ${e.message}`),
+          message: JSON.stringify({ type: "call", requestId, kind: "mutation", path: entry.path, args: entry.args ?? {} }),
+          sent: false,
+          outbox: entry.ref,
+          restored: true,
+        });
+        this.outbox.push(entry);
+      }
+    } catch {}
+  }
+
+  /** The newest results are cached (debounced) so a later session can show them while offline. */
+  private cacheResult(key: string, value: unknown) {
+    if (!this.offline) return;
+    this.cache.set(key, { value, at: Date.now() });
+    if (this.cacheTimer) return;
+    this.cacheTimer = setTimeout(() => {
+      this.cacheTimer = null;
+      this.flushCache();
+    }, 300);
+  }
+
+  /** Writes the cache to storage, keeping only the newest results. */
+  private flushCache() {
+    if (!this.offline) return;
+    const newest = [...this.cache.entries()].sort((a, b) => b[1].at - a[1].at).slice(0, this.offline.maxCached);
+    this.cache = new Map(newest);
+    this.writeOfflineStorage(this.cacheKey, {
+      subject: this.authSubject ?? this.cacheSubject ?? null,
+      entries: Object.fromEntries(newest.map(([k, v]) => [k, v])),
+    });
+  }
+
+  /** The cache belongs to whoever is signed in; a different user starts empty. */
+  private authAnswered(subject: string | null) {
+    this.authSubject = subject;
+    this.authConfirmed = true;
+    if (!this.offline) return;
+    if (this.cacheSubject === undefined) this.cacheSubject = subject;
+    else if (this.cacheSubject !== subject) {
+      this.cache.clear();
+      this.cacheSubject = subject;
+      this.writeOfflineStorage(this.cacheKey, { subject, entries: {} });
+    }
+  }
+
+  /** Cached results held for the auth answer: shown if it's the same user, dropped otherwise. */
+  private releaseHydrations(subject: string | null) {
+    for (const sub of this.subs.values()) {
+      const held = sub.pendingHydration;
+      if (!held) continue;
+      sub.pendingHydration = undefined;
+      if (held.subject !== subject) continue;
+      sub.server = { ok: true, value: held.value };
+      sub.last = sub.server;
+      for (const l of sub.listeners) l(sub.last!);
+    }
+  }
+
+  /**
+   * The server confirmed who is asking: queued mutations made by that user (or by nobody known
+   * yet) are sent in order; ones made by someone else are dropped, never sent as this user.
+   */
+  private releaseOutbox(subject: string | null) {
+    if (!this.offline) return;
+    let changed = false;
+    for (const [requestId, p] of [...this.pending]) {
+      const entry = p.outbox ? this.outbox.find((e) => e.ref === p.outbox) : undefined;
+      if (!entry || p.sent) continue;
+      if (entry.subject === undefined) {
+        entry.subject = subject;
+        changed = true;
+      } else if (entry.subject !== subject) {
+        this.pending.delete(requestId);
+        this.outbox.splice(this.outbox.indexOf(entry), 1);
+        changed = true;
+        const error = new Error("Dropped: queued by a different user than the one now signed in.");
+        if (p.restored) console.warn(`onebase: a queued ${entry.path} mutation was dropped: ${error.message}`);
+        else p.reject(error);
+        continue;
+      }
+      if (this.ws?.readyState === 1) {
+        this.ws.send(p.message);
+        p.sent = true;
+      }
+    }
+    if (changed) this.writeOfflineStorage(this.outboxKey, this.outbox);
+  }
+
+  private dropHydrations() {
+    for (const sub of this.subs.values()) sub.pendingHydration = undefined;
+  }
+
+  /** Mutations still queued (made while disconnected, not yet answered by the server). */
+  get queuedMutations(): number {
+    return this.outbox.length;
+  }
+
+  /** Drops every queued mutation, rejecting the promises returned when they were made. */
+  clearQueuedMutations() {
+    for (const entry of this.outbox) {
+      for (const [requestId, p] of this.pending) {
+        if (p.outbox !== entry.ref) continue;
+        this.pending.delete(requestId);
+        if (!p.restored) p.reject(new Error("Dropped: cleared while queued."));
+      }
+    }
+    this.outbox = [];
+    this.writeOfflineStorage(this.outboxKey, this.outbox);
+  }
+
+  /** A queued mutation is settled (answered, or lost with the connection): forget it. */
+  private outboxDone(ref: object, error?: Error) {
+    const at = this.outbox.findIndex((e) => e.ref === ref);
+    if (at < 0) return;
+    this.outbox.splice(at, 1);
+    this.writeOfflineStorage(this.outboxKey, this.outbox);
+    if (error) console.warn(`onebase: a queued mutation was lost with the connection; it may or may not have run.`);
+  }
+
+  private writeOfflineStorage(key: string, value: unknown) {
+    if (!this.offline) return;
+    try {
+      this.offline.storage.setItem(key, JSON.stringify(value));
+    } catch (err) {
+      console.warn("onebase: writing offline state failed; continuing without it.", err);
+    }
+  }
+
   /**
    * Applies query updates and call results in one step. The server sends a mutation's result
    * together with the updates that reflect it, so its optimistic update is dropped exactly when
@@ -446,6 +657,7 @@ export class OnebaseClient {
       const sub = this.subsById.get(u.id);
       if (!sub) continue;
       sub.server = u.ok ? { ok: true, value: u.value } : { ok: false, error: toError(u) };
+      if (u.ok) this.cacheResult(sub.key, u.value);
       changed.add(sub);
     }
     if (this.layers.length || finished.length) {
@@ -457,6 +669,7 @@ export class OnebaseClient {
       }
     }
     for (const [p, r] of settled) {
+      if (p.outbox) this.outboxDone(p.outbox);
       if (r.ok) p.resolve(r.value);
       else p.reject(toError(r));
     }
@@ -465,6 +678,7 @@ export class OnebaseClient {
   /** Sets a token (or a function returning one) sent with every request; re-runs subscriptions as that user. */
   setAuth(token: string | TokenFetcher | null) {
     this.fetchToken = token === null ? null : typeof token === "function" ? token : () => token;
+    this.authSubject = undefined; // unknown until the server answers for this token
     // Not connected yet: the next connection authenticates first anyway.
     if (this.ws?.readyState === 1) void this.authenticate();
   }
@@ -536,9 +750,20 @@ export class OnebaseClient {
     const key = subKey(path, args);
     let sub = this.subs.get(key);
     if (!sub) {
-      sub = { id: this.nextId++, path, args: args ?? {}, sent: false, listeners: new Set(), server: null, last: null };
+      sub = { id: this.nextId++, key, path, args: args ?? {}, sent: false, listeners: new Set(), server: null, last: null };
       this.subs.set(key, sub);
       this.subsById.set(sub.id, sub);
+      // Offline: the newest cached result shows immediately, then the server's answer replaces it.
+      // With a token configured it's held back until the server confirms the same user is asking.
+      const cached = this.cache.get(key);
+      if (cached) {
+        // A cache that belongs to a user is never shown to anyone else, signed out included.
+        if (this.fetchToken || this.cacheSubject != null) sub.pendingHydration = { value: cached.value, subject: this.cacheSubject ?? null };
+        else {
+          sub.server = { ok: true, value: cached.value };
+          sub.last = sub.server;
+        }
+      }
       if (this.ready) {
         this.raw({ type: "sub", id: sub.id, path, args: sub.args });
         sub.sent = true;
@@ -565,11 +790,20 @@ export class OnebaseClient {
 
   private call(kind: "query" | "mutation" | "action", fn: FunctionLike, args: unknown, layer?: Layer): Promise<any> {
     const requestId = this.nextId++;
-    const message = JSON.stringify({ type: "call", requestId, kind, path: getFunctionName(fn), args: args ?? {} });
+    const path = getFunctionName(fn);
+    const message = JSON.stringify({ type: "call", requestId, kind, path, args: args ?? {} });
     return new Promise((resolve, reject) => {
       const p: Pending = { resolve, reject, message, sent: false, layer };
+      // Offline: mutations persist until the server answers, so a disconnect (or a reload while
+      // disconnected) doesn't lose them. They're sent in the order they were made.
+      if (kind === "mutation" && this.offline) {
+        const entry: OutboxEntry = { path, args: args ?? {}, subject: this.authSubject, ref: {} };
+        p.outbox = entry.ref;
+        this.outbox.push(entry);
+        this.writeOfflineStorage(this.outboxKey, this.outbox);
+      }
       this.pending.set(requestId, p);
-      if (this.ready && this.ws?.readyState === 1) {
+      if (this.ready && this.ws?.readyState === 1 && (!p.outbox || this.authConfirmed)) {
         this.ws.send(message);
         p.sent = true;
       }
@@ -599,6 +833,11 @@ export class OnebaseClient {
 
   close() {
     this.closed = true;
+    if (this.cacheTimer) {
+      clearTimeout(this.cacheTimer);
+      this.cacheTimer = null;
+    }
+    this.flushCache();
     this.ws?.close();
   }
 }

@@ -102,7 +102,7 @@ function header(prefix: string, active: "home" | "docs") {
   return `<header class="topbar">
   <div class="topbar-inner">
     ${active === "docs" ? `<button class="icon-btn menu-btn" type="button" aria-label="Open navigation" data-menu><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></button>` : ""}
-    <a class="brand" href="${prefix}index.html">${LOGO}<span>onebase</span></a>
+    <a class="brand" href="${prefix}index.html">${LOGO}<span>OneBase</span></a>
     <nav class="topnav">
       <a href="${prefix}docs/index.html"${active === "docs" ? ' aria-current="page"' : ""}>Docs</a>
       <a href="${prefix}docs/getting-started.html">Quick start</a>
@@ -136,7 +136,7 @@ function docPage(page: Page, pages: Map<string, Page>) {
         .join("")}</ul></nav>`
     : "";
   return `<!doctype html>
-<html lang="en"><head>${head(`${page.title} · onebase docs`, page.description, "../")}</head>
+<html lang="en"><head>${head(`${page.title} · OneBase docs`, page.description, "../")}</head>
 <body class="docs-body" data-root="../">
 ${header("../", "docs")}
 <div class="docs-layout">
@@ -211,7 +211,7 @@ writeFileSync(join(OUT, "llms-full.txt"), all.map((p) => p.markdown.trim()).join
 for (const p of all) writeFileSync(join(OUT, "docs", `${p.slug}.md`), p.markdown);
 
 const landing = readFileSync(join(import.meta.dir, "index.html"), "utf8")
-  .replace("<!--HEAD-->", head("onebase: the reactive backend in one file", "TypeScript functions, a typed document database and live queries. A Convex-style API that runs as a single binary on SQLite, Postgres or Turso.", ""))
+  .replace("<!--HEAD-->", head("OneBase: the reactive backend in one file", "TypeScript functions, a typed document database and live queries. A Convex-style API that runs as a single binary on SQLite, Postgres or Turso.", ""))
   .replace("<!--HEADER-->", header("", "home"))
   .replace(/<!--VERSION-->/g, VERSION)
   .replace(/<!--REPO-->/g, REPO);

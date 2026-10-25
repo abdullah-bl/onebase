@@ -90,7 +90,7 @@ function App() {
 | `useOnebaseAuth()` | `{ isLoading, isAuthenticated, error }` (also exported as `useConvexAuth`) |
 | `<Authenticated>`, `<Unauthenticated>`, `<AuthLoading>` | render their children only in that state |
 
-Signing up an address that already has an account never says so. With the right password it signs in (the same reply a new account gets); with a wrong one it fails exactly like sign-in. With `verifyEmail`, a code is emailed either way, and confirming it signs into the existing account. Without `verifyEmail`, the only remaining difference is that sign-up of an *unregistered* address succeeds — turn on `verifyEmail` if that distinction matters to you.
+Signing up an address that already has an account never says so. With the right password it signs in (the same reply a new account gets); with a wrong one it fails exactly like sign-in. With `verifyEmail`, a code is emailed either way, and confirming it signs into the existing account. If that account was never confirmed (so anyone could have created it), confirming also sets the password to the one chosen in this sign-up and ends any earlier sessions. Without `verifyEmail`, the only remaining difference is that sign-up of an *unregistered* address succeeds — turn on `verifyEmail` if that distinction matters to you.
 
 Without React, the same methods are on the client: `client.signIn(...)`, `client.signOut()`, `client.authState` and `client.onAuthChange(listener)`.
 

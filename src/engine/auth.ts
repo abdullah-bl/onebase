@@ -304,7 +304,7 @@ export class AuthService {
     await this.runtime.withWriter((tx) => tx.run("DELETE FROM _auth_attempts WHERE key = ?", [key]));
     const user = found!.user;
     if (method.verifyEmail && typeof user.emailVerificationTime !== "number") {
-      await this.sendEmailCode(method, email, "verify");
+      await this.sendEmailCode(method, email, "verify", false, found!.secret);
       return { codeSent: true };
     }
     return this.runtime.withWriter(async (tx) => ({ userId: user._id, token: await this.createSession(tx, user._id) }));
@@ -343,14 +343,16 @@ export class AuthService {
       existing = true; // signed up twice at once; the account is there now
     }
     if (!existing) {
-      if ("codeSent" in created!) await this.sendEmailCode(method, email, "verify");
+      if ("codeSent" in created!) await this.sendEmailCode(method, email, "verify", false, secret);
       return created!;
     }
     // The email already has an account, but the answer must read exactly like a fresh sign-up's,
     // so sign-up never reveals which emails are registered.
     if (method.verifyEmail) {
-      // A code is sent either way; confirming it signs the owner into their existing account.
-      await this.sendEmailCode(method, email, "verify");
+      // A code is sent either way; confirming it signs the owner into their existing account. If
+      // that account was never confirmed, someone else may have created it, so confirming also
+      // makes this sign-up's password the account's password.
+      await this.sendEmailCode(method, email, "verify", false, secret);
       return { codeSent: true };
     }
     // Without emailed codes there's nothing to answer a fresh sign-up's token with: the right
@@ -373,8 +375,12 @@ export class AuthService {
     await this.countAttempt(`send:${email}`, MAX_CODES_SENT, "codes requested for this email");
   }
 
-  /** Creates a code (replacing earlier ones for the same email and purpose) and hands it to sendCode. */
-  private async sendEmailCode(method: PasswordMethod, email: string, purpose: "verify" | "reset", counted = false) {
+  /**
+   * Creates a code (replacing earlier ones for the same email and purpose) and hands it to sendCode.
+   * A verify code carries the password hash of whoever asked for it; confirming the code makes that
+   * the account's password, so an unconfirmed account's earlier password never survives confirmation.
+   */
+  private async sendEmailCode(method: PasswordMethod, email: string, purpose: "verify" | "reset", counted = false, secret?: string) {
     if (!method.sendCode) throw new AuthError("Email codes aren't set up: add sendCode to password() in auth.config.ts.");
     if (!counted) await this.countCodeSent(email);
     const code = randomCode();
@@ -383,7 +389,7 @@ export class AuthService {
       await tx.run("INSERT INTO _auth_codes (code_hash, kind, data, expires) VALUES (?, ?, ?, ?)", [
         sha256(`${purpose}|${email}|${code}`),
         `${purpose}:${email}`,
-        JSON.stringify({ email }),
+        JSON.stringify(defined({ email, secret })),
         Date.now() + EMAIL_CODE_TTL,
       ]);
     });
@@ -395,22 +401,23 @@ export class AuthService {
     }
   }
 
-  /** Consumes a code; wrong guesses count toward a lockout, like failed passwords. */
-  private async takeEmailCode(purpose: "verify" | "reset", email: string, code: unknown, client: string) {
+  /** Consumes a code and returns what was stored with it; wrong guesses count toward a lockout, like failed passwords. */
+  private async takeEmailCode(purpose: "verify" | "reset", email: string, code: unknown, client: string): Promise<{ secret?: string }> {
     const key = `code:${email}|${client}`;
     await this.countAttempt(key, MAX_FAILURES, "wrong codes");
     const entered = typeof code === "string" ? code.replace(/\s/g, "") : "";
-    const valid =
+    const data =
       /^\d{8}$/.test(entered) &&
       (await this.runtime.withWriter(async (tx) => {
         const hash = sha256(`${purpose}|${email}|${entered}`);
-        const row = await tx.get("SELECT expires FROM _auth_codes WHERE code_hash = ? AND kind = ?", [hash, `${purpose}:${email}`]);
-        if (!row) return false;
+        const row = await tx.get("SELECT data, expires FROM _auth_codes WHERE code_hash = ? AND kind = ?", [hash, `${purpose}:${email}`]);
+        if (!row) return null;
         await tx.run("DELETE FROM _auth_codes WHERE code_hash = ?", [hash]);
-        return Number(row.expires) >= Date.now();
+        return Number(row.expires) >= Date.now() ? (JSON.parse(row.data as string) as { secret?: string }) : null;
       }));
-    if (!valid) throw new AuthError("That code is wrong or has expired. Request a new one.", 401);
+    if (!data) throw new AuthError("That code is wrong or has expired. Request a new one.", 401);
     await this.runtime.withWriter((tx) => tx.run("DELETE FROM _auth_attempts WHERE key = ?", [key]));
+    return data;
   }
 
   /** Step 1 of a reset. The answer is the same whether or not the email has an account. */
@@ -447,12 +454,19 @@ export class AuthService {
 
   /** Confirms the email of a new account (verifyEmail) and signs in. */
   private async confirmEmail(email: string, code: unknown, client: string): Promise<SignInResult> {
-    await this.takeEmailCode("verify", email, code, client);
-    return this.runtime.authWrite(async ({ db, tx }) => {
+    const { secret } = await this.takeEmailCode("verify", email, code, client);
+    return this.runtime.authWrite(async ({ db, tx, revoke }) => {
       const account = await tx.get("SELECT user_id FROM _auth_accounts WHERE provider = 'password' AND account_id = ?", [email]);
       const user = account ? await db.get(account.user_id) : null;
       if (!user) throw new AuthError("This account no longer exists.", 401);
-      if (typeof user.emailVerificationTime !== "number") await db.patch(user._id, { emailVerificationTime: Date.now() });
+      if (typeof user.emailVerificationTime !== "number") {
+        await db.patch(user._id, { emailVerificationTime: Date.now() });
+        // Until now anyone could have created this account. The inbox owner keeps the password they
+        // just chose, and nothing from before confirmation (an earlier password, a session) survives.
+        if (secret) await tx.run("UPDATE _auth_accounts SET secret = ? WHERE provider = 'password' AND account_id = ?", [secret, email]);
+        revoke((await tx.all("SELECT id FROM _auth_sessions WHERE user_id = ?", [user._id])).map((r) => r.id as string));
+        await tx.run("DELETE FROM _auth_sessions WHERE user_id = ?", [user._id]);
+      }
       return { userId: user._id, token: await this.createSession(tx, user._id) };
     });
   }

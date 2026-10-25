@@ -163,6 +163,8 @@ export class JwtVerifier {
   }
 }
 
+const RESERVED_IDENTITY_FIELDS = new Set(["subject", "issuer", "tokenIdentifier", "sessionId", "__proto__"]);
+
 /** Maps standard OIDC claims to the identity shape Convex uses. */
 export function identityFromClaims(claims: Claims & { sub: string }): UserIdentity {
   const { iss, sub, aud, exp, nbf, iat, jti, ...rest } = claims;
@@ -177,7 +179,12 @@ export function identityFromClaims(claims: Claims & { sub: string }): UserIdenti
     updated_at: "updatedAt",
   };
   const identity: UserIdentity = { subject: sub, issuer: iss, tokenIdentifier: `${iss}|${sub}` };
-  for (const [k, v] of Object.entries(rest)) identity[camel[k] ?? k] = v;
+  for (const [k, v] of Object.entries(rest)) {
+    const key = camel[k] ?? k;
+    // The fields onebase derives (and sessionId, which built-in sessions own) can't come from a claim:
+    // a claim named tokenIdentifier would otherwise pose as another provider's user, or a built-in one.
+    if (!RESERVED_IDENTITY_FIELDS.has(key)) identity[key] = v;
+  }
   return identity;
 }
 

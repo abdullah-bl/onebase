@@ -24,6 +24,7 @@
   "scripts": {
     "dev": "bun src/cli.ts dev",
     "test": "bun test",
+    "bench": "bun scripts/bench.ts",
     "typecheck": "tsc --noEmit",
     "build:client": "bun scripts/build-client.ts",
     "build:binary": "bun run build:assets && bun build --compile --minify --no-compile-autoload-dotenv src/cli.ts --outfile dist/onebase",

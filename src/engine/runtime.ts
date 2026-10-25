@@ -213,13 +213,15 @@ export class Runtime {
   }
 
   /** Startup's index update and document check, unless the active deployment is no longer `expected`. */
-  private applyStartupSchema(expected: string | null) {
-    return this.driver.write(async (tx) => {
+  private async applyStartupSchema(expected: string | null) {
+    const applied = await this.driver.write(async (tx) => {
       // Applying this schema after another instance deployed would drop that deployment's indexes.
       if (this.loadCode && (await activeDeploymentId(tx)) !== expected) return null;
       const result = await applySchema(tx, this.driver.dialect, this.schema);
       return { result, warnings: await this.checkDocuments(tx, this.schema) };
     });
+    if (applied?.result.created.length) await this.driver.optimize?.(); // new indexes need statistics too
+    return applied;
   }
 
   /**
@@ -401,6 +403,7 @@ export class Runtime {
       await this.install(prepared, deployment);
       this.log.info(`Deployment ${stored.id} is live: ${prepared.functions.size} function(s).`);
     }
+    if (!opts.dryRun && indexes.created.length) await this.driver.optimize?.();
     for (const w of warnings) this.log.warn(w);
     return {
       id: stored.id,

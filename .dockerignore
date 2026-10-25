@@ -1,0 +1,12 @@
+.git
+.github
+.zcode
+node_modules
+dist
+onebase_data
+example
+site
+tests
+docs
+clients
+.env*

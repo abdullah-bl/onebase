@@ -410,7 +410,10 @@ export function serve(opts: ServeOptions): Server<SocketData> {
         } catch {
           return;
         }
-        void handleMessage(ws, msg);
+        // `null`, numbers and arrays are valid JSON but not messages.
+        if (typeof msg !== "object" || msg === null || Array.isArray(msg)) return;
+        // Nothing a client sends may become an unhandled rejection in the shared process.
+        handleMessage(ws, msg).catch((err) => runtime.log.error(`sync: ${err instanceof Error ? err.message : String(err)}`));
       },
       close(ws) {
         sockets.delete(ws);

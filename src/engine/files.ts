@@ -18,6 +18,21 @@ export interface BlobBackend {
   remove(id: string): Promise<void>;
 }
 
+/**
+ * Types a browser shows inline without running script. Anything else (HTML, SVG, XML, unknown)
+ * downloads instead, so an uploaded file can't run script on the app's (and dashboard's) origin.
+ */
+const INLINE_TYPE = /^(image\/(png|jpeg|gif|webp|avif|bmp|x-icon|vnd\.microsoft\.icon)|video\/[\w.+-]+|audio\/[\w.+-]+|application\/pdf|text\/plain)(;|$)/i;
+
+/** Headers that keep an uploaded file from being treated as a page on this origin. */
+function fileSafetyHeaders(contentType: string | null): Record<string, string> {
+  const inline = contentType !== null && INLINE_TYPE.test(contentType.trim());
+  return {
+    "X-Content-Type-Options": "nosniff",
+    ...(inline ? {} : { "Content-Disposition": "attachment", "Content-Security-Policy": "sandbox; default-src 'none'" }),
+  };
+}
+
 const ID = /^[0-9a-z]+$/;
 const checkId = (id: string) => {
   if (!ID.test(id)) throw new OnebaseError(`Invalid storage id "${id}".`);
@@ -46,6 +61,7 @@ export class LocalBlobs implements BlobBackend {
         "Content-Type": meta.contentType ?? "application/octet-stream",
         "Cache-Control": "public, max-age=31536000, immutable",
         ETag: `"${meta.sha256}"`,
+        ...fileSafetyHeaders(meta.contentType),
       },
     });
   }

@@ -97,6 +97,25 @@ describe("JWT auth providers", () => {
     expect(await reason(verifier.verify("not-a-jwt"))).toContain("expected a JWT");
   });
 
+  test("claims can't replace the identity fields onebase derives", async () => {
+    const verifier = new JwtVerifier([{ domain: rs.origin, applicationID: "my-app" }]);
+    const id = await verifier.verify(
+      await rs.sign({
+        iss: rs.origin,
+        sub: "attacker",
+        aud: "my-app",
+        exp: now() + 60,
+        tokenIdentifier: "onebase|victimUserId",
+        subject: "victimUserId",
+        issuer: "onebase",
+        sessionId: "victim-session",
+        email: "a@b.c",
+      }),
+    );
+    expect(id).toMatchObject({ subject: "attacker", issuer: rs.origin, tokenIdentifier: `${rs.origin}|attacker`, email: "a@b.c" });
+    expect(id.sessionId).toBeUndefined();
+  });
+
   test("providers and a custom authenticate() can be combined", async () => {
     const verify = createAuthenticate({
       providers: [{ domain: rs.origin }],
@@ -258,6 +277,29 @@ for (const [backendName, filesUrl] of FILE_BACKENDS) describe(`file storage (${b
     expect(await stored(storageId)).toBe(false);
     expect(await call("query", "files:url", { id: storageId })).toBeNull();
     expect((await fetch(url)).status).toBe(404);
+  });
+
+  // S3 downloads redirect to the bucket's own origin, so only local files are served from ours.
+  test.if(backendName === "local")("uploads that could run script download instead of rendering on this origin", async () => {
+    const upload = async (contentType: string, body: string) => {
+      const uploadUrl: string = await call("mutation", "files:uploadUrl", {});
+      const { storageId } = (await fetch(uploadUrl, { method: "POST", headers: { "Content-Type": contentType }, body }).then((r) => r.json())) as any;
+      return fetch(`${base}/api/storage/${storageId}`);
+    };
+    for (const [type, body] of [
+      ["text/html", "<script>localStorage.getItem('ob-admin-key')</script>"],
+      ["image/svg+xml", "<svg xmlns='http://www.w3.org/2000/svg' onload='alert(1)'/>"],
+      ["application/x-unknown", "?"],
+    ] as const) {
+      const res = await upload(type, body);
+      expect(res.headers.get("content-disposition")).toBe("attachment");
+      expect(res.headers.get("content-security-policy")).toContain("sandbox");
+      expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    }
+    // Images, media and plain text still show inline.
+    const png = await upload("image/png", "png");
+    expect(png.headers.get("content-disposition")).toBeNull();
+    expect(png.headers.get("x-content-type-options")).toBe("nosniff");
   });
 
   test("actions can store and read blobs", async () => {

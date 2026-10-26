@@ -471,6 +471,20 @@ for (const DB of DATABASES) describe(`${DB.name}: built-in auth`, () => {
       expect(confirmed.body.userId).toBe(existing); // the code signs into the existing account
     });
 
+    test("someone who signs up another person's email first loses that account's password when the owner confirms", async () => {
+      // The attacker registers the address first and can't confirm it (they don't read the inbox).
+      await flow2("signUp", { email: "pre@example.com", password: "attacker pass" });
+      // The owner signs up later and confirms the code they were sent.
+      await flow2("signUp", { email: "pre@example.com", password: "owner password" });
+      const owner = await flow2("email-verification", { email: "pre@example.com", code: await inbox.codeFor("pre@example.com", "verify") });
+      expect(owner.status).toBe(200);
+
+      expect((await flow2("signIn", { email: "pre@example.com", password: "attacker pass" })).status).toBe(401);
+      const again = await flow2("signIn", { email: "pre@example.com", password: "owner password" });
+      expect(again.status).toBe(200);
+      expect(again.body.userId).toBe(owner.body.userId);
+    });
+
     test("a code that can't be sent is reported", async () => {
       expect(await flow2("signUp", { email: "fail@example.com", password: "correct horse" })).toMatchObject({
         status: 502,

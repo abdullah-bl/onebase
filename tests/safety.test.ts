@@ -159,6 +159,19 @@ describe("HTTP: CORS origins and rate limits", () => {
     // Health checks and file downloads aren't counted.
     expect((await fetch(`${base}/api/health`)).status).toBe(200);
   });
+
+  test("WebSocket frames that are JSON but not messages are ignored", async () => {
+    const ws = new WebSocket(`${base.replace("http", "ws")}/api/sync`);
+    const messages: any[] = [];
+    ws.onmessage = (e) => messages.push(JSON.parse(String(e.data)));
+    await new Promise((resolve) => (ws.onopen = resolve));
+    for (const frame of ["null", "5", "true", '"x"', "[]"]) ws.send(frame);
+    // The connection still works afterwards: an auth message gets its answer.
+    ws.send(JSON.stringify({ type: "auth", token: null }));
+    for (let i = 0; i < 50 && !messages.some((m) => m.type === "auth"); i++) await Bun.sleep(10);
+    expect(messages.find((m) => m.type === "auth")).toMatchObject({ ok: true, identity: null });
+    ws.close();
+  });
 });
 
 describe("rate limiter", () => {

@@ -47,7 +47,7 @@ export const list = query({
 ```
 
 `getUrl` returns a stable URL, `/api/storage/<id>`:
-- **On disk:** the server sends the file with long-lived caching headers.
+- **On disk:** the server sends the file with long-lived caching headers. Images, audio, video, PDFs and plain text show in the browser; anything else (HTML, SVG, unknown types) downloads, so an uploaded file can't run script on your app's or the dashboard's origin.
 - **In S3:** the server redirects to a short-lived presigned URL, so the bytes come straight from S3.
 
 Set `--url https://api.example.com` so these URLs use your public address.

@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { applySchema } from "../src/engine/database";
-import { LibsqlDriver, SqliteDriver } from "../src/engine/driver";
+import { LibsqlDriver, MysqlDriver, SqliteDriver } from "../src/engine/driver";
 import { Runtime } from "../src/engine/runtime";
 import { defineSchema, defineTable, mutation, query } from "../src/server";
 import { v } from "../src/values";
@@ -167,5 +167,23 @@ describe("sqlite planner statistics", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("mysql driver", () => {
+  test("turns the engine's upserts into ON DUPLICATE KEY UPDATE", async () => {
+    const sent: string[] = [];
+    const driver = new MysqlDriver("mysql://u:p@localhost/db");
+    const exec = (driver as any).exec({ unsafe: async (sql: string) => (sent.push(sql), Object.assign([], { affectedRows: 1 })) });
+    await exec.run("INSERT INTO _crons (name, spec, next_run) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET spec = excluded.spec, next_run = excluded.next_run");
+    expect(sent).toEqual(["INSERT INTO _crons (name, spec, next_run) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE spec = VALUES(spec), next_run = VALUES(next_run)"]);
+    await driver.close();
+  });
+
+  // Set TEST_MARIADB_URL to check that MariaDB is turned away with an explanation.
+  test.if(!!process.env.TEST_MARIADB_URL)("refuses MariaDB", async () => {
+    const driver = new MysqlDriver(process.env.TEST_MARIADB_URL!);
+    await expect(driver.init()).rejects.toThrow("onebase doesn't support MariaDB");
+    await driver.close();
   });
 });

@@ -11,7 +11,7 @@ import type {
 } from "./api";
 import { getFunctionName } from "./api";
 import { parseCron } from "./cron";
-import type { AnyDataModel, GenericDataModel, GenericTableInfo, SearchIndexConfig } from "./schema";
+import type { AnyDataModel, GenericDataModel, GenericTableInfo, SearchIndexConfig, VectorIndexConfig } from "./schema";
 import {
   asObjectValidator,
   type AnyValidator,
@@ -46,6 +46,9 @@ type IndexesOf<DM, T extends keyof DM> = DM[T] extends GenericTableInfo ? DM[T][
 type SearchIndexesOf<DM, T extends keyof DM> = DM[T] extends { searchIndexes: infer S extends Record<string, SearchIndexConfig> }
   ? S
   : Record<string, SearchIndexConfig>;
+type VectorIndexesOf<DM, T extends keyof DM> = DM[T] extends { vectorIndexes: infer V extends Record<string, VectorIndexConfig> }
+  ? V
+  : Record<string, VectorIndexConfig>;
 
 export type Expression<T = unknown> = { readonly __expr: true; readonly __t?: T };
 type ExprOrValue<T> = Expression<T> | T;
@@ -225,6 +228,23 @@ export interface MutationCtx<DM = AnyDataModel> {
   runMutation: Call<"mutation">;
 }
 
+export type VectorFilter = { readonly __vectorFilter: true };
+
+export interface VectorFilterBuilder<Doc, Index extends VectorIndexConfig> {
+  /** Only documents where a `filterFields` field equals `value`. */
+  eq<F extends Index["filterFields"]>(field: F, value: F extends keyof Doc ? Doc[F] : any): VectorFilter;
+  /** Documents that match any of the filters. */
+  or(...filters: VectorFilter[]): VectorFilter;
+}
+
+export type VectorSearchQuery<Doc, Index extends VectorIndexConfig> = {
+  /** The vector to compare against, with the index's number of dimensions. */
+  vector: number[];
+  /** How many results to return, from 1 to 256 (default 10). */
+  limit?: number;
+  filter?: (q: VectorFilterBuilder<Doc, Index>) => VectorFilter;
+};
+
 export interface ActionCtx<DM = AnyDataModel> {
   auth: Auth;
   storage: StorageActionWriter;
@@ -232,6 +252,15 @@ export interface ActionCtx<DM = AnyDataModel> {
   runQuery: Call<"query">;
   runMutation: Call<"mutation">;
   runAction: Call<"action">;
+  /**
+   * The documents nearest to `query.vector` by cosine similarity, most similar first.
+   * `_score` runs from -1 to 1; load the documents with ctx.runQuery().
+   */
+  vectorSearch<T extends TableNames<DM>, I extends keyof VectorIndexesOf<DM, T> & string>(
+    table: T,
+    index: I,
+    query: VectorSearchQuery<DocOf<DM, T>, VectorIndexesOf<DM, T>[I]>,
+  ): Promise<{ _id: GenericId<T>; _score: number }[]>;
 }
 
 // ---- Function builders ----

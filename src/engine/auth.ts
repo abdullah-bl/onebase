@@ -301,7 +301,7 @@ export class AuthService {
     // Verify against a dummy hash for unknown emails, so timing doesn't reveal which emails have accounts.
     const valid = found ? await Bun.password.verify(password, found.secret) : (await Bun.password.verify(password, await this.dummy()), false);
     if (!valid) throw new AuthError("Invalid email or password.", 401);
-    await this.runtime.withWriter((tx) => tx.run("DELETE FROM _auth_attempts WHERE key = ?", [key]));
+    await this.runtime.withWriter((tx) => tx.run("DELETE FROM _auth_attempts WHERE \"key\" = ?", [key]));
     const user = found!.user;
     if (method.verifyEmail && typeof user.emailVerificationTime !== "number") {
       await this.sendEmailCode(method, email, "verify", false, found!.secret);
@@ -416,7 +416,7 @@ export class AuthService {
         return Number(row.expires) >= Date.now() ? (JSON.parse(row.data as string) as { secret?: string }) : null;
       }));
     if (!data) throw new AuthError("That code is wrong or has expired. Request a new one.", 401);
-    await this.runtime.withWriter((tx) => tx.run("DELETE FROM _auth_attempts WHERE key = ?", [key]));
+    await this.runtime.withWriter((tx) => tx.run("DELETE FROM _auth_attempts WHERE \"key\" = ?", [key]));
     return data;
   }
 
@@ -443,7 +443,7 @@ export class AuthService {
       revoke((await tx.all("SELECT id FROM _auth_sessions WHERE user_id = ?", [user._id])).map((r) => r.id as string));
       await tx.run("DELETE FROM _auth_sessions WHERE user_id = ?", [user._id]);
       // The owner has proven the inbox: their failed-password count ends, on every network.
-      await tx.run("DELETE FROM _auth_attempts WHERE key = ? OR key LIKE ?", [`password:${email}`, `password:${email}|%`]);
+      await tx.run("DELETE FROM _auth_attempts WHERE \"key\" = ? OR \"key\" LIKE ?", [`password:${email}`, `password:${email}|%`]);
       // The code proves they read this inbox.
       if (typeof user.emailVerificationTime !== "number" && "emailVerificationTime" in this.fitUsers({ emailVerificationTime: 1 })) {
         await db.patch(user._id, { emailVerificationTime: Date.now() });
@@ -494,18 +494,18 @@ export class AuthService {
   private async countAttempt(key: string, max: number, what: string) {
     const now = Date.now();
     const { count, start } = await this.runtime.withWriter(async (tx) => {
-      const row = await tx.get("SELECT count, window_start FROM _auth_attempts WHERE key = ?", [key]);
+      const row = await tx.get("SELECT count, window_start FROM _auth_attempts WHERE \"key\" = ?", [key]);
       if (!row) {
-        await tx.run("INSERT INTO _auth_attempts (key, count, window_start) VALUES (?, 1, ?)", [key, now]);
+        await tx.run("INSERT INTO _auth_attempts (\"key\", count, window_start) VALUES (?, 1, ?)", [key, now]);
         if (Math.random() < AuthService.cleanupChance) await this.cleanup(tx);
         return { count: 1, start: now };
       }
       if (Number(row.window_start) < now - FAILURE_WINDOW) {
-        await tx.run("UPDATE _auth_attempts SET count = 1, window_start = ? WHERE key = ?", [now, key]);
+        await tx.run("UPDATE _auth_attempts SET count = 1, window_start = ? WHERE \"key\" = ?", [now, key]);
         if (Math.random() < AuthService.cleanupChance) await this.cleanup(tx);
         return { count: 1, start: now };
       }
-      await tx.run("UPDATE _auth_attempts SET count = count + 1 WHERE key = ?", [key]);
+      await tx.run("UPDATE _auth_attempts SET count = count + 1 WHERE \"key\" = ?", [key]);
       return { count: Number(row.count) + 1, start: Number(row.window_start) };
     });
     if (count > max) {

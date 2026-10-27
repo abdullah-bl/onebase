@@ -28,13 +28,13 @@ onebase uses Convex's programming model and most of its API. If you know Convex,
 |---|---|---|
 | Hosting | Managed cloud or self-hosted backend | One binary you run anywhere |
 | Runtime | V8 isolates; Node only in `"use node"` actions | Bun everywhere; any npm package in any function |
-| Database | Convex's own | SQLite (default), Postgres or Turso |
+| Database | Convex's own | SQLite (default), Postgres, MySQL or Turso |
 | `.filter()` | Builder only; never uses indexes | Builder or `{ field: value }`; uses matching indexes automatically |
 | Mutations | Optimistic concurrency | Serial per process; serializable across instances |
 | Imports | `convex/server`, `convex/values` | `onebase/server`, `onebase/values` (builders still come from `./_generated/server`) |
 | Functions folder | `convex/` | `onebase/` (a `convex/` folder also works) |
 | Full-text search | ✓ | ✓ (`searchIndex`, `withSearchIndex`) |
-| Vector search | ✓ | Not yet |
+| Vector search | ✓ | ✓ (`vectorIndex`, `ctx.vectorSearch`) |
 | Dashboard | ✓ | ✓ (built in, at `/_admin`) |
 
 ## Porting a project

@@ -164,7 +164,7 @@ test("--rollback goes back to the previous deployment", async () => {
 
 test("deploys at the same time run one after the other", async () => {
   await Promise.all([push(v1), push(v2), push(v1)]);
-  const recorded = await app.runtime.adminRead((_db, tx) => tx.get("SELECT value FROM _meta WHERE key = 'deployment'"));
+  const recorded = await app.runtime.adminRead((_db, tx) => tx.get("SELECT value FROM _meta WHERE \"key\" = 'deployment'"));
   expect(app.runtime.deployment?.id).toBe(recorded?.value as string);
 });
 

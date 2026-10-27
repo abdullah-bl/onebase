@@ -50,3 +50,30 @@ test("flags document callbacks in query .filter() but not array .filter()", asyn
   const flagged = findings.filter((f) => f.message.startsWith(".filter() on a query")).map((f) => f.where);
   expect(flagged).toEqual(["posts.ts:3", "posts.ts:11"]);
 });
+
+test("checks vector index fields", async () => {
+  const project = join(mkdtempSync(join(tmpdir(), "onebase-doctor-")), "onebase");
+  mkdirSync(project);
+  writeFileSync(
+    join(project, "schema.ts"),
+    `import { defineSchema, defineTable } from "onebase/server";
+import { v } from "onebase/values";
+
+export default defineSchema({
+  docs: defineTable({ title: v.string(), embedding: v.optional(v.array(v.float64())) })
+    .vectorIndex("good", { vectorField: "embedding", dimensions: 3 })
+    .vectorIndex("text", { vectorField: "title", dimensions: 3 })
+    .vectorIndex("missing", { vectorField: "embedding", dimensions: 3, filterFields: ["kind"] }),
+});
+`,
+  );
+  try {
+    const findings = (await doctor(project)).filter((f) => f.where.includes("vectorIndex"));
+    expect(findings.map((f) => [f.where, f.message])).toEqual([
+      ['schema.ts › docs.vectorIndex("text")', 'vectorField "title" is v.string(); vectors are arrays of numbers.'],
+      ['schema.ts › docs.vectorIndex("missing")', 'Field "kind" doesn\'t exist on "docs".'],
+    ]);
+  } finally {
+    rmSync(join(project, ".."), { recursive: true, force: true });
+  }
+});

@@ -75,6 +75,14 @@ defineTable({ ... }).searchIndex("search_body", { searchField: "body", filterFie
 
 Full-text search over one string field. See [Search](./search.md).
 
+## Vector indexes
+
+```ts
+defineTable({ ... }).vectorIndex("by_embedding", { vectorField: "embedding", dimensions: 1536, filterFields: ["cuisine"] })
+```
+
+Nearest-neighbour search over an array of numbers, from actions with `ctx.vectorSearch`. See [Vector search](./vector-search.md).
+
 ## Changing a schema
 
 When `schema.ts` changes, onebase checks every stored document against it at startup, like a Convex deploy. If some don't match, the server refuses to start and lists them:

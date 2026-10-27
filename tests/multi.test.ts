@@ -68,7 +68,7 @@ for (const [name, url] of URLS) {
       const reset = (r: Runtime) =>
         r.driver.write(async (tx) => {
           await tx.run("DELETE FROM _deployments");
-          await tx.run("DELETE FROM _meta WHERE key = 'deployment'");
+          await tx.run("DELETE FROM _meta WHERE \"key\" = 'deployment'");
         });
       await reset(await instance());
       const a = await instance(undefined, { loadCode: importBundle });

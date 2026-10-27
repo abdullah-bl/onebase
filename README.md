@@ -8,7 +8,7 @@ A lightweight, Convex-style reactive backend: TypeScript functions, a typed docu
 - **Forgiving and explicit:** errors say how to fix the problem, indexes are picked automatically for filters, and `onebase doctor` checks your project.
 - **Batteries included:** sign-in with passwords and OAuth, full-text search, optimistic updates, scheduler, cron jobs, file storage, JWT auth (Clerk, Auth0, any OIDC), HTTP routes and pagination.
 - **Dashboard built in** at `/_admin`: browse and edit data, run functions, live logs, jobs and files.
-- **Your choice of database:** SQLite by default; Postgres or Turso (libSQL) when you need several instances. Files on disk or in S3/R2/MinIO, and SQLite backups to S3.
+- **Your choice of database:** SQLite by default; Postgres, MySQL or Turso (libSQL) when you need several instances. Files on disk or in S3/R2/MinIO, and SQLite backups to S3.
 - **Single file deploy**, PocketBase style.
 
 ## Quick start
@@ -91,13 +91,14 @@ onebase build --out ./app          # cross-compile with --target bun-linux-arm64
 | **SQLite** (default) | none; data in `./onebase_data` | one server, lowest latency and memory |
 | **SQLite + S3 backups** | `--backup s3://bucket/backups` | one server, with a durable copy of the data |
 | **Postgres** | `--db postgres://user:pass@host/db` | several instances behind a load balancer |
+| **MySQL 8** | `--db mysql://user:pass@host/db` | several instances, on an existing MySQL server (schema indexes aren't used) |
 | **Turso / libSQL** | `--db libsql://my-db.turso.io` (+ `$TURSO_AUTH_TOKEN`) | managed SQLite, several instances |
 | **Files in S3** | `--files s3://bucket/files` | any of the above; works with AWS S3, Cloudflare R2, MinIO, etc. |
 
-S3 credentials come from `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` / `S3_ENDPOINT` / `S3_REGION` (or the `AWS_*` equivalents). Postgres and S3 support are built into Bun, so they don't make the binary bigger.
+S3 credentials come from `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` / `S3_ENDPOINT` / `S3_REGION` (or the `AWS_*` equivalents). Postgres, MySQL and S3 support are built into Bun, so they don't make the binary bigger.
 
-**Multiple instances (Postgres / Turso):**
-- **Live queries:** a commit on one instance updates live queries on all the others (Postgres `LISTEN/NOTIFY`; for Turso, a small commit log that each instance polls).
+**Multiple instances (Postgres / MySQL / Turso):**
+- **Live queries:** a commit on one instance updates live queries on all the others (Postgres `LISTEN/NOTIFY`; for MySQL and Turso, a small commit log that each instance polls).
 - **Mutations:** they run as serializable transactions and are retried on conflicts.
 - **Scheduler and crons:** each job and each cron run is claimed by exactly one instance.
 
@@ -124,10 +125,11 @@ Send `Authorization: Bearer <token>` for auth: a built-in session token, or a to
 ## How it works
 
 - **Storage:** all documents live in one `documents` table (JSON in SQLite, `jsonb` in Postgres). Each schema index becomes a partial expression index, so the database's planner chooses indexes for both `withIndex` and `filter`.
-- **Drivers:** the engine talks to a small async driver interface (`read`, `write`, `publish`, `subscribe`) with SQLite (`bun:sqlite`), Postgres (`Bun.SQL`) and libSQL implementations. The same tests run against all three.
+- **Drivers:** the engine talks to a small async driver interface (`read`, `write`, `publish`, `subscribe`) with SQLite (`bun:sqlite`), Postgres and MySQL (`Bun.SQL`), and libSQL implementations. The same tests run against all four.
 - **Transactions:** mutations from one process run one at a time in a serializable transaction. Queries read a consistent snapshot (a separate WAL reader on SQLite; `REPEATABLE READ` on Postgres).
 - **Reactivity:** each query records the documents, equality ranges, index bounds and the slice of rows it read (for example `messages where channel = X`, the latest 50). After a commit, only subscriptions whose reads overlap the writes re-run. Identical subscriptions share one execution, and results are pushed only when they change.
-- **Search:** SQLite and Turso keep an FTS5 table per search index; Postgres uses a GIN `tsvector` index on the documents table.
+- **Search:** SQLite and Turso keep an FTS5 table per search index; Postgres uses a GIN `tsvector` index on the documents table; MySQL a `FULLTEXT` side table.
+- **Vector search:** SQLite and Turso keep a float32 side table per vector index (compared with `vector_distance_cos`, built into libSQL and added to `bun:sqlite`); Postgres uses a pgvector HNSW index; MySQL ranks in the server.
 - **Scheduler and crons:** jobs and cron schedules are stored in SQLite, so they survive restarts. Scheduled mutations run exactly once.
 - **Files:** stored on disk in `<data>/files`, with metadata in SQLite. Deletes inside a mutation only take effect if it commits.
 - **Auth:** built-in sign-in stores users in your `users` table; password hashes (argon2id), OAuth links, sessions and one-time codes live in system tables, with tokens stored as SHA-256 hashes. External JWTs are verified with WebCrypto (RS256/384/512, PS256, ES256/384, EdDSA). Keys come from OIDC discovery or a JWKS URL, are cached, and are refetched when they rotate.
@@ -136,8 +138,8 @@ Send `Authorization: Bearer <token>` for auth: a built-in session token, or a to
 
 ```bash
 bun test               # engine + end-to-end tests (SQLite, local files)
-# Also against Postgres, libSQL and S3:
-TEST_POSTGRES_URL=postgres://… TEST_LIBSQL_URL=http://127.0.0.1:8080 \
+# Also against Postgres (with pgvector), MySQL, libSQL and S3:
+TEST_POSTGRES_URL=postgres://… TEST_MYSQL_URL="mysql://…?allowPublicKeyRetrieval=true" TEST_LIBSQL_URL=http://127.0.0.1:8080 \
 TEST_S3_URL="s3://bucket/prefix?endpoint=http://127.0.0.1:9000" S3_ACCESS_KEY_ID=… S3_SECRET_ACCESS_KEY=… bun test
 bun run typecheck      # includes type-level tests in tests/types.ts
 bun run build:assets   # rebuild the embedded browser client and dashboard (src/client, src/dashboard)

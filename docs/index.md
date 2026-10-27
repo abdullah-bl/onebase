@@ -34,7 +34,7 @@ onebase follows [Convex](https://convex.dev)'s programming model and API, and ma
 - **Node and npm everywhere.** Queries, mutations and actions all run in Bun, so any npm package works in any function. There is no `"use node"` split.
 - **One file to deploy.** Copy the binary to a server and run it. The functions can sit next to it in a folder, or be compiled into it along with your frontend.
 - **Hard to misuse.** Errors explain how to fix the problem, `.filter()` picks indexes automatically, and `onebase doctor` catches common mistakes. This matters when an LLM writes the code.
-- **Grows with you.** Start on SQLite. When you need several instances, switch to Postgres or Turso with one flag.
+- **Grows with you.** Start on SQLite. When you need several instances, switch to Postgres, MySQL or Turso with one flag.
 
 ## What's included
 
@@ -51,12 +51,12 @@ onebase follows [Convex](https://convex.dev)'s programming model and API, and ma
 | [File storage](./file-storage.md) | Uploads and downloads, on local disk or in S3 / R2 / MinIO |
 | [Auth](./auth.md) | Built-in password and OAuth sign-in with sessions, or tokens from Clerk, Auth0, WorkOS and any OIDC provider |
 | [HTTP actions](./http-actions.md) | Webhooks and custom HTTP endpoints |
-| [Databases](./databases.md) | SQLite, Postgres or Turso, including multiple instances |
+| [Databases](./databases.md) | SQLite, Postgres, MySQL or Turso, including multiple instances |
 | [Backups](./backups.md) | SQLite snapshots to S3, with restore |
 | [Dashboard](./dashboard.md) | Browse and edit data, run functions, and watch logs, jobs and files at `/_admin` |
 
 ## When to use something else
 
-onebase is a young project. Use Convex if you want a managed service, vector search, and a team supporting it. Use onebase if you want to own the whole stack, run it on a small VPS or your own hardware, or need full Node.js in every function.
+onebase is a young project. Use Convex if you want a managed service and a team supporting it. Use onebase if you want to own the whole stack, run it on a small VPS or your own hardware, or need full Node.js in every function.
 
 Next: [Quick start](./getting-started.md).

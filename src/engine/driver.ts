@@ -1,10 +1,10 @@
 // Database drivers. The engine only talks to this interface, so the same functions run on
-// a local SQLite file, Postgres, or Turso/libSQL.
+// a local SQLite file, Postgres, MySQL, or Turso/libSQL.
 
 import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { newId, postgresDialect, sqliteDialect, type Dialect } from "./dialect";
+import { mysqlDialect, newId, postgresDialect, sqliteDialect, vector32, vectorDistanceCos, type Dialect } from "./dialect";
 import { unguardedFetch } from "./guard";
 
 export type Row = Record<string, any>;
@@ -18,7 +18,7 @@ export interface Exec {
 
 export interface Driver {
   readonly dialect: Dialect;
-  readonly kind: "sqlite" | "postgres" | "libsql";
+  readonly kind: "sqlite" | "postgres" | "mysql" | "libsql";
   /** Shown at startup (no credentials). */
   readonly description: string;
   /** True when other processes can share this database, so commits must be broadcast. */
@@ -105,6 +105,12 @@ const OPTIMIZE_INTERVAL_MS = 60 * 60 * 1000;
 /** Also optimize after this many write transactions: a database that starts empty grows fast. */
 const OPTIMIZE_EVERY_WRITES = 1000;
 
+/** The vector functions libSQL has built in, so vector indexes use the same SQL on both. */
+function addVectorFunctions(db: Database) {
+  db.function("vector32", { deterministic: true }, vector32);
+  db.function("vector_distance_cos", { deterministic: true }, vectorDistanceCos);
+}
+
 export class SqliteDriver implements Driver {
   readonly dialect = sqliteDialect;
   readonly kind = "sqlite";
@@ -122,6 +128,7 @@ export class SqliteDriver implements Driver {
     this.writer.run("PRAGMA journal_mode = WAL");
     this.writer.run("PRAGMA synchronous = NORMAL");
     this.writer.run("PRAGMA busy_timeout = 5000");
+    addVectorFunctions(this.writer);
     for (const sql of this.dialect.ddl) this.writer.run(sql);
     // Without statistics SQLite can't tell a selective index from a useless one, and a range
     // query on an expression index falls back to scanning the table and sorting it. Analyze what
@@ -142,6 +149,7 @@ export class SqliteDriver implements Driver {
   private openReader(): Database {
     const reader = new Database(this.path, { readonly: true, strict: true });
     reader.run("PRAGMA busy_timeout = 5000");
+    addVectorFunctions(reader);
     return reader;
   }
 
@@ -317,10 +325,47 @@ export class PostgresDriver implements Driver {
   }
 }
 
-// ---------- Turso / libSQL ----------
+// ---------- Commit log (libSQL, MySQL) ----------
 
 const COMMIT_POLL_MS = 200;
 const COMMIT_RETENTION_MS = 60_000;
+
+/**
+ * For databases without LISTEN/NOTIFY: each mutation writes its message to a _commits table in
+ * its transaction, and every instance polls the table for messages it hasn't seen.
+ */
+async function pollCommits(rows: Exec, onMessage: (message: string) => void): Promise<ReturnType<typeof setInterval>> {
+  const seen = new Map<string, number>();
+  let since = Date.now();
+  // Commits already in the log are older than anything this instance will read, so don't replay them.
+  const existing = await rows.all("SELECT id, at FROM _commits WHERE at > ?", [since - 5000]).catch(() => []);
+  for (const r of existing) seen.set(r.id, r.at);
+  let busy = false;
+  const poll = async () => {
+    if (busy) return;
+    busy = true;
+    try {
+      const now = Date.now();
+      // Look back a few seconds: a slow transaction can commit after newer ones.
+      const fresh = await rows.all("SELECT id, at, payload FROM _commits WHERE at > ? ORDER BY at", [since - 5000]);
+      for (const r of fresh) {
+        if (seen.has(r.id)) continue;
+        seen.set(r.id, r.at);
+        onMessage(r.payload);
+      }
+      since = now;
+      for (const [id, at] of seen) if (at < now - 10_000) seen.delete(id);
+      if (Math.random() < 0.02) await rows.run("DELETE FROM _commits WHERE at < ?", [now - COMMIT_RETENTION_MS]);
+    } catch {
+      // Transient network errors: try again next tick.
+    } finally {
+      busy = false;
+    }
+  };
+  return setInterval(poll, COMMIT_POLL_MS);
+}
+
+// ---------- Turso / libSQL ----------
 // sqld answers HTTP 429 once more than --max-concurrent-requests (128 by default) are in
 // flight, and Turso rate-limits too. An open transaction sends one request at a time, so
 // bursts (say, hundreds of subscriptions running for the first time) queue here instead.
@@ -407,35 +452,7 @@ export class LibsqlDriver implements Driver {
   }
 
   async subscribe(onMessage: (message: string) => void) {
-    const seen = new Map<string, number>();
-    const rows = this.exec(this.client);
-    let since = Date.now();
-    // Commits already in the log are older than anything this instance will read, so don't replay them.
-    const existing = await rows.all("SELECT id, at FROM _commits WHERE at > ?", [since - 5000]).catch(() => []);
-    for (const r of existing) seen.set(r.id, r.at);
-    let busy = false;
-    const poll = async () => {
-      if (busy) return;
-      busy = true;
-      try {
-        const now = Date.now();
-        // Look back a few seconds: a slow transaction can commit after newer ones.
-        const fresh = await rows.all("SELECT id, at, payload FROM _commits WHERE at > ? ORDER BY at", [since - 5000]);
-        for (const r of fresh) {
-          if (seen.has(r.id)) continue;
-          seen.set(r.id, r.at);
-          onMessage(r.payload);
-        }
-        since = now;
-        for (const [id, at] of seen) if (at < now - 10_000) seen.delete(id);
-        if (Math.random() < 0.02) await rows.run("DELETE FROM _commits WHERE at < ?", [now - COMMIT_RETENTION_MS]);
-      } catch {
-        // Transient network errors: try again next tick.
-      } finally {
-        busy = false;
-      }
-    };
-    this.polling = setInterval(poll, COMMIT_POLL_MS);
+    this.polling = await pollCommits(this.exec(this.client), onMessage);
   }
 
   async close() {
@@ -444,14 +461,132 @@ export class LibsqlDriver implements Driver {
   }
 }
 
+// ---------- MySQL (Bun.SQL) ----------
+
+/** MySQL 8's defaults plus ANSI_QUOTES, so "identifiers" are quoted as in the other databases. */
+const MYSQL_MODE = "ANSI_QUOTES,ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
+const MYSQL_MIN_VERSION = [8, 0, 21]; // JSON_VALUE(... RETURNING ...)
+
+/** The engine writes upserts as SQLite/Postgres do; MySQL spells them ON DUPLICATE KEY UPDATE. */
+function onDuplicateKey(sql: string): string {
+  return sql.replace(/ON CONFLICT\s*\([^)]*\)\s*DO UPDATE SET (.*)$/s, (_, sets: string) =>
+    `ON DUPLICATE KEY UPDATE ${sets.replace(/excluded\.(\w+)/g, "VALUES($1)")}`,
+  );
+}
+
+/** Deadlocks and lock wait timeouts: MySQL rolled the transaction back (or can be retried). */
+function mysqlRetryable(err: any): boolean {
+  return err?.errno === 1213 || err?.errno === 1205;
+}
+
+/**
+ * MySQL 8.0.21+. Each transaction runs on a connection of its own (session settings stick to a
+ * connection), mutations at SERIALIZABLE, which in InnoDB makes every read lock what it read.
+ * Other instances learn about commits by polling the _commits log, as with libSQL.
+ */
+export class MysqlDriver implements Driver {
+  readonly dialect = mysqlDialect;
+  readonly kind = "mysql";
+  readonly shared = true;
+  private readonly sql: InstanceType<typeof Bun.SQL>;
+  private polling: ReturnType<typeof setInterval> | null = null;
+
+  constructor(private readonly url: string) {
+    const u = new URL(url);
+    // Bun reads most options from the URL, but not this one; it's needed for caching_sha2_password without TLS.
+    const allowPublicKeyRetrieval = u.searchParams.get("allowPublicKeyRetrieval") === "true";
+    u.searchParams.delete("allowPublicKeyRetrieval");
+    this.sql = new Bun.SQL(u.toString(), { adapter: "mysql", max: 10, foundRows: true, allowPublicKeyRetrieval } as any);
+  }
+
+  get description() {
+    const u = new URL(this.url);
+    return `mysql://${u.host}${u.pathname}`;
+  }
+
+  private exec(conn: any): Exec {
+    const run = async (sql: string, params: unknown[] = []) => conn.unsafe(onDuplicateKey(sql), params);
+    return {
+      all: async (sql, params) => [...(await run(sql, params))],
+      get: async (sql, params) => (await run(sql, params))[0] ?? null,
+      run: async (sql, params) => ({ changes: (await run(sql, params)).affectedRows ?? 0 }),
+    };
+  }
+
+  private async transaction<T>(isolation: string, start: string, fn: (tx: Exec) => Promise<T>): Promise<T> {
+    const conn = await this.sql.reserve();
+    try {
+      await conn.unsafe(`SET SESSION sql_mode = '${MYSQL_MODE}', SESSION time_zone = '+00:00', SESSION transaction_isolation = '${isolation}'`);
+      await conn.unsafe(start);
+      try {
+        const result = await fn(this.exec(conn));
+        await conn.unsafe("COMMIT");
+        return result;
+      } catch (err) {
+        await conn.unsafe("ROLLBACK").catch(() => {});
+        throw err;
+      }
+    } finally {
+      conn.release();
+    }
+  }
+
+  async init() {
+    const [{ v }] = await this.sql.unsafe("SELECT VERSION() AS v");
+    if (/mariadb/i.test(v)) {
+      throw new Error(
+        `onebase doesn't support MariaDB (${v}): its JSON type is plain text, so documents can't be compared or ordered by value. ` +
+          `Use MySQL 8.0.21+, Postgres, SQLite or libSQL.`,
+      );
+    }
+    const version = String(v).split(/[.-]/).map(Number);
+    const diff = MYSQL_MIN_VERSION.map((n, i) => (version[i] ?? 0) - n).find((d) => d !== 0) ?? 0;
+    if (diff < 0) {
+      throw new Error(`onebase needs MySQL ${MYSQL_MIN_VERSION.join(".")} or later; this server is ${v}.`);
+    }
+    await this.transaction("READ-COMMITTED", "START TRANSACTION", async (tx) => {
+      // Serialize schema setup when several instances start at once (DDL commits as it goes).
+      await tx.get("SELECT GET_LOCK('onebase_init', 60)");
+      try {
+        for (const ddl of this.dialect.ddl) await tx.run(ddl);
+      } finally {
+        await tx.get("SELECT RELEASE_LOCK('onebase_init')");
+      }
+    });
+  }
+
+  read<T>(fn: (tx: Exec) => Promise<T>): Promise<T> {
+    return this.transaction("REPEATABLE-READ", "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY", fn);
+  }
+
+  write<T>(fn: (tx: Exec) => Promise<T>): Promise<T> {
+    return retrying(() => this.transaction("SERIALIZABLE", "START TRANSACTION", fn), mysqlRetryable);
+  }
+
+  async publish(tx: Exec, message: string) {
+    await tx.run("INSERT INTO _commits (id, at, payload) VALUES (?, ?, ?)", [newId(), Date.now(), message]);
+  }
+
+  async subscribe(onMessage: (message: string) => void) {
+    this.polling = await pollCommits(this.exec(this.sql), onMessage);
+  }
+
+  async close() {
+    if (this.polling) clearInterval(this.polling);
+    await this.sql.close();
+  }
+}
+
 /**
  * Picks a driver from a URL:
  *   ./data/db.sqlite or file:./db.sqlite → SQLite
  *   postgres://user:pass@host/db         → Postgres
+ *   mysql://user:pass@host/db            → MySQL 8.0.21+
  *   libsql://my-db.turso.io, https://…   → Turso / libSQL (token from ?authToken= or $LIBSQL_AUTH_TOKEN)
  */
 export function createDriver(url: string): Driver {
   if (/^postgres(ql)?:\/\//.test(url)) return new PostgresDriver(url);
+  if (/^mysql:\/\//.test(url)) return new MysqlDriver(url);
   if (/^(libsql|https?|wss?):\/\//.test(url)) {
     const u = new URL(url);
     const token = u.searchParams.get("authToken") ?? process.env.LIBSQL_AUTH_TOKEN ?? process.env.TURSO_AUTH_TOKEN ?? undefined;

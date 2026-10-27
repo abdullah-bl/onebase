@@ -5,7 +5,7 @@ import { relative, resolve } from "node:path";
 import { staleGeneratedFiles } from "./codegen";
 import { listSourceFiles, loadProject, modulePathFor, type Project } from "./project";
 import { isRegisteredFunction } from "./server";
-import type { SearchIndexDef } from "./schema";
+import type { SearchIndexDef, VectorIndexDef } from "./schema";
 import { describeValidator, type AnyValidator } from "./values";
 
 export type Finding = { level: "error" | "warn"; where: string; message: string; fix?: string };
@@ -21,6 +21,13 @@ function collectIds(val: AnyValidator | undefined, out: string[]) {
 
 function acceptsString(val: AnyValidator): boolean {
   return val.kind === "string" || val.kind === "any" || (val.kind === "union" && val.members!.some(acceptsString));
+}
+
+/** Can hold an array of numbers (v.array(v.number()), possibly optional or in a union)? */
+function acceptsNumberArray(val: AnyValidator): boolean {
+  if (val.kind === "any") return true;
+  if (val.kind === "union") return val.members!.some(acceptsNumberArray);
+  return val.kind === "array" && (val.element!.kind === "number" || val.element!.kind === "any");
 }
 
 function checkSchema(project: Project, findings: Finding[]) {
@@ -71,6 +78,23 @@ function checkSchema(project: Project, findings: Finding[]) {
           level: "error",
           where,
           message: `searchField "${index.searchField}" is ${describeValidator(searched)}; only string fields can be searched.`,
+        });
+      }
+    }
+    for (const index of (def.vectorIndexes ?? []) as VectorIndexDef[]) {
+      const where = `schema.ts › ${table}.vectorIndex("${index.name}")`;
+      for (const field of [index.vectorField, ...index.filterFields]) {
+        if (fields && !fields.includes(field.split(".")[0]!)) {
+          findings.push({ level: "error", where, message: `Field "${field}" doesn't exist on "${table}".`, fix: `Known fields: ${fields.join(", ")}` });
+        }
+      }
+      const vectors: AnyValidator | undefined = def.validator.fields?.[index.vectorField];
+      if (vectors && !acceptsNumberArray(vectors)) {
+        findings.push({
+          level: "error",
+          where,
+          message: `vectorField "${index.vectorField}" is ${describeValidator(vectors)}; vectors are arrays of numbers.`,
+          fix: `Use v.array(v.float64()), or v.optional(v.array(v.float64())) for documents without one.`,
         });
       }
     }

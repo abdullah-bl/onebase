@@ -67,6 +67,7 @@ export const byAuthor = query({
 - You don't have to use `withIndex`: if an index exists for the fields you filter on, it is used automatically. In dev mode a warning tells you when a filter scans the whole table, and which index to add.
 - In `withIndex`, call `.eq()` on index fields in order, then at most one lower bound (`gt`/`gte`) and one upper bound (`lt`/`lte`) on the next field.
 - Full-text search: declare `.searchIndex("search_title", { searchField: "title", filterFields: ["author"] })` on the table, then `ctx.db.query("posts").withSearchIndex("search_title", (q) => q.search("title", text).eq("author", author)).take(10)`. Results are best match first (no `.order()`), at most 1024; any word matches and the last word also matches as a prefix.
+- Vector search: declare `.vectorIndex("by_embedding", { vectorField: "embedding", dimensions: 1536, filterFields: ["cuisine"] })` with `embedding: v.optional(v.array(v.float64()))`, then in an **action**: `await ctx.vectorSearch("foods", "by_embedding", { vector, limit: 16, filter: (q) => q.eq("cuisine", c) })`. It returns `[{ _id, _score }]` (cosine similarity, most similar first; limit 1–256, default 10); load the documents with `ctx.runQuery`. Writing a vector of the wrong length fails the mutation.
 
 ## Mutations (transactional writes)
 
@@ -217,10 +218,10 @@ const like = useMutation(api.posts.like).withOptimisticUpdate((store, { id }) =>
 
 ## Differences from Convex
 
-- Functions run in Bun, on SQLite by default, or on Postgres or Turso with `--db`. Any npm package works anywhere, and there is no `"use node"`.
+- Functions run in Bun, on SQLite by default, or on Postgres, MySQL or Turso with `--db`. Any npm package works anywhere, and there is no `"use node"`.
 - Mutations run one at a time; reads use a consistent snapshot.
 - `.filter` also accepts an object shorthand, and indexes are picked automatically for filters.
 - `auth.config.ts` can also export a custom `authenticate(token)`.
-- Not supported yet: vector indexes, `ctx.db.system`.
+- Not supported yet: `ctx.db.system`.
 
 Run `onebase doctor` after changes: it checks the schema, indexes, imports and common mistakes, and prints the fix for each.

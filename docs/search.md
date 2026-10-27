@@ -67,12 +67,14 @@ export const searchPage = query({
 
 Words are split on anything that isn't a letter, digit or combining mark, so text in any script works. There's no stemming: "running" doesn't match "run", though typing "run" finds "running" through the prefix rule.
 
-- **SQLite and Turso** ignore accents: "cafe" finds "café".
+- **SQLite, Turso and MySQL** ignore accents: "cafe" finds "café".
 - **Postgres** keeps them: "cafe" and "café" are different words.
+- **MySQL** skips words shorter than 3 characters and common stopwords such as "the".
 
 ## How it's stored
 
 - **SQLite / Turso:** one [FTS5](https://www.sqlite.org/fts5.html) table per search index, ranked with BM25. It lives in the same database file, so [backups](./backups.md) include it.
 - **Postgres:** a GIN index on `to_tsvector('simple', field)` over the documents table, ranked with `ts_rank`. Writes need no extra work.
+- **MySQL:** a side table per search index with a `FULLTEXT` index, searched in boolean mode.
 
 `onebase doctor` checks that `searchField` and `filterFields` exist and that the search field is a string.

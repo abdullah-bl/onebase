@@ -57,7 +57,7 @@ for (const D of DRIVERS) describe(`${D.name}: schema changes are checked against
     fixing.stop();
     (await open(strict)).stop();
     // Once a schema has been checked, its fingerprint is stored.
-    expect(await driver.read((tx) => tx.get("SELECT value FROM _meta WHERE key = 'schema'"))).not.toBeNull();
+    expect(await driver.read((tx) => tx.get("SELECT value FROM _meta WHERE \"key\" = 'schema'"))).not.toBeNull();
   });
 });
 

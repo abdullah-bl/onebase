@@ -3,11 +3,12 @@
 import { createDriver, SqliteDriver, type Driver } from "../src/engine/driver";
 import { Runtime, type RuntimeOptions } from "../src/engine/runtime";
 
-/** SQLite always runs; set TEST_POSTGRES_URL / TEST_LIBSQL_URL to also run against Postgres and libSQL (Turso). */
+/** SQLite always runs; set TEST_POSTGRES_URL / TEST_MYSQL_URL / TEST_LIBSQL_URL to also run against Postgres, MySQL and libSQL (Turso). */
 export const DRIVERS: { name: string; make: (dir: string) => Driver }[] = [
   { name: "sqlite", make: (dir) => new SqliteDriver(`${dir}/db.sqlite`) },
   ...(process.env.TEST_POSTGRES_URL ? [{ name: "postgres", make: () => createDriver(process.env.TEST_POSTGRES_URL!) }] : []),
   ...(process.env.TEST_LIBSQL_URL ? [{ name: "libsql", make: () => createDriver(process.env.TEST_LIBSQL_URL!) }] : []),
+  ...(process.env.TEST_MYSQL_URL ? [{ name: "mysql", make: () => createDriver(process.env.TEST_MYSQL_URL!) }] : []),
 ];
 
 export const quiet = { info() {}, warn() {}, error() {} };

@@ -1,7 +1,7 @@
-import type { SchemaDefinition, SearchIndexDef } from "../schema";
+import type { SchemaDefinition, SearchIndexDef, VectorIndexDef } from "../schema";
 import type { PaginationOptions, PaginationResult } from "../server";
 import { describeValue, isPlainObject, validate, type AnyValidator } from "../values";
-import { FIELD_PATH, isIdForTable, newId, systemKind, tableLiteral, type Dialect, type ValueKind } from "./dialect";
+import { cosineDistance, FIELD_PATH, isIdForTable, newId, systemKind, tableLiteral, type Dialect, type ValueKind } from "./dialect";
 import type { Exec } from "./driver";
 
 export type Doc = Record<string, unknown> & { _id: string; _creationTime: number };
@@ -201,7 +201,7 @@ class ExprCompiler {
   bool(e: Expr): string {
     const d = this.d;
     if (e.op === "lit") return d.boolLiteral(Boolean((e as any).value));
-    if (e.op === "field") return d.name === "postgres" ? `(${d.field((e as any).path)} = 'true'::jsonb)` : `(${d.field((e as any).path)})`;
+    if (e.op === "field") return d.isTrue(d.field((e as any).path));
     const args = (e as any).args as Expr[];
     switch (e.op) {
       case "and":
@@ -227,7 +227,7 @@ class ExprCompiler {
         const sa = this.operand(a, kind);
         const sb = this.operand(b, kind);
         if (e.op === "eq") return `(${sa} = ${sb})`;
-        if (e.op === "neq") return d.name === "postgres" ? `(${sa} IS DISTINCT FROM ${sb})` : `(${sa} IS NOT ${sb})`;
+        if (e.op === "neq") return d.distinct(sa, sb);
         return `(${sa} ${COMPARE[e.op]} ${sb})`;
       }
       default:
@@ -281,11 +281,45 @@ function searchOffset(cursor: string): number {
   return key[1] as number;
 }
 
+// ---- Vector search ----
+
+/** Vector searches return 10 results unless asked for more, and at most 256, like Convex. */
+export const DEFAULT_VECTOR_RESULTS = 10;
+export const MAX_VECTOR_RESULTS = 256;
+
+export const vectorIndexName = (table: string, index: string) => `vx_${table}__${index}`;
+
+export type VectorSearchQuery = { vector: unknown; limit?: unknown; filter?: (q: any) => unknown };
+type VectorFilter = { __vectorFilter: true; op: "eq"; field: string; value: unknown } | { __vectorFilter: true; op: "or"; args: VectorFilter[] };
+
+const isVectorFilter = (x: unknown): x is VectorFilter => typeof x === "object" && x !== null && (x as any).__vectorFilter === true;
+
+/** The vector a document holds for `index`: null when the field is missing, an error when it isn't `dimensions` numbers. */
+function documentVector(index: VectorIndexDef, table: string, doc: Record<string, unknown>): number[] | null {
+  const value = getPath(doc, index.vectorField);
+  if (value === undefined || value === null) return null;
+  if (!Array.isArray(value) || value.length !== index.dimensions || value.some((x) => typeof x !== "number")) {
+    throw new OnebaseError(
+      `"${table}".${index.vectorField} must be an array of ${index.dimensions} numbers for vector index "${index.name}", ` +
+        `got ${Array.isArray(value) ? `an array of ${value.length}` : describeValue(value)}.`,
+    );
+  }
+  return value as number[];
+}
+
 // ---- Queries ----
 
 type Cond = { field: string; op: "eq" | "gt" | "gte" | "lt" | "lte"; value: unknown };
 type Search = { index: SearchIndexDef; text: string; eq: Cond[] };
 const COND_SQL = { eq: "=", gt: ">", gte: ">=", lt: "<", lte: "<=" };
+
+function condSql(d: Dialect, cond: Cond, params: unknown[]): string {
+  const kind = systemKind(cond.field) ?? "json";
+  const col = d.field(cond.field);
+  if (cond.op === "eq" && (cond.value === null || cond.value === undefined)) return d.isNull(col, kind);
+  params.push(d.encode(cond.value, kind));
+  return `${col} ${COND_SQL[cond.op]} ${d.placeholder(kind)}`;
+}
 
 class QueryImpl {
   private indexName: string | null = null;
@@ -435,12 +469,7 @@ class QueryImpl {
   }
 
   private condSql(cond: Cond, params: unknown[]): string {
-    const d = this.db.dialect;
-    const kind = systemKind(cond.field) ?? "json";
-    const col = d.field(cond.field);
-    if (cond.op === "eq" && (cond.value === null || cond.value === undefined)) return d.isNull(col, kind);
-    params.push(d.encode(cond.value, kind));
-    return `${col} ${COND_SQL[cond.op]} ${d.placeholder(kind)}`;
+    return condSql(this.db.dialect, cond, params);
   }
 
   private async run(opts: { limit?: number; cursor?: string | null; endCursor?: string | null }) {
@@ -649,6 +678,97 @@ export class DatabaseImpl {
     return index;
   }
 
+  vectorIndex(table: string, indexName: unknown): VectorIndexDef {
+    const indexes = (this.schema?.tables[table]?.vectorIndexes ?? []) as VectorIndexDef[];
+    const index = indexes.find((i) => i.name === indexName);
+    if (!index) {
+      throw new OnebaseError(
+        `Vector index ${typeof indexName === "string" ? `"${indexName}"` : describeValue(indexName)} doesn't exist on "${table}". ` +
+          (indexes.length
+            ? `Available: ${indexes.map((i) => i.name).join(", ")}.`
+            : `Add one in schema.ts: defineTable({...}).vectorIndex("by_embedding", { vectorField: "embedding", dimensions: 1536 }).`),
+      );
+    }
+    return index;
+  }
+
+  /** Checks the table's vector fields and keeps vector indexes in step with a write (where the database doesn't index documents itself). */
+  private async syncVectors(table: string, id: string, doc: Record<string, unknown> | null) {
+    const indexes = (this.schema?.tables[table]?.vectorIndexes ?? []) as VectorIndexDef[];
+    if (!indexes.length) return;
+    const entries = indexes.map((i) => ({ name: vectorIndexName(table, i.name), vector: doc ? documentVector(i, table, doc) : null }));
+    await this.dialect.syncVector?.(this.tx, id, entries);
+  }
+
+  /**
+   * The documents nearest to `query.vector` by cosine similarity, most similar first, as
+   * `{ _id, _score }` with `_score` from -1 to 1.
+   */
+  async vectorSearch(table: unknown, indexName: unknown, query: VectorSearchQuery): Promise<{ _id: string; _score: number }[]> {
+    const t = this.checkTable(table);
+    const index = this.vectorIndex(t, indexName);
+    const where = `vector index "${index.name}" on "${t}"`;
+    if (!isPlainObject(query)) throw new OnebaseError(`vectorSearch() needs { vector, limit?, filter? }, got ${describeValue(query)}.`);
+    const { vector, limit = DEFAULT_VECTOR_RESULTS, filter } = query;
+    if (!Array.isArray(vector) || vector.length !== index.dimensions || vector.some((x) => typeof x !== "number" || !Number.isFinite(x))) {
+      throw new OnebaseError(
+        `${where} needs a vector of ${index.dimensions} numbers, got ${Array.isArray(vector) ? `an array of ${vector.length}` : describeValue(vector)}.`,
+      );
+    }
+    if (!vector.some((x) => x !== 0)) throw new OnebaseError(`vectorSearch() can't rank by a vector of all zeros.`);
+    if (!Number.isInteger(limit) || (limit as number) < 1 || (limit as number) > MAX_VECTOR_RESULTS) {
+      throw new OnebaseError(`vectorSearch() limit must be a whole number from 1 to ${MAX_VECTOR_RESULTS}, got ${describeValue(limit)}.`);
+    }
+
+    const d = this.dialect;
+    const sql = d.vectorSql(vectorIndexName(t, index.name), index);
+    const params: unknown[] = [d.encodeVector(vector)];
+    const conds = [`tbl = ${tableLiteral(t)}`, ...sql.where];
+    if (filter !== undefined) {
+      if (typeof filter !== "function") throw new OnebaseError(`vectorSearch() filter must be a callback: filter: (q) => q.eq("field", value).`);
+      const builder = {
+        eq: (field: string, value: unknown): VectorFilter => {
+          if (!index.filterFields.includes(field)) {
+            throw new OnebaseError(`"${field}" isn't a filter field of ${where} (filterFields: ${index.filterFields.join(", ") || "none"}). Add it to filterFields in schema.ts.`);
+          }
+          return { __vectorFilter: true, op: "eq", field, value };
+        },
+        or: (...args: VectorFilter[]): VectorFilter => {
+          if (!args.every(isVectorFilter)) throw new OnebaseError(`q.or() takes q.eq(...) or q.or(...) filters.`);
+          return { __vectorFilter: true, op: "or", args };
+        },
+      };
+      const result = filter(builder);
+      if (!isVectorFilter(result)) throw new OnebaseError(`vectorSearch() filter must return q.eq(...) or q.or(...).`);
+      const compile = (f: VectorFilter): string =>
+        f.op === "eq"
+          ? condSql(d, { field: f.field, op: "eq", value: f.value }, params)
+          : f.args.length
+            ? `(${f.args.map(compile).join(" OR ")})`
+            : d.boolLiteral(false);
+      conds.push(compile(result));
+    }
+    if ("vector" in sql) {
+      // No distance function in the database: rank every matching document here.
+      const rows = await this.tx.all(`SELECT id, ${sql.vector} AS vec FROM ${sql.from} WHERE ${conds.join(" AND ")}`, params.slice(1));
+      return rows
+        .map((row) => {
+          const vec = typeof row.vec === "string" ? JSON.parse(row.vec) : row.vec;
+          return { _id: row.id as string, distance: cosineDistance(vec, vector as number[]) };
+        })
+        .sort((a, b) => a.distance - b.distance || (a._id < b._id ? -1 : 1))
+        .slice(0, limit as number)
+        .map(({ _id, distance }) => ({ _id, _score: 1 - distance }));
+    }
+    params.push(params[0]); // the distance again, for ORDER BY
+    await d.vectorSetup?.(this.tx, limit as number);
+    const rows = await this.tx.all(
+      `SELECT id, ${sql.distance} AS distance FROM ${sql.from} WHERE ${conds.join(" AND ")} ORDER BY ${sql.distance}, id LIMIT ${limit as number}`,
+      params,
+    );
+    return rows.map((row) => ({ _id: row.id as string, _score: 1 - Number(row.distance) }));
+  }
+
   /** Keeps the table's search indexes in step with a write (a no-op where the database indexes documents itself). */
   private async syncSearch(table: string, id: string, doc: Record<string, unknown> | null) {
     const indexes = (this.schema?.tables[table]?.searchIndexes ?? []) as SearchIndexDef[];
@@ -743,6 +863,7 @@ export class DatabaseImpl {
     const ct = this.nextCreationTime();
     await this.tx.run(`INSERT INTO documents (id, tbl, ct, doc) VALUES (?, ?, ?, ${this.dialect.docPlaceholder})`, [id, t, ct, JSON.stringify(doc)]);
     await this.syncSearch(t, id, doc);
+    await this.syncVectors(t, id, doc);
     this.writes?.push({ table: t, id, before: null, after: { _id: id, _creationTime: ct, ...doc } });
     return id;
   }
@@ -757,6 +878,7 @@ export class DatabaseImpl {
   private async writeDoc(table: string, before: Doc, fields: Record<string, unknown>) {
     await this.tx.run(`UPDATE documents SET doc = ${this.dialect.docPlaceholder} WHERE id = ?`, [JSON.stringify(fields), before._id]);
     await this.syncSearch(table, before._id, fields);
+    await this.syncVectors(table, before._id, fields);
     this.writes?.push({ table, id: before._id, before, after: { _id: before._id, _creationTime: before._creationTime, ...fields } });
   }
 
@@ -792,6 +914,7 @@ export class DatabaseImpl {
     const { id: docId, table, doc } = await this.existing(id, "delete");
     await this.tx.run("DELETE FROM documents WHERE id = ?", [docId]);
     await this.syncSearch(table, docId, null);
+    await this.syncVectors(table, docId, null);
     this.writes?.push({ table, id: docId, before: doc, after: null });
   }
 }
@@ -823,7 +946,7 @@ export function writerView(db: DatabaseImpl) {
   };
 }
 
-/** Creates the indexes (and search indexes) declared in the schema and drops the ones that were removed. */
+/** Creates the indexes (and search and vector indexes) declared in the schema and drops the ones that were removed. */
 export async function applySchema(
   tx: Exec,
   dialect: Dialect,
@@ -844,6 +967,10 @@ export async function applySchema(
       const name = searchIndexName(table, index.name);
       wanted.set(name, dialect.searchIndex(name, table, index.searchField));
     }
+    for (const index of ((def as any).vectorIndexes ?? []) as VectorIndexDef[]) {
+      const name = vectorIndexName(table, index.name);
+      wanted.set(name, dialect.vectorIndex(name, table, index));
+    }
   }
   const existing = new Map((await tx.all("SELECT name, def FROM _indexes")).map((r) => [r.name as string, r.def as string]));
   const created: string[] = [];
@@ -863,7 +990,7 @@ export async function applySchema(
     created.push(name);
   }
   // SQLite: with no search indexes left, their row id map is no longer needed.
-  if (dialect.syncSearch && dropped.some((n) => n.startsWith("sx_")) && ![...wanted.keys()].some((n) => n.startsWith("sx_"))) {
+  if (dialect.name === "sqlite" && dropped.some((n) => n.startsWith("sx_")) && ![...wanted.keys()].some((n) => n.startsWith("sx_"))) {
     await tx.run("DELETE FROM _search_ids");
   }
   return { created, dropped };

@@ -23,7 +23,7 @@ onebase is about 4,000 lines of TypeScript running in a single Bun process.
                       └────────┬─────────┘
                                ▼
               ┌────────────── driver ──────────────┐
-              │  SQLite  │  Postgres  │  libSQL     │
+              │ SQLite │ Postgres │ MySQL │ libSQL │
               └────────────────────────────────────┘
 ```
 
@@ -40,7 +40,9 @@ Queries compile to SQL against those same expressions, so the database's own pla
 
 ## Search indexes
 
-On SQLite and Turso, each search index is an FTS5 table, kept in step with the documents table inside the same transaction as each write. On Postgres it's a GIN expression index on the documents table. See [Search](./search.md).
+On SQLite and Turso, each search index is an FTS5 table, kept in step with the documents table inside the same transaction as each write. On Postgres it's a GIN expression index on the documents table, and on MySQL a `FULLTEXT` side table. See [Search](./search.md).
+
+Vector indexes work the same way: a side table of float32 vectors on SQLite and Turso, and a pgvector HNSW expression index on Postgres. See [Vector search](./vector-search.md).
 
 ## Transactions
 

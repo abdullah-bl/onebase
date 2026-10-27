@@ -34,7 +34,7 @@ Each flag can also be set with an environment variable, which can come from a [.
 | `--port <n>` | `8090` / `$PORT` | |
 | `--host <addr>` | `0.0.0.0` / `$ONEBASE_HOST` | |
 | `--url <url>` | `http://localhost:<port>` / `$ONEBASE_URL` | Public URL, used in file URLs. For `deploy`: the server to push to (`$ONEBASE_DEPLOY_URL`). |
-| `--db <url>` | `<data>/db.sqlite` / `$ONEBASE_DB` / `$DATABASE_URL` | SQLite path, `postgres://…`, or `libsql://…` / `https://…` |
+| `--db <url>` | `<data>/db.sqlite` / `$ONEBASE_DB` / `$DATABASE_URL` | SQLite path, `postgres://…`, `mysql://…`, or `libsql://…` / `https://…` |
 | `--files <s3url>` | local `<data>/files` / `$ONEBASE_FILES` | `s3://bucket/prefix` |
 | `--backup <s3url>` | / `$ONEBASE_BACKUP` | `s3://bucket/prefix` |
 | `--backup-every <d>` | `1h` / `$ONEBASE_BACKUP_EVERY` | `30m`, `6h`, `1d`, … |

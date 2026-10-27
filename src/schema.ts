@@ -12,6 +12,13 @@ export type IndexDef = { name: string; fields: string[] };
 export type SearchIndexDef = { name: string; searchField: string; filterFields: string[] };
 /** Type-level shape of a search index: its text field and the fields it can filter on. */
 export type SearchIndexConfig = { searchField: string; filterFields: string };
+export type VectorIndexDef = { name: string; vectorField: string; dimensions: number; filterFields: string[] };
+/** Type-level shape of a vector index: its vector field, its size and the fields it can filter on. */
+export type VectorIndexConfig = { vectorField: string; dimensions: number; filterFields: string };
+
+/** Vector sizes a vector index accepts, like Convex. */
+export const MIN_VECTOR_DIMENSIONS = 2;
+export const MAX_VECTOR_DIMENSIONS = 4096;
 
 const INDEX_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
@@ -19,19 +26,22 @@ export class TableDefinition<
   Document = any,
   Indexes extends Record<string, string[]> = {},
   SearchIndexes extends Record<string, SearchIndexConfig> = {},
+  VectorIndexes extends Record<string, VectorIndexConfig> = {},
 > {
   readonly indexes: IndexDef[] = [];
   readonly searchIndexes: SearchIndexDef[] = [];
+  readonly vectorIndexes: VectorIndexDef[] = [];
   /** Type-only markers. */
   declare readonly __indexes: Indexes;
   declare readonly __searchIndexes: SearchIndexes;
+  declare readonly __vectorIndexes: VectorIndexes;
 
   constructor(readonly validator: Validator<Document, any>) {}
 
   index<Name extends string, Fields extends [FieldPath<Document>, ...FieldPath<Document>[]]>(
     name: Name,
     fields: Fields,
-  ): TableDefinition<Document, Indexes & Record<Name, Fields>, SearchIndexes> {
+  ): TableDefinition<Document, Indexes & Record<Name, Fields>, SearchIndexes, VectorIndexes> {
     this.indexes.push({ name, fields });
     return this as any;
   }
@@ -43,7 +53,7 @@ export class TableDefinition<
   searchIndex<Name extends string, SearchField extends FieldPath<Document>, FilterFields extends FieldPath<Document> = never>(
     name: Name,
     config: { searchField: SearchField; filterFields?: FilterFields[] },
-  ): TableDefinition<Document, Indexes, SearchIndexes & Record<Name, { searchField: SearchField; filterFields: FilterFields }>> {
+  ): TableDefinition<Document, Indexes, SearchIndexes & Record<Name, { searchField: SearchField; filterFields: FilterFields }>, VectorIndexes> {
     if (!INDEX_NAME.test(name)) throw new Error(`Invalid search index name "${name}": use letters, digits and _.`);
     if (typeof config?.searchField !== "string") {
       throw new Error(`searchIndex("${name}") needs a searchField, e.g. .searchIndex("${name}", { searchField: "body" }).`);
@@ -57,8 +67,40 @@ export class TableDefinition<
     return this as any;
   }
 
-  vectorIndex(name: string, _config: unknown): this {
-    throw new Error(`vectorIndex("${name}") is not supported by onebase yet. Full-text search works: .searchIndex(...).`);
+  /**
+   * Nearest-neighbour search over an array of numbers, optionally narrowed by `filterFields`.
+   * Query it from an action with `ctx.vectorSearch(table, name, { vector, limit, filter })`.
+   * Documents whose field is missing aren't indexed; any other value must be `dimensions` numbers.
+   */
+  vectorIndex<
+    Name extends string,
+    VectorField extends FieldPath<Document>,
+    Dimensions extends number,
+    FilterFields extends FieldPath<Document> = never,
+  >(
+    name: Name,
+    config: { vectorField: VectorField; dimensions: Dimensions; filterFields?: FilterFields[] },
+  ): TableDefinition<
+    Document,
+    Indexes,
+    SearchIndexes,
+    VectorIndexes & Record<Name, { vectorField: VectorField; dimensions: Dimensions; filterFields: FilterFields }>
+  > {
+    if (!INDEX_NAME.test(name)) throw new Error(`Invalid vector index name "${name}": use letters, digits and _.`);
+    if (typeof config?.vectorField !== "string") {
+      throw new Error(`vectorIndex("${name}") needs a vectorField, e.g. .vectorIndex("${name}", { vectorField: "embedding", dimensions: 1536 }).`);
+    }
+    const { dimensions } = config;
+    if (!Number.isInteger(dimensions) || dimensions < MIN_VECTOR_DIMENSIONS || dimensions > MAX_VECTOR_DIMENSIONS) {
+      throw new Error(`vectorIndex("${name}"): dimensions must be a whole number from ${MIN_VECTOR_DIMENSIONS} to ${MAX_VECTOR_DIMENSIONS}, got ${dimensions}.`);
+    }
+    const filterFields = config.filterFields ?? [];
+    if (!Array.isArray(filterFields) || filterFields.some((f) => typeof f !== "string")) {
+      throw new Error(`vectorIndex("${name}"): filterFields must be a list of field names.`);
+    }
+    if (filterFields.length > 16) throw new Error(`vectorIndex("${name}") can have at most 16 filterFields.`);
+    this.vectorIndexes.push({ name, vectorField: config.vectorField, dimensions, filterFields: [...filterFields] });
+    return this as any;
   }
 }
 
@@ -77,13 +119,13 @@ export type SchemaOptions = {
   schemaValidation?: boolean;
 };
 
-export type SchemaDefinition<Tables extends Record<string, TableDefinition<any, any, any>>> = {
+export type SchemaDefinition<Tables extends Record<string, TableDefinition<any, any, any, any>>> = {
   readonly tables: Tables;
   readonly schemaValidation: boolean;
   readonly __isOnebaseSchema: true;
 };
 
-export function defineSchema<Tables extends Record<string, TableDefinition<any, any, any>>>(
+export function defineSchema<Tables extends Record<string, TableDefinition<any, any, any, any>>>(
   tables: Tables,
   options: SchemaOptions = {},
 ): SchemaDefinition<Tables> {
@@ -94,7 +136,7 @@ export function defineSchema<Tables extends Record<string, TableDefinition<any, 
     if (!(table instanceof TableDefinition) && !(table as any)?.validator) {
       throw new Error(`Table "${name}" must be created with defineTable({...}).`);
     }
-    const names = [...table.indexes.map((i) => i.name), ...(table.searchIndexes ?? []).map((i) => i.name)];
+    const names = [...table.indexes, ...(table.searchIndexes ?? []), ...(table.vectorIndexes ?? [])].map((i) => i.name);
     const dup = names.find((n, i) => names.indexOf(n) !== i);
     if (dup) throw new Error(`Table "${name}" has two indexes named "${dup}".`);
   }
@@ -116,12 +158,18 @@ export type GenericTableInfo = {
   document: GenericDocument;
   indexes: Record<string, string[]>;
   searchIndexes?: Record<string, SearchIndexConfig>;
+  vectorIndexes?: Record<string, VectorIndexConfig>;
 };
 export type GenericDataModel = Record<string, GenericTableInfo>;
 
 /** Used when there is no schema.ts: any table, any shape. */
 export type AnyDataModel = {
-  [table: string]: { document: any; indexes: Record<string, string[]>; searchIndexes: Record<string, SearchIndexConfig> };
+  [table: string]: {
+    document: any;
+    indexes: Record<string, string[]>;
+    searchIndexes: Record<string, SearchIndexConfig>;
+    vectorIndexes: Record<string, VectorIndexConfig>;
+  };
 };
 
 /** Every index implicitly ends with _creationTime (documents with equal fields are in creation order). */
@@ -130,11 +178,12 @@ type WithCreationTime<I> = { [K in keyof I]: I[K] extends string[] ? [...I[K], "
 export type DataModelFromSchema<S> =
   S extends SchemaDefinition<infer Tables>
     ? {
-        [T in keyof Tables & string]: Tables[T] extends TableDefinition<infer D, infer I, infer SI>
+        [T in keyof Tables & string]: Tables[T] extends TableDefinition<infer D, infer I, infer SI, infer VI>
           ? {
               document: Expand<D & SystemFields<T>>;
               indexes: Expand<WithCreationTime<I> & { by_creation_time: ["_creationTime"] }>;
               searchIndexes: Expand<SI>;
+              vectorIndexes: Expand<VI>;
             }
           : never;
       }

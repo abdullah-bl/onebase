@@ -6,7 +6,7 @@ import type { SchemaDefinition } from "../schema";
 import { isRegisteredFunction, type CronJob, type HttpRouter, type RegisteredFunction, type UserIdentity } from "../server";
 import { ConvexError, describeValue, isPlainObject, validate, type AnyValidator } from "../values";
 import { CronRunner } from "./crons";
-import { applySchema, DatabaseImpl, OnebaseError, readerView, writerView, type ReadSet, type Write } from "./database";
+import { applySchema, DatabaseImpl, OnebaseError, readerView, writerView, type ReadSet, type VectorSearchQuery, type Write } from "./database";
 import { isIdForTable, newId } from "./dialect";
 import { savepoint, SerialQueue, type Driver, type Exec } from "./driver";
 import { FileStore, LocalBlobs, type BlobBackend } from "./files";
@@ -238,12 +238,12 @@ export class Runtime {
   private async checkDocuments(tx: Exec, schema: SchemaDefinition<any> | null, record = true): Promise<string[]> {
     if (!schema?.schemaValidation) {
       // Writes aren't validated now, so check everything again once validation is turned back on.
-      if (record) await tx.run("DELETE FROM _meta WHERE key = 'schema'");
+      if (record) await tx.run("DELETE FROM _meta WHERE \"key\" = 'schema'");
       return [];
     }
     const tables = Object.entries(schema.tables) as [string, { validator: AnyValidator }][];
     const fingerprint = new Bun.CryptoHasher("sha256").update(JSON.stringify(tables.map(([t, d]) => [t, d.validator]))).digest("hex");
-    const stored = await tx.get("SELECT value FROM _meta WHERE key = 'schema'");
+    const stored = await tx.get("SELECT value FROM _meta WHERE \"key\" = 'schema'");
     if (stored?.value === fingerprint) return [];
 
     const d = this.driver.dialect;
@@ -277,7 +277,7 @@ export class Runtime {
     const known = new Set(tables.map(([t]) => t));
     const orphans = (await tx.all("SELECT DISTINCT tbl FROM documents")).map((r) => r.tbl as string).filter((t) => !known.has(t));
     if (record) {
-      await tx.run("INSERT INTO _meta (key, value) VALUES ('schema', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [fingerprint]);
+      await tx.run("INSERT INTO _meta (\"key\", value) VALUES ('schema', ?) ON CONFLICT(\"key\") DO UPDATE SET value = excluded.value", [fingerprint]);
     }
     return orphans.map((t) => `Table "${t}" has documents but isn't in schema.ts, so functions can't read them. Add it back to keep using them.`);
   }
@@ -815,6 +815,8 @@ export class Runtime {
       runQuery: (ref: FunctionLike, args?: unknown) => this.runQuery(ref, args, { identity, allowInternal: true }).then((r) => r.value),
       runMutation: (ref: FunctionLike, args?: unknown) => this.runMutation(ref, args, { identity, allowInternal: true }),
       runAction: (ref: FunctionLike, args?: unknown) => this.runAction(ref, args, { identity, allowInternal: true }),
+      vectorSearch: (table: string, index: string, query: VectorSearchQuery) =>
+        this.driver.read((tx) => this.newDb(tx, {}).vectorSearch(table, index, query)),
     };
     Object.defineProperty(ctx, "db", {
       get() {

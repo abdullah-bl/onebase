@@ -29,7 +29,7 @@ function toStored(row: Record<string, unknown> | null): StoredDeployment | null 
 }
 
 export async function activeDeployment(tx: Exec): Promise<StoredDeployment | null> {
-  return toStored(await tx.get(`SELECT ${COLUMNS} FROM _deployments d JOIN _meta m ON m.key = 'deployment' AND m.value = d.id`));
+  return toStored(await tx.get(`SELECT ${COLUMNS} FROM _deployments d JOIN _meta m ON m."key" = 'deployment' AND m.value = d.id`));
 }
 
 export async function getDeployment(tx: Exec, id: string): Promise<StoredDeployment | null> {
@@ -37,12 +37,12 @@ export async function getDeployment(tx: Exec, id: string): Promise<StoredDeploym
 }
 
 export async function activeDeploymentId(tx: Exec): Promise<string | null> {
-  return ((await tx.get("SELECT value FROM _meta WHERE key = 'deployment'"))?.value as string | undefined) ?? null;
+  return ((await tx.get("SELECT value FROM _meta WHERE \"key\" = 'deployment'"))?.value as string | undefined) ?? null;
 }
 
 /** Ids of the deployments that were made active, oldest first: a deploy adds one, a rollback goes back one. */
 async function activations(tx: Exec): Promise<string[]> {
-  const row = await tx.get("SELECT value FROM _meta WHERE key = 'deployments'");
+  const row = await tx.get("SELECT value FROM _meta WHERE \"key\" = 'deployments'");
   try {
     const ids = row ? JSON.parse(String(row.value)) : [];
     return Array.isArray(ids) ? ids.map(String) : [];
@@ -74,7 +74,7 @@ export async function setActiveDeployment(tx: Exec, id: string, how: "deploy" | 
   const at = ids.lastIndexOf(id);
   // A rollback forgets what came after the deployment it goes back to, so the next one goes back further.
   ids = how === "rollback" && at >= 0 ? ids.slice(0, at + 1) : [...ids, id];
-  const upsert = "INSERT INTO _meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value";
+  const upsert = "INSERT INTO _meta (\"key\", value) VALUES (?, ?) ON CONFLICT(\"key\") DO UPDATE SET value = excluded.value";
   await tx.run(upsert, ["deployment", id]);
   await tx.run(upsert, ["deployments", JSON.stringify(ids.slice(-KEEP_DEPLOYMENTS * 2))]);
 }

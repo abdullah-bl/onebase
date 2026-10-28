@@ -2,15 +2,18 @@
 // onebase/components.ts and calls as ctx.components.<mount>.<function>(args). Imported as
 // "onebase/components". The components that ship with onebase are written with this same API.
 
-import type { FunctionType } from "../api";
+import type { FunctionHandle, FunctionReference, FunctionType } from "../api";
 import { MOUNT_NAME } from "../engine/catalog";
 import type { GenericDataModel, SchemaDefinition } from "../schema";
+import { v } from "../values";
 import {
   functionBuilder,
   isRegisteredFunction,
   type ActionCtx,
   type Auth,
   type FunctionBuilder,
+  type HttpAction,
+  type HttpMethod,
   type MutationCtx,
   type QueryCtx,
   type RegisteredFunction,
@@ -18,15 +21,22 @@ import {
 } from "../server";
 
 /** Options every component takes when mounted, next to its own configuration. */
-export type MountOptions = {
+export type MountOptions<Exposed extends string = string> = {
   /**
    * Let the component see who is calling: its functions get the caller's `ctx.auth`. Off by
    * default, so a component only knows what the app passes it (Convex components never see it).
    */
   auth?: boolean;
+  /**
+   * Public functions browser clients may call directly, as `api.components.<mount>.<fn>`
+   * (nested ones as "lib.fn"). Without it, clients reach a component only through your functions.
+   */
+  expose?: readonly Exposed[];
+  /** Where the component's HTTP routes are served (default "/<mount>"); false turns them off. */
+  httpPrefix?: string | false;
 };
 
-const MOUNT_OPTIONS = ["auth"] as const;
+const MOUNT_OPTIONS = ["auth", "expose", "httpPrefix"] as const;
 
 /** A component function as the app calls it: `Call` is its exact signature. */
 export type ComponentFn<Type extends FunctionType, Call> = { readonly __componentFn: Type; readonly __call: Call };
@@ -43,18 +53,26 @@ export type ApiFromFunctions<Fns> = {
     : ApiFromFunctions<Fns[K]>;
 };
 
-/** A component mounted under a name: what `rateLimiter({...})` returns. */
-export interface Mount<Api = any> {
+/** What every mount has at runtime. */
+export interface MountBase {
   readonly __onebase: "componentMount";
   readonly definition: ComponentDefinition<any, any, any>;
   readonly config: unknown;
   readonly options: MountOptions;
-  /** Type-only marker. */
-  readonly __api?: Api;
 }
 
-/** onebase/components.ts's default export. */
-export type ComponentsDefinition<M extends Record<string, Mount<any>> = Record<string, Mount<any>>> = {
+/** A component mounted under a name: what `rateLimiter({...})` returns. */
+export interface Mount<Api = any, Exposed extends string = never> extends MountBase {
+  /** Type-only markers. */
+  readonly __api?: Api;
+  readonly __exposed?: Exposed;
+}
+
+/**
+ * onebase/components.ts's default export. Mounts are constrained by MountBase, which has no type
+ * markers, so TypeScript infers each mount's exposed names from its own call.
+ */
+export type ComponentsDefinition<M extends Record<string, MountBase> = Record<string, MountBase>> = {
   readonly __onebase: "components";
   readonly mounts: M;
 };
@@ -73,14 +91,37 @@ export type CallableApi<Api, K extends FunctionType> = {
 
 /** `ctx.components` for a function of kind `K`. */
 export type ComponentsCtx<C, K extends FunctionType> =
-  C extends ComponentsDefinition<infer M> ? { [N in keyof M]: CallableApi<NonNullable<M[N]["__api"]>, K> } : {};
+  C extends ComponentsDefinition<infer M> ? { [N in keyof M]: M[N] extends Mount<infer Api, any> ? CallableApi<NonNullable<Api>, K> : never } : {};
+
+type RefOf<T extends FunctionType, V extends "public" | "internal", Call> = Call extends (...args: infer P) => Promise<infer R>
+  ? FunctionReference<T, V, P extends [] ? {} : NonNullable<P[0]>, R>
+  : never;
+
+/** References to the functions in a component's API whose dotted paths are in `E` (all of them for `string`). */
+type RefsOf<Api, V extends "public" | "internal", E extends string> = {
+  [N in keyof Api & string as Api[N] extends ComponentFn<any, any> ? (N extends E ? N : never) : E extends N | `${N}.${string}` ? N : never]: Api[N] extends ComponentFn<
+    infer T,
+    infer Call
+  >
+    ? RefOf<T, V, Call>
+    : RefsOf<Api[N], V, string extends E ? string : E extends `${N}.${infer Rest}` ? Rest : never>;
+};
+
+/**
+ * `api.components` (the functions each mount exposes to clients) and `internal.components` (all
+ * their public functions, for the scheduler and crons): written into _generated/api.ts.
+ */
+export type ComponentsApi<C, V extends "public" | "internal"> =
+  C extends ComponentsDefinition<infer M>
+    ? { [N in keyof M]: M[N] extends Mount<infer Api, infer E> ? RefsOf<NonNullable<Api>, V, V extends "public" ? E : string> : never }
+    : {};
 
 /**
  * Mounts components: `export default defineComponents({ limiter: rateLimiter({...}) })` in
  * onebase/components.ts. Each mount gets its own tables, so the same component can be mounted
  * twice under different names.
  */
-export function defineComponents<const M extends Record<string, Mount<any>>>(mounts: M): ComponentsDefinition<M> {
+export function defineComponents<const M extends Record<string, MountBase>>(mounts: M): ComponentsDefinition<M> {
   for (const [name, mount] of Object.entries(mounts)) {
     if (!MOUNT_NAME.test(name)) {
       throw new Error(`Invalid component name "${name}": use letters, digits and _ (start with a letter, at most 32 characters).`);
@@ -94,8 +135,11 @@ export function defineComponents<const M extends Record<string, Mount<any>>>(mou
 
 // ---- Writing a component ----
 
-/** What a component's functions can call besides ctx.db: their own functions, by the function itself. */
-type OwnCall<T extends FunctionType> = <A, R>(fn: RegisteredFunction<T, any, A, R>, args?: A) => Promise<R>;
+/**
+ * What a component's functions can call besides ctx.db: their own functions (pass the function
+ * itself), and handles the app gave them (createFunctionHandle), which may be the app's.
+ */
+type OwnCall<T extends FunctionType> = <A, R>(fn: RegisteredFunction<T, any, A, R> | FunctionHandle<T, A, R>, args?: A) => Promise<R>;
 
 type ComponentBase<Config> = {
   /** The configuration the app mounted this instance with. */
@@ -104,7 +148,16 @@ type ComponentBase<Config> = {
   component: { mount: string };
   /** The caller's identity if the app mounted the component with `auth: true`; otherwise always null. */
   auth: Auth;
+  /** Where the component's table hooks stand. */
+  hooks: { status(table?: string): Promise<HookStatus> };
 };
+
+/**
+ * "ready": every document of the table has reached the hook. "backfilling": documents written
+ * before the hook existed (or before its fingerprint changed) are still being fed to it.
+ * "resetting": the component is clearing what it derived before a rebuild.
+ */
+export type HookStatus = { table: string; state: "ready" | "backfilling" | "resetting"; ready: boolean };
 
 export type ComponentQueryCtx<DM, Config> = Pick<QueryCtx<DM>, "db"> & ComponentBase<Config> & { runQuery: OwnCall<"query"> };
 export type ComponentMutationCtx<DM, Config> = Pick<MutationCtx<DM>, "db"> &
@@ -117,10 +170,11 @@ export type ComponentActionCtx<DM, Config> = Pick<ActionCtx<DM>, "vectorSearch">
     scheduler: ComponentScheduler;
   };
 
-/** Schedules the component's own functions (pass the function itself). */
+/** Schedules the component's own functions (pass the function itself) or handles it was given. */
 export type ComponentScheduler = {
-  runAfter<A>(delayMs: number, fn: RegisteredFunction<any, any, A, any>, args?: A): Promise<string>;
-  runAt<A>(timestamp: number | Date, fn: RegisteredFunction<any, any, A, any>, args?: A): Promise<string>;
+  runAfter<A>(delayMs: number, fn: RegisteredFunction<any, any, A, any> | FunctionHandle<any, A, any>, args?: A): Promise<string>;
+  runAt<A>(timestamp: number | Date, fn: RegisteredFunction<any, any, A, any> | FunctionHandle<any, A, any>, args?: A): Promise<string>;
+  /** Cancels one of the component's own scheduled jobs. */
   cancel: Scheduler["cancel"];
 };
 
@@ -136,8 +190,56 @@ export function componentServer<DM extends GenericDataModel, Config = {}>() {
     internalQuery: functionBuilder("query", "internal") as FunctionBuilder<"query", "internal", ComponentQueryCtx<DM, Config>>,
     internalMutation: functionBuilder("mutation", "internal") as FunctionBuilder<"mutation", "internal", ComponentMutationCtx<DM, Config>>,
     internalAction: functionBuilder("action", "internal") as FunctionBuilder<"action", "internal", ComponentActionCtx<DM, Config>>,
+    /** A handler for the component's HTTP routes; ctx is the component's action ctx. */
+    httpAction: (handler: (ctx: ComponentActionCtx<DM, Config>, request: Request) => Promise<Response> | Response): HttpAction => ({
+      __onebase: "httpAction",
+      handler: handler as unknown as HttpAction["handler"],
+    }),
   };
 }
+
+/** A cron job a component runs for every mount: named `components/<mount>/<name>` in the dashboard. */
+export type ComponentCron = {
+  name: string;
+  /** An interval ({ minutes: 5 }, at least 1 second) or a cron expression ("0 9 * * mon-fri", UTC). */
+  schedule: { seconds?: number; minutes?: number; hours?: number } | string;
+  /** One of the component's own functions. */
+  fn: RegisteredFunction;
+  args?: Record<string, unknown>;
+};
+
+/** An HTTP route, served under the mount's httpPrefix: `{ path: "/hook" }` on mount "stripe" is /stripe/hook. */
+export type ComponentRoute = { method: HttpMethod; handler: HttpAction } & ({ path: string; pathPrefix?: undefined } | { pathPrefix: string; path?: undefined });
+
+// ---- Table hooks ----
+
+/** One document's change, as a table hook receives it. Several writes to a document in one transaction arrive as one change. */
+export type TableChange<Doc = Record<string, any> & { _id: string; _creationTime: number }> =
+  | { op: "insert"; id: string; before: null; after: Doc }
+  | { op: "update"; id: string; before: Doc; after: Doc }
+  | { op: "delete"; id: string; before: Doc; after: null };
+
+/** The args a table hook's onChange mutation takes: `internalMutation({ args: tableChangesValidator, ... })`. */
+export const tableChangesValidator = {
+  changes: v.array(v.object({ op: v.string(), id: v.string(), before: v.any(), after: v.any() })),
+};
+
+/**
+ * Keeps a component in step with an app table: `onChange` gets every change to `table`, in the
+ * writing transaction, before the component is next called and before commit. Documents that
+ * existed before the hook are fed to it in batches (as inserts), after `reset` has cleared what
+ * the component derived earlier. Changing `fingerprint` (say, when the configuration changes)
+ * resets and rebuilds.
+ */
+export type TableHook = {
+  /** An app table (from schema.ts). */
+  table: string;
+  /** An internal mutation of the component, taking tableChangesValidator. */
+  onChange: RegisteredFunction<"mutation", "internal", any, any>;
+  /** An internal mutation that deletes some of the derived data and returns { done: true } once nothing is left. */
+  reset?: RegisteredFunction<"mutation", "internal", any, { done: boolean }>;
+  fingerprint?: string;
+};
 
 /** A component's functions: `{ limit, check }`, or nested like `{ lib: { limit } }`. */
 export type FunctionTree = { [name: string]: RegisteredFunction | FunctionTree };
@@ -149,8 +251,12 @@ export interface ComponentDefinition<S extends SchemaDefinition<any>, Config, Fn
   readonly schema: S;
   readonly functions: Fns;
   readonly checkConfig?: (config: Config) => void;
+  /** Table hooks for a mount, from its configuration. */
+  readonly hooks?: (config: Config) => TableHook[];
+  readonly crons?: (config: Config) => ComponentCron[];
+  readonly http?: (config: Config) => ComponentRoute[];
   /** Mounts this component with its configuration; components usually wrap this in a factory. */
-  mount(config: Config, options?: MountOptions): Mount<ApiFromFunctions<Fns>>;
+  mount<const E extends string = never>(config: Config, options?: MountOptions<E>): Mount<ApiFromFunctions<Fns>, E>;
 }
 
 /**
@@ -162,6 +268,9 @@ export function defineComponent<S extends SchemaDefinition<any>, Config = {}, co
   schema: S;
   functions: Fns;
   checkConfig?: (config: Config) => void;
+  hooks?: (config: Config) => TableHook[];
+  crons?: (config: Config) => ComponentCron[];
+  http?: (config: Config) => ComponentRoute[];
 }): ComponentDefinition<S, Config, Fns> {
   if (typeof def?.name !== "string" || !def.name) throw new Error("defineComponent({ name }) needs a name.");
   if (!(def.schema as any)?.__isOnebaseSchema) throw new Error(`Component "${def.name}": schema must come from defineSchema({ ... }).`);
@@ -172,10 +281,22 @@ export function defineComponent<S extends SchemaDefinition<any>, Config = {}, co
     schema: def.schema,
     functions: def.functions,
     checkConfig: def.checkConfig,
+    hooks: def.hooks,
+    crons: def.crons,
+    http: def.http,
     mount(config, options = {}) {
       def.checkConfig?.(config);
       for (const key of Object.keys(options)) {
         if (!(MOUNT_OPTIONS as readonly string[]).includes(key)) throw new Error(`Component "${def.name}": unknown mount option "${key}".`);
+      }
+      for (const name of options.expose ?? []) {
+        const fn = String(name).split(".").reduce<any>((tree, key) => (tree && !isRegisteredFunction(tree) ? tree[key] : undefined), def.functions);
+        if (!isRegisteredFunction(fn)) throw new Error(`Component "${def.name}": can't expose "${name}": it has no such function.`);
+        if (fn.visibility === "internal") throw new Error(`Component "${def.name}": can't expose "${name}": it's internal to the component.`);
+      }
+      const prefix = options.httpPrefix;
+      if (prefix !== undefined && prefix !== false && (typeof prefix !== "string" || !/^\/[A-Za-z0-9_\-./]*[^/]$/.test(prefix))) {
+        throw new Error(`Component "${def.name}": httpPrefix must be a path like "/stripe" (no trailing slash), or false.`);
       }
       return { __onebase: "componentMount", definition, config, options };
     },

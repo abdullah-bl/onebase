@@ -65,6 +65,7 @@
       $("name").value = localStorage.getItem("name") || "guest" + Math.floor(Math.random() * 1000);
       let current = null;
       let stopMessages = () => {};
+      let stopCount = () => {};
 
       const names = ["general", "random"];
       const ids = Object.fromEntries(await Promise.all(names.map(async (n) => [n, await client.mutation(api.channels.getOrCreate, { name: n })])));
@@ -78,6 +79,8 @@
       // The latest messages, or live search results while there's text in the search box.
       function subscribe() {
         const text = $("search").value.trim();
+        stopCount();
+        stopCount = client.onUpdate(api.messages.count, { channel: current }, (n) => ($("search").placeholder = `Search ${n} message${n === 1 ? "" : "s"}…`));
         stopMessages();
         stopMessages = text
           ? client.onUpdate(api.messages.search, { channel: current, text }, render, (e) => ($("error").textContent = e.message))

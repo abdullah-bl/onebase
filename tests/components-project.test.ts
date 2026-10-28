@@ -56,7 +56,9 @@ test("components.ts loads from disk, is typed in _generated and passes doctor", 
   const server = readFileSync(join(dir, "_generated", "server.ts"), "utf8");
   expect(server).toContain('import type components from "../components";');
   expect(server).toContain("makeServer<DataModel, typeof components>()");
-  expect(readFileSync(join(dir, "_generated", "api.ts"), "utf8")).not.toContain("../components");
+  const api = readFileSync(join(dir, "_generated", "api.ts"), "utf8");
+  expect(api).toContain('{ components: ComponentsApi<typeof components, "public"> }');
+  expect(api).toContain('{ components: ComponentsApi<typeof components, "internal"> }');
   expect((await doctor(dir)).filter((f) => f.level === "error")).toEqual([]);
 });
 

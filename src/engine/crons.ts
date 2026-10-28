@@ -25,7 +25,7 @@ export class CronRunner {
   }
 
   async start() {
-    for (const job of this.jobs) this.runtime.resolve(job.fn, null, true); // fail fast on typos
+    for (const job of this.jobs) this.runtime.resolve(job.fn, null, true, "system"); // fail fast on typos
     const now = Date.now();
     await this.runtime.withWriter(async (tx) => {
       this.states = [];

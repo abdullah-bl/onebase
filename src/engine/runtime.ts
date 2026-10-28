@@ -1,13 +1,16 @@
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getFunctionName, type FunctionLike, type FunctionType } from "../api";
-import type { ComponentDefinition, ComponentsDefinition, MountOptions } from "../components";
+import { functionPathSymbol, getFunctionName, isFunctionHandle, type FunctionLike, type FunctionType } from "../api";
+import type { ComponentDefinition, ComponentRoute, ComponentsDefinition, MountOptions } from "../components";
+import { parseCron } from "../cron";
 import type { SchemaDefinition } from "../schema";
-import { isRegisteredFunction, type CronJob, type HttpRouter, type RegisteredFunction, type UserIdentity } from "../server";
+import { isRegisteredFunction, type CronJob, type HttpAction, type HttpRouter, type RegisteredFunction, type UserIdentity } from "../server";
 import { ConvexError, describeValue, isPlainObject, validate, type AnyValidator } from "../values";
 import { buildCatalog, TableScope, tableMount, validatesTable, type Catalog } from "./catalog";
 import { CronRunner } from "./crons";
+import { BACKFILL_BATCH, backfilled, coalesce, hookState, readProgress, writeProgress, type HookProgress, type ResolvedHook } from "./hooks";
 import { applySchema, DatabaseImpl, OnebaseError, readerView, writerView, type ReadSet, type VectorSearchQuery, type Write } from "./database";
 import { isIdForTable, newId } from "./dialect";
 import { savepoint, SerialQueue, type Driver, type Exec } from "./driver";
@@ -64,6 +67,11 @@ export type MountRuntime = {
   scope: TableScope;
   /** The component's function objects → their names in this mount ("components/limiter:limit"). */
   names: Map<RegisteredFunction, string>;
+  /** App tables this mount follows. */
+  hooks: ResolvedHook[];
+  /** HTTP routes, served under `httpPrefix` (null: not served). */
+  routes: ComponentRoute[];
+  httpPrefix: string | null;
 };
 
 /** Who is calling: the app (null), a component, or the system (scheduler, crons, dashboard), which may call anything. */
@@ -79,6 +87,8 @@ type PreparedCode = {
   componentFunctions: Map<string, { mount: MountRuntime; internal: boolean }>;
   mounts: Map<string, MountRuntime>;
   catalog: Catalog | null;
+  /** crons.ts's jobs and every mount's. */
+  crons: CronJob[];
   auth: AuthService | null;
   authenticate: Authenticate | null;
 };
@@ -151,6 +161,8 @@ type TxState = {
   afterCommit: (() => Promise<void> | void)[];
   /** Auth sessions ended in this transaction; connections using them are signed out after commit. */
   revoked: string[];
+  /** Per table hook: how many of `writes` it has been given. */
+  hookCursors: Map<string, number>;
 };
 
 /** Commit broadcasts above this size only list the tables (Postgres NOTIFY caps payloads at 8000 bytes). */
@@ -199,6 +211,8 @@ export class Runtime {
   private heartbeat: ReturnType<typeof setInterval> | null = null;
   private lastCreationTime = 0;
   private readonly warnedQueries = new Set<string>();
+  /** Signs function handles; loaded from the database by init(). */
+  private handleKey: Buffer | null = null;
   private stopped = false;
 
   constructor(opts: RuntimeOptions) {
@@ -228,6 +242,7 @@ export class Runtime {
    */
   async init(): Promise<{ created: string[]; dropped: string[] }> {
     await this.driver.init();
+    this.handleKey = await this.loadHandleKey();
     let applied: { result: { created: string[]; dropped: string[] }; warnings: string[] } | null = null;
     while (!applied) {
       const stored = this.loadCode ? await this.driver.read((tx) => activeDeployment(tx)) : null;
@@ -254,7 +269,20 @@ export class Runtime {
       // A deploy that committed before we were listening was never announced to us.
       await this.syncDeployment();
     }
+    this.startBackfills();
     return applied.result;
+  }
+
+  /** The key function handles are signed with: one per database, so handles work on every instance and after restarts. */
+  private async loadHandleKey(): Promise<Buffer> {
+    const value = await this.driver.write(async (tx) => {
+      // Keeps the stored key if there is one (another instance may have just written it).
+      await tx.run(`INSERT INTO _meta ("key", value) VALUES ('handles', ?) ON CONFLICT("key") DO UPDATE SET value = _meta.value`, [
+        randomBytes(32).toString("base64"),
+      ]);
+      return (await tx.get(`SELECT value FROM _meta WHERE "key" = 'handles'`))!.value as string;
+    });
+    return Buffer.from(value, "base64");
   }
 
   /** Startup's index update and document check, unless the active deployment is no longer `expected`. */
@@ -355,7 +383,18 @@ export class Runtime {
       }
     }
     for (const [name, m] of Object.entries(code.components?.mounts ?? {})) {
-      const mount: MountRuntime = { name, definition: m.definition, config: m.config, options: m.options ?? {}, scope: TableScope.component(name), names: new Map() };
+      const mount: MountRuntime = {
+        name,
+        definition: m.definition,
+        config: m.config,
+        options: m.options ?? {},
+        scope: TableScope.component(name),
+        names: new Map(),
+        hooks: [],
+        routes: m.definition.http?.(m.config) ?? [],
+        httpPrefix: m.options?.httpPrefix === false ? null : (m.options?.httpPrefix ?? `/${name}`),
+      };
+      const exposed = new Set((m.options?.expose ?? []).map(String));
       const walk = (tree: Record<string, unknown>, path: string[]) => {
         for (const [key, value] of Object.entries(tree)) {
           if (!isRegisteredFunction(value)) {
@@ -363,15 +402,20 @@ export class Runtime {
             continue;
           }
           const fullName = `components/${[name, ...path].join("/")}:${key}`;
-          // Not callable by clients: the app decides what to offer them.
-          functions.set(fullName, { ...value, visibility: "internal" });
+          // Clients reach only what the app exposed; everything else goes through the app's functions.
+          functions.set(fullName, { ...value, visibility: exposed.has([...path, key].join(".")) ? "public" : "internal" });
           componentFunctions.set(fullName, { mount, internal: value.visibility === "internal" });
           mount.names.set(value, fullName);
         }
       };
       walk(m.definition.functions, []);
+      mount.hooks = this.resolveHooks(mount, code.schema, functions);
+      if (mount.httpPrefix && /^\/(api|_admin|_onebase)(\/|$)/.test(mount.httpPrefix)) {
+        throw new OnebaseError(`Component "${name}": httpPrefix "${mount.httpPrefix}" is taken by onebase itself; pick another.`);
+      }
       mounts.set(name, mount);
     }
+    const crons = [...code.crons, ...[...mounts.values()].flatMap((mount) => this.componentCrons(mount))];
     const catalog = buildCatalog(code.schema, [...mounts.values()].map((m) => ({ mount: m.name, schema: m.definition.schema })));
     return {
       code,
@@ -379,9 +423,80 @@ export class Runtime {
       componentFunctions,
       mounts,
       catalog,
+      crons,
       auth: code.auth?.methods?.length ? new AuthService(this, code.auth) : null,
       authenticate: this.customAuthenticate ?? (code.auth ? createAuthenticate(code.auth) : null),
     };
+  }
+
+  /** A mount's cron jobs, named "components/<mount>/<name>" so they can't clash with the app's. */
+  private componentCrons(mount: MountRuntime): CronJob[] {
+    const where = `Component "${mount.name}" (${mount.definition.name})`;
+    return (mount.definition.crons?.(mount.config) ?? []).map((cron) => {
+      if (typeof cron?.name !== "string" || !/^[A-Za-z0-9_.-]+$/.test(cron.name)) throw new OnebaseError(`${where}: cron jobs need a name (letters, digits, _ . -).`);
+      const fn = mount.names.get(cron.fn);
+      if (!fn) throw new OnebaseError(`${where}: cron "${cron.name}" must run one of the component's own functions.`);
+      let schedule: CronJob["schedule"];
+      if (typeof cron.schedule === "string") {
+        parseCron(cron.schedule);
+        schedule = { type: "cron", expression: cron.schedule };
+      } else {
+        const ms = ((cron.schedule?.hours ?? 0) * 3600 + (cron.schedule?.minutes ?? 0) * 60 + (cron.schedule?.seconds ?? 0)) * 1000;
+        if (!(ms >= 1000)) throw new OnebaseError(`${where}: cron "${cron.name}" needs an interval of at least 1 second, e.g. { minutes: 5 }.`);
+        schedule = { type: "interval", ms };
+      }
+      return { name: `components/${mount.name}/${cron.name}`, schedule, fn, args: cron.args ?? {} };
+    });
+  }
+
+  /**
+   * The handler for an HTTP request: an http.ts route first, then a component's route under its
+   * prefix (so the app can always override one).
+   */
+  lookupHttp(method: string, pathname: string): { handler: HttpAction; mount: MountRuntime | null } | null {
+    const own = this.http?.lookup(method, pathname);
+    if (own) return { handler: own, mount: null };
+    for (const mount of this.mounts.values()) {
+      const prefix = mount.httpPrefix;
+      if (!prefix || !mount.routes.length || (pathname !== prefix && !pathname.startsWith(prefix + "/"))) continue;
+      const rest = pathname.slice(prefix.length) || "/";
+      const exact = mount.routes.find((r) => r.method === method && r.path === rest);
+      const prefixed = mount.routes
+        .filter((r) => r.method === method && r.pathPrefix && rest.startsWith(r.pathPrefix))
+        .sort((a, b) => b.pathPrefix!.length - a.pathPrefix!.length)[0];
+      const route = exact ?? prefixed;
+      if (route) return { handler: route.handler, mount };
+    }
+    return null;
+  }
+
+  /** A mount's table hooks, checked: they follow app tables and run the component's own functions. */
+  private resolveHooks(mount: MountRuntime, schema: SchemaDefinition<any> | null, functions: Map<string, RegisteredFunction>): ResolvedHook[] {
+    const where = `Component "${mount.name}" (${mount.definition.name})`;
+    const own = (fn: RegisteredFunction | undefined, what: string) => {
+      const name = fn && mount.names.get(fn);
+      if (!name || fn!.type !== "mutation") throw new OnebaseError(`${where}: a table hook's ${what} must be one of its own mutations, listed in its functions.`);
+      return { name, fn: functions.get(name)! };
+    };
+    const hooks: ResolvedHook[] = [];
+    for (const hook of mount.definition.hooks?.(mount.config) ?? []) {
+      if (typeof hook?.table !== "string" || !/^[A-Za-z][A-Za-z0-9_]*$/.test(hook.table)) {
+        throw new OnebaseError(`${where}: a table hook needs the name of an app table.`);
+      }
+      if (schema && !(hook.table in schema.tables)) {
+        throw new OnebaseError(`${where} follows table "${hook.table}", which isn't in schema.ts. Known tables: ${Object.keys(schema.tables).join(", ") || "(none)"}.`);
+      }
+      if (hooks.some((h) => h.table === hook.table)) throw new OnebaseError(`${where} has two hooks on "${hook.table}".`);
+      hooks.push({
+        mount: mount.name,
+        table: hook.table,
+        key: `hook:${mount.name}:${hook.table}`,
+        onChange: own(hook.onChange, "onChange"),
+        reset: hook.reset ? own(hook.reset, "reset") : null,
+        fingerprint: hook.fingerprint ?? "",
+      });
+    }
+    return hooks;
   }
 
   private setCode(prepared: PreparedCode, deployment: Deployment | null) {
@@ -394,7 +509,7 @@ export class Runtime {
     this.http = prepared.code.http;
     this.auth = prepared.auth;
     this.authenticate = prepared.authenticate;
-    this.crons = prepared.code.crons;
+    this.crons = prepared.crons;
     this.functions.clear();
     for (const [name, fn] of prepared.functions) this.functions.set(name, fn);
     this.deployment = deployment;
@@ -412,6 +527,7 @@ export class Runtime {
       await this.startCrons();
       this.pokeScheduler();
     }
+    this.startBackfills();
     await Promise.all(this.deployListeners.map((l) => l()));
   }
 
@@ -722,6 +838,10 @@ export class Runtime {
     caller: Caller = null,
   ): { name: string; fn: RegisteredFunction; mount: MountRuntime | null } {
     const name = this.functionName(ref, caller);
+    // A handle is a capability the app handed out: whoever holds it may call that function, but only
+    // from server code (a client never calls through one).
+    const viaHandle = isFunctionHandle(ref);
+    if (viaHandle && !allowInternal) throw new OnebaseError("Function handles can only be called from other functions.");
     const fn = this.functions.get(name);
     if (!fn) {
       const [mod] = name.split(":");
@@ -739,7 +859,7 @@ export class Runtime {
     }
     const info = this.componentFunctions.get(name);
     const target = info?.mount ?? null;
-    if (caller !== "system" && caller !== target) {
+    if (!viaHandle && caller !== "system" && caller !== target) {
       if (caller) {
         throw new OnebaseError(
           target
@@ -752,8 +872,30 @@ export class Runtime {
     return { name, fn, mount: target };
   }
 
+  private handleSignature(name: string): string {
+    if (!this.handleKey) throw new OnebaseError("Function handles work once the runtime has started (init()).");
+    return createHmac("sha256", this.handleKey).update(name).digest("base64url").slice(0, 22);
+  }
+
+  /** A signed handle to a function `caller` may call: anyone holding it can then call that function. */
+  createHandle(ref: unknown, caller: Caller): string {
+    const { name } = this.resolve(ref as FunctionLike, null, true, caller);
+    return `function://${name}#${this.handleSignature(name)}`;
+  }
+
+  /** The function a handle names, if its signature is right. */
+  private handleName(handle: string): string {
+    const [name, signature] = handle.slice("function://".length).split("#");
+    const expected = name ? Buffer.from(this.handleSignature(name)) : null;
+    if (!expected || !signature || signature.length !== expected.length || !timingSafeEqual(Buffer.from(signature), expected)) {
+      throw new OnebaseError("Invalid function handle: make handles with createFunctionHandle() rather than by hand.");
+    }
+    return name!;
+  }
+
   /** A component names its own functions by passing the function itself. */
   private functionName(ref: FunctionLike | RegisteredFunction, caller: Caller): string {
+    if (isFunctionHandle(ref)) return this.handleName(ref);
     if (!isRegisteredFunction(ref)) return getFunctionName(ref);
     const name = caller && caller !== "system" ? caller.names.get(ref) : undefined;
     if (!name) {
@@ -838,7 +980,15 @@ export class Runtime {
       runAfter: (delayMs: number, ref: FunctionLike, args?: unknown) => schedule(Date.now() + Math.max(0, delayMs), ref, args),
       runAt: (ts: number | Date, ref: FunctionLike, args?: unknown) => schedule(ts instanceof Date ? ts.getTime() : ts, ref, args),
       cancel: async (id: string) => {
-        const cancel = (tx: Exec) => tx.run("UPDATE _scheduled SET state = 'canceled' WHERE id = ? AND state = 'pending'", [id]);
+        const cancel = async (tx: Exec) => {
+          // A component cancels only its own jobs.
+          if (caller) {
+            const job = await tx.get("SELECT fn FROM _scheduled WHERE id = ?", [id]);
+            const own = `components/${caller.name}`;
+            if (!job || !(job.fn.startsWith(own + ":") || job.fn.startsWith(own + "/"))) return;
+          }
+          await tx.run("UPDATE _scheduled SET state = 'canceled' WHERE id = ? AND state = 'pending'", [id]);
+        };
         if (state) await cancel(state.tx);
         else await this.withWriter(cancel);
       },
@@ -914,35 +1064,49 @@ export class Runtime {
   }
 
   /** What a component's functions get besides their database. */
-  private componentBase(mount: MountRuntime, identity: UserIdentity | null) {
-    return { auth: this.authFor(identity), config: mount.config, component: { mount: mount.name } };
+  private componentBase(mount: MountRuntime, identity: UserIdentity | null, tx: Exec | null) {
+    const status = async (table?: string) => {
+      const hook = table === undefined ? mount.hooks[0] : mount.hooks.find((h) => h.table === table);
+      if (!hook) throw new OnebaseError(`Component "${mount.name}" has no table hook${table === undefined ? "" : ` on "${table}"`}.`);
+      const progress = tx ? await readProgress(tx, hook.key) : await this.withReader((t) => readProgress(t, hook.key));
+      const state = hookState(progress, hook.fingerprint);
+      return { table: hook.table, state, ready: state === "ready" };
+    };
+    return { auth: this.authFor(identity), config: mount.config, component: { mount: mount.name }, hooks: { status } };
   }
 
-  private queryCtx(db: DatabaseImpl, identity: UserIdentity | null, mount: MountRuntime | null = null): any {
+  /**
+   * `state` is set for a query run inside a mutation: before the app calls into a component, the
+   * component's table hooks get the mutation's writes so far, so it reads its own data up to date.
+   */
+  private queryCtx(db: DatabaseImpl, identity: UserIdentity | null, mount: MountRuntime | null = null, state: TxState | null = null): any {
     const id = this.identityFor(mount, identity);
     // Nested queries read in the same snapshot and into the same read set, so they stay reactive.
-    const runQuery = (ref: FunctionLike, args?: unknown) => {
+    const runQuery = async (ref: FunctionLike, args?: unknown) => {
       const { name, fn, mount: target } = this.resolve(ref, "query", true, mount);
-      return this.invoke(name, fn, this.queryCtx(db, id, target), args);
+      if (state && target && target !== mount) await this.flushHooks(state, target);
+      return this.invoke(name, fn, this.queryCtx(db, id, target, state), args);
     };
     const scoped = readerView(db.withScope(mount?.scope ?? TableScope.app));
-    if (mount) return { db: scoped, ...this.componentBase(mount, id), runQuery };
+    if (mount) return { db: scoped, ...this.componentBase(mount, id, db.tx), runQuery };
     return { db: scoped, auth: this.authFor(id), storage: this.storageReader(db.tx), runQuery, components: this.componentsProxy("query", { runQuery }) };
   }
 
   private mutationCtx(state: TxState, identity: UserIdentity | null, mount: MountRuntime | null = null): any {
     const id = this.identityFor(mount, identity);
-    const runQuery = (ref: FunctionLike, args?: unknown) => {
+    const runQuery = async (ref: FunctionLike, args?: unknown) => {
       const { name, fn, mount: target } = this.resolve(ref, "query", true, mount);
-      return this.invoke(name, fn, this.queryCtx(state.db, id, target), args);
+      if (target && target !== mount) await this.flushHooks(state, target);
+      return this.invoke(name, fn, this.queryCtx(state.db, id, target, state), args);
     };
-    const runMutation = (ref: FunctionLike, args?: unknown) => {
+    const runMutation = async (ref: FunctionLike, args?: unknown) => {
       const { name, fn, mount: target } = this.resolve(ref, "mutation", true, mount);
+      if (target && target !== mount) await this.flushHooks(state, target);
       return this.nestedMutation(state, name, fn, id, target, args);
     };
     const db = writerView(state.db.withScope(mount?.scope ?? TableScope.app));
     const scheduler = this.schedulerFor(state, mount);
-    if (mount) return { db, ...this.componentBase(mount, id), scheduler, runQuery, runMutation };
+    if (mount) return { db, ...this.componentBase(mount, id, state.tx), scheduler, runQuery, runMutation };
     return {
       db,
       auth: this.authFor(id),
@@ -963,7 +1127,36 @@ export class Runtime {
     } catch (err) {
       state.writes.length = mark;
       state.afterCommit.length = commitMark;
+      // Hooks that saw writes now rolled back saw them inside this savepoint, so their own writes went too.
+      for (const [key, cursor] of state.hookCursors) if (cursor > mark) state.hookCursors.set(key, mark);
       throw err;
+    }
+  }
+
+  /**
+   * Gives table hooks the writes they haven't seen, coalesced per document, in a savepoint of the
+   * writing transaction (`only`: just one mount's). Documents the backfill hasn't reached yet are
+   * left out: it will read their current state. A hook that throws fails the call.
+   */
+  private async flushHooks(state: TxState, only?: MountRuntime) {
+    for (const mount of only ? [only] : this.mounts.values()) {
+      for (const hook of mount.hooks) {
+        const from = state.hookCursors.get(hook.key) ?? 0;
+        const to = state.writes.length;
+        if (from >= to) continue;
+        state.hookCursors.set(hook.key, to);
+        const writes = state.writes.slice(from, to).filter((w) => w.table === hook.table);
+        if (!writes.length) continue;
+        const progress = await readProgress(state.tx, hook.key);
+        const changes = coalesce(writes).filter((c) => backfilled(progress, hook.fingerprint, c));
+        if (!changes.length) continue;
+        try {
+          await this.nestedMutation(state, hook.onChange.name, hook.onChange.fn, null, mount, { changes });
+        } catch (err) {
+          state.hookCursors.set(hook.key, from);
+          throw err;
+        }
+      }
     }
   }
 
@@ -976,7 +1169,7 @@ export class Runtime {
     const vectorSearch = (table: string, index: string, query: VectorSearchQuery) =>
       this.driver.read((tx) => this.newDb(tx, {}, mount?.scope).vectorSearch(table, index, query));
     const ctx: Record<string, unknown> = mount
-      ? { ...this.componentBase(mount, id), scheduler: this.schedulerFor(null, mount), runQuery, runMutation, runAction, vectorSearch }
+      ? { ...this.componentBase(mount, id, null), scheduler: this.schedulerFor(null, mount), runQuery, runMutation, runAction, vectorSearch }
       : {
           auth: this.authFor(id),
           storage: this.storageForActions(),
@@ -995,6 +1188,23 @@ export class Runtime {
       },
     });
     return ctx;
+  }
+
+  /**
+   * Function references in a component call's arguments (`{ fn: internal.emails.send }`) become
+   * signed handles, so the component can call them back or schedule them.
+   */
+  private referencesToHandles(args: unknown): unknown {
+    if (!isPlainObject(args)) return args;
+    const out: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(args)) {
+      let path: unknown;
+      try {
+        path = typeof value === "object" && value !== null ? (value as any)[functionPathSymbol] : undefined;
+      } catch {}
+      out[key] = typeof path === "string" ? this.createHandle(value, null) : value;
+    }
+    return out;
   }
 
   /**
@@ -1023,7 +1233,7 @@ export class Runtime {
               );
             }
             const name = mount.names.get(value)!;
-            return (args?: unknown) => call(name, args);
+            return (args?: unknown) => call(name, this.referencesToHandles(args));
           },
         },
       );
@@ -1042,14 +1252,24 @@ export class Runtime {
 
   private async invoke(name: string, fn: RegisteredFunction, ctx: unknown, args: unknown) {
     const checked = this.checkArgs(name, fn, args);
-    const result = await currentFunction.run({ type: fn.type, name }, () => fn.handler(ctx, checked));
+    const caller = this.componentFunctions.get(name)?.mount ?? null;
+    const handle = (ref: unknown) => this.createHandle(ref, caller);
+    const result = await currentFunction.run({ type: fn.type, name, handle }, () => fn.handler(ctx, checked));
     return this.checkReturn(name, fn, result);
   }
 
   /** Runs an http.ts route handler. */
-  async runHttpAction(handler: (ctx: any, request: Request) => Promise<Response> | Response, request: Request, identity: UserIdentity | null) {
+  async runHttpAction(
+    handler: (ctx: any, request: Request) => Promise<Response> | Response,
+    request: Request,
+    identity: UserIdentity | null,
+    mount: MountRuntime | null = null,
+  ) {
     const name = `${request.method} ${new URL(request.url).pathname}`;
-    return this.calls.track(name, "http", "http", () => currentFunction.run({ type: "action", name }, async () => handler(this.actionCtx(identity), request)));
+    const handle = (ref: unknown) => this.createHandle(ref, mount);
+    return this.calls.track(name, "http", "http", () =>
+      currentFunction.run({ type: "action", name, handle }, async () => handler(this.actionCtx(identity, mount), request)),
+    );
   }
 
   // ---- Entry points ----
@@ -1094,9 +1314,11 @@ export class Runtime {
     const { value, writes, scheduled, afterCommit, revoked } = await this.mutations.run(() =>
       // The driver may run this more than once if another instance conflicts; each attempt starts fresh.
       this.driver.write(async (tx) => {
-        const state: TxState = { tx, db: undefined as any, writes: [], scheduled: false, afterCommit: [], revoked: [] };
+        const state: TxState = { tx, db: undefined as any, writes: [], scheduled: false, afterCommit: [], revoked: [], hookCursors: new Map() };
         state.db = this.newDb(tx, { writes: state.writes }, scope);
         const value = await body(state);
+        // Nothing commits before every table hook has seen every write.
+        await this.flushHooks(state);
         if (this.driver.shared && this.driver.publish && (state.writes.length || state.scheduled || state.revoked.length)) {
           for (const message of this.broadcastMessages(state)) await this.driver.publish(tx, message);
         }
@@ -1161,6 +1383,71 @@ export class Runtime {
     if (fn.type === "query") return (await this.runQuery(ref, args, opts)).value;
     if (fn.type === "mutation") return this.runMutation(ref, args, opts);
     return this.runAction(ref, args, opts);
+  }
+
+  // ---- Table hook backfills ----
+
+  private backfills: Promise<void> = Promise.resolve();
+
+  /** Resolves once every table hook has caught up with the documents written before it existed. */
+  hooksReady(): Promise<void> {
+    return this.backfills;
+  }
+
+  /** Feeds existing documents to new (or changed) table hooks, in batches queued with mutations. */
+  private startBackfills() {
+    const hooks = [...this.mounts.values()].flatMap((mount) => mount.hooks.map((hook) => ({ mount, hook })));
+    this.backfills = this.backfills.then(async () => {
+      if (this.stopped) return;
+      await this.withWriter(async (tx) => {
+        const keep = new Set(hooks.map((h) => h.hook.key));
+        for (const row of await tx.all(`SELECT "key" FROM _meta WHERE "key" LIKE 'hook:%'`)) {
+          if (!keep.has(row.key as string)) await tx.run(`DELETE FROM _meta WHERE "key" = ?`, [row.key]);
+        }
+      });
+      for (const { mount, hook } of hooks) {
+        try {
+          while (!this.stopped && !(await this.transact((state) => this.backfillStep(state, mount, hook)))) {}
+        } catch (err) {
+          this.log.error(`Component "${mount.name}" couldn't catch up with table "${hook.table}": ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    }).catch((err) => this.log.error(`Table hooks: ${err instanceof Error ? err.message : String(err)}`));
+  }
+
+  /** One batch of a hook's backfill; true once it has caught up. */
+  private async backfillStep(state: TxState, mount: MountRuntime, hook: ResolvedHook): Promise<boolean> {
+    let progress = await readProgress(state.tx, hook.key);
+    if (progress?.fingerprint === hook.fingerprint && progress.state === "ready") return true;
+    if (!progress || progress.fingerprint !== hook.fingerprint) {
+      progress = { fingerprint: hook.fingerprint, state: hook.reset ? "resetting" : "backfilling", cursor: null };
+    }
+    if (progress.state === "resetting") {
+      const result = (await this.nestedMutation(state, hook.reset!.name, hook.reset!.fn, null, mount, {})) as { done?: boolean } | null;
+      if (result?.done) progress = { ...progress, state: "backfilling" };
+      await writeProgress(state.tx, hook.key, progress);
+      return false;
+    }
+    const d = this.driver.dialect;
+    const rows = await state.tx.all(
+      `SELECT id, ct, doc FROM documents WHERE tbl = ? AND (ct, id) > (${d.placeholder("ct")}, ${d.placeholder("id")}) ORDER BY ct, id LIMIT ${BACKFILL_BATCH}`,
+      [hook.table, ...(progress.cursor ?? [-1, ""])],
+    );
+    const changes = rows.map((row) => ({
+      op: "insert",
+      id: row.id,
+      before: null,
+      after: { _id: row.id, _creationTime: Number(row.ct), ...d.parseDoc(row.doc) },
+    }));
+    if (changes.length) await this.nestedMutation(state, hook.onChange.name, hook.onChange.fn, null, mount, { changes });
+    const last = rows[rows.length - 1];
+    const next: HookProgress = {
+      fingerprint: hook.fingerprint,
+      state: rows.length < BACKFILL_BATCH ? "ready" : "backfilling",
+      cursor: last ? [Number(last.ct), last.id as string] : progress.cursor,
+    };
+    await writeProgress(state.tx, hook.key, next);
+    return next.state === "ready";
   }
 
   // ---- Scheduler ----

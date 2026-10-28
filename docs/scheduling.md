@@ -37,6 +37,8 @@ export const requestSummary = mutation({
 });
 ```
 
+Scheduled functions all start when they're due and aren't retried. For many jobs at once, a limit on how many run together, retries or a callback when each finishes, use the [work queue](./work-queue.md).
+
 ## Cron jobs
 
 Declare recurring jobs in `onebase/crons.ts`:

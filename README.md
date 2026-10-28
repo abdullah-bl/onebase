@@ -7,7 +7,7 @@ A lightweight, Convex-style reactive backend: TypeScript functions, a typed docu
 - **Convex-shaped API:** `query`, `mutation`, `action`, `v.*`, `ctx.db`, `api.module.fn`, `useQuery`. Code and LLM knowledge carry over.
 - **Forgiving and explicit:** errors say how to fix the problem, indexes are picked automatically for filters, and `onebase doctor` checks your project.
 - **Batteries included:** sign-in with passwords and OAuth, full-text search, optimistic updates, scheduler, cron jobs, file storage, JWT auth (Clerk, Auth0, any OIDC), HTTP routes and pagination.
-- **Components:** mount packages with their own tables, like the built-in rate limiter, and call them as `ctx.components.limiter.limit({ ... })`, in your transaction.
+- **Components:** mount packages with their own tables, like the built-in rate limiter, aggregate (counts, sums and ranks in O(log n)), sharded counter and work queue, and call them as `ctx.components.limiter.limit({ ... })`, in your transaction. Components can follow your tables through table hooks, with no triggers to wire up.
 - **Dashboard built in** at `/_admin`: browse and edit data, run functions, live logs, jobs and files.
 - **Your choice of database:** SQLite by default; Postgres, MySQL or Turso (libSQL) when you need several instances. Files on disk or in S3/R2/MinIO, and SQLite backups to S3.
 - **Single file deploy**, PocketBase style.

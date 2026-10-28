@@ -140,6 +140,7 @@ Renaming a mount is like removing one and adding another: the new name starts wi
 | [Rate limiter](./rate-limiter.md) | `onebase/components/rate-limiter` | Token bucket and fixed window limits per key, stored in the database |
 | [Aggregate](./aggregate.md) | `onebase/components/aggregate` | Counts, sums, ranks and the n-th item over a table in O(log n), kept in step with it |
 | [Sharded counter](./sharded-counter.md) | `onebase/components/sharded-counter` | Counters that many writers can bump at once |
+| [Work queue](./work-queue.md) | `onebase/components/work-queue` | Background actions and mutations with limited parallelism, retries and completion callbacks |
 
 To write your own, see [Writing components](./components-authoring.md).
 

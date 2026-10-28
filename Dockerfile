@@ -1,6 +1,6 @@
 # Build the single-file onebase binary, then ship it in a slim image.
 # The binary targets the platform the image is built for (amd64 or arm64).
-FROM oven/bun:1.4.2 AS build
+FROM oven/bun:1.4.4 AS build
 WORKDIR /src
 COPY package.json bun.lock tsconfig.json ./
 RUN bun install --frozen-lockfile

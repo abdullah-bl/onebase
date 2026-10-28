@@ -107,6 +107,9 @@ const OPTIMIZE_EVERY_WRITES = 1000;
 
 /** The vector functions libSQL has built in, so vector indexes use the same SQL on both. */
 function addVectorFunctions(db: Database) {
+  if (typeof db.function !== "function") {
+    throw new Error(`onebase needs Bun 1.4.4 or newer for SQLite (this is Bun ${Bun.version}). Run \`bun upgrade\`.`);
+  }
   db.function("vector32", { deterministic: true }, vector32);
   db.function("vector_distance_cos", { deterministic: true }, vectorDistanceCos);
 }

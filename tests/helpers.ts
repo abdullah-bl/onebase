@@ -25,7 +25,13 @@ export async function openRuntime(make: () => Driver, opts: Omit<RuntimeOptions,
     });
   }
   const runtime = new Runtime({ driver, log: quiet, ...opts });
-  await runtime.init();
+  try {
+    await runtime.init();
+  } catch (err) {
+    // Close the pool, or one failing test leaves connections open and the rest hit "too many clients".
+    await driver.close();
+    throw err;
+  }
   return { driver, runtime };
 }
 

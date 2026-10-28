@@ -32,6 +32,9 @@
     "site": "bun site/build.ts",
     "build:assets": "bun scripts/build-client.ts && bun scripts/build-dashboard.ts"
   },
+  "engines": {
+    "bun": ">=1.4.4"
+  },
   "private": true,
   "devDependencies": {
     "@types/bun": "latest",

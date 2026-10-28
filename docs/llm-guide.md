@@ -236,6 +236,7 @@ await ctx.components.limiter.limit({ name: "send", key: userId, throws: true });
 - Your `ctx.db` can't see component tables (stored as `limiter.rateLimits`), and components can't see yours. Pass ids as strings.
 - Clients can't call components directly: wrap them in your own query or mutation.
 - Components get `ctx.auth` only when mounted with `auth: true`.
+- Counts, sums and ranks over a table: mount `aggregate({ table: "scores", sortKey: (d: Doc<"scores">) => d.points })` from `onebase/components/aggregate` (it follows the table by itself), then `ctx.components.leaderboard.count()`, `.sum()`, `.indexOf({ key, order: "desc" })`, `.at({ index })`. Don't count with `.collect().length` on large tables.
 
 ## Differences from Convex
 

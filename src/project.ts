@@ -6,6 +6,7 @@ import { join, relative, resolve } from "node:path";
 import * as auth from "./auth";
 import * as components from "./components";
 import type { ComponentsDefinition } from "./components";
+import * as aggregate from "./components/aggregate";
 import * as rateLimiter from "./components/rate-limiter";
 import type { AuthConfig } from "./engine/jwt";
 import type { Modules } from "./engine/runtime";
@@ -31,7 +32,7 @@ export type Project = {
 const SPECIAL = new Set(["schema", "auth.config", "components"]);
 
 /** The components that ship with onebase, importable as onebase/components/<name>. */
-export const BUILT_IN_COMPONENTS: Record<string, Record<string, unknown>> = { "rate-limiter": rateLimiter };
+export const BUILT_IN_COMPONENTS: Record<string, Record<string, unknown>> = { aggregate, "rate-limiter": rateLimiter };
 
 let registered = false;
 

@@ -15,6 +15,7 @@ Convex has components too. onebase's are used differently:
 | Call | `ctx.runMutation(components.limiter.lib.limit, args)`, usually through a wrapper class | `ctx.components.limiter.limit(args)`, typed from what you mounted |
 | Caller's identity | Never visible to components | Visible when you mount with `auth: true` |
 | Configuration | Passed on every call or to a wrapper class | Given once, when mounting |
+| Following a table | You add triggers to every write yourself | Table hooks: the component gets every change, in the same transaction |
 
 ## Mount a component
 
@@ -65,6 +66,15 @@ Each mount has its own tables. They are stored as `<mount>.<table>` (for example
 
 Isolation keeps components' data apart. It isn't a sandbox: components are npm packages running in your process, so install ones you trust.
 
+## Table hooks
+
+A component can follow one of your tables. The [aggregate](./aggregate.md) does: mounted with `table: "scores"`, it gets every insert, patch, replace and delete on `scores`, from any mutation, dashboard edits and sign-ups included.
+
+- **Same transaction:** the component gets the changes in the transaction that wrote them, before the transaction commits. If it fails, the write fails with it.
+- **Up to date:** if your mutation calls the component after writing, the component already has those writes.
+- **One change per document:** several writes to one document in a transaction arrive as one change. A document inserted and deleted in the same transaction never reaches the component.
+- **Existing documents:** documents written before the component was mounted are fed to it in the background, 200 per transaction. The component reports when it has caught up (the aggregate's `status()`).
+
 ## The caller's identity
 
 By default a component's `ctx.auth.getUserIdentity()` returns null. The app checks who the caller is and passes the component what it needs, such as a user id as a `key`. To let a component see the identity itself, mount it with `auth: true`:
@@ -95,6 +105,7 @@ Renaming a mount is like removing one and adding another: the new name starts wi
 | Component | Import | |
 |---|---|---|
 | [Rate limiter](./rate-limiter.md) | `onebase/components/rate-limiter` | Token bucket and fixed window limits per key, stored in the database |
+| [Aggregate](./aggregate.md) | `onebase/components/aggregate` | Counts, sums, ranks and the n-th item over a table in O(log n), kept in step with it |
 
 To write your own, see [Writing components](./components-authoring.md).
 

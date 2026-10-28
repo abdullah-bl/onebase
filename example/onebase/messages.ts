@@ -42,6 +42,12 @@ export const search = query({
   },
 });
 
+/** How many messages a channel has: a few document reads, however many there are. */
+export const count = query({
+  args: { channel: v.id("channels") },
+  handler: async (ctx, { channel }) => await ctx.components.messageCounts.count({ namespace: channel }),
+});
+
 export const generateUploadUrl = mutation({
   args: {},
   handler: async (ctx) => await ctx.storage.generateUploadUrl(),

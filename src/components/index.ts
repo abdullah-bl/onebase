@@ -5,6 +5,7 @@
 import type { FunctionType } from "../api";
 import { MOUNT_NAME } from "../engine/catalog";
 import type { GenericDataModel, SchemaDefinition } from "../schema";
+import { v } from "../values";
 import {
   functionBuilder,
   isRegisteredFunction,
@@ -104,7 +105,16 @@ type ComponentBase<Config> = {
   component: { mount: string };
   /** The caller's identity if the app mounted the component with `auth: true`; otherwise always null. */
   auth: Auth;
+  /** Where the component's table hooks stand. */
+  hooks: { status(table?: string): Promise<HookStatus> };
 };
+
+/**
+ * "ready": every document of the table has reached the hook. "backfilling": documents written
+ * before the hook existed (or before its fingerprint changed) are still being fed to it.
+ * "resetting": the component is clearing what it derived before a rebuild.
+ */
+export type HookStatus = { table: string; state: "ready" | "backfilling" | "resetting"; ready: boolean };
 
 export type ComponentQueryCtx<DM, Config> = Pick<QueryCtx<DM>, "db"> & ComponentBase<Config> & { runQuery: OwnCall<"query"> };
 export type ComponentMutationCtx<DM, Config> = Pick<MutationCtx<DM>, "db"> &
@@ -139,6 +149,36 @@ export function componentServer<DM extends GenericDataModel, Config = {}>() {
   };
 }
 
+// ---- Table hooks ----
+
+/** One document's change, as a table hook receives it. Several writes to a document in one transaction arrive as one change. */
+export type TableChange<Doc = Record<string, any> & { _id: string; _creationTime: number }> =
+  | { op: "insert"; id: string; before: null; after: Doc }
+  | { op: "update"; id: string; before: Doc; after: Doc }
+  | { op: "delete"; id: string; before: Doc; after: null };
+
+/** The args a table hook's onChange mutation takes: `internalMutation({ args: tableChangesValidator, ... })`. */
+export const tableChangesValidator = {
+  changes: v.array(v.object({ op: v.string(), id: v.string(), before: v.any(), after: v.any() })),
+};
+
+/**
+ * Keeps a component in step with an app table: `onChange` gets every change to `table`, in the
+ * writing transaction, before the component is next called and before commit. Documents that
+ * existed before the hook are fed to it in batches (as inserts), after `reset` has cleared what
+ * the component derived earlier. Changing `fingerprint` (say, when the configuration changes)
+ * resets and rebuilds.
+ */
+export type TableHook = {
+  /** An app table (from schema.ts). */
+  table: string;
+  /** An internal mutation of the component, taking tableChangesValidator. */
+  onChange: RegisteredFunction<"mutation", "internal", any, any>;
+  /** An internal mutation that deletes some of the derived data and returns { done: true } once nothing is left. */
+  reset?: RegisteredFunction<"mutation", "internal", any, { done: boolean }>;
+  fingerprint?: string;
+};
+
 /** A component's functions: `{ limit, check }`, or nested like `{ lib: { limit } }`. */
 export type FunctionTree = { [name: string]: RegisteredFunction | FunctionTree };
 
@@ -149,6 +189,8 @@ export interface ComponentDefinition<S extends SchemaDefinition<any>, Config, Fn
   readonly schema: S;
   readonly functions: Fns;
   readonly checkConfig?: (config: Config) => void;
+  /** Table hooks for a mount, from its configuration. */
+  readonly hooks?: (config: Config) => TableHook[];
   /** Mounts this component with its configuration; components usually wrap this in a factory. */
   mount(config: Config, options?: MountOptions): Mount<ApiFromFunctions<Fns>>;
 }
@@ -162,6 +204,7 @@ export function defineComponent<S extends SchemaDefinition<any>, Config = {}, co
   schema: S;
   functions: Fns;
   checkConfig?: (config: Config) => void;
+  hooks?: (config: Config) => TableHook[];
 }): ComponentDefinition<S, Config, Fns> {
   if (typeof def?.name !== "string" || !def.name) throw new Error("defineComponent({ name }) needs a name.");
   if (!(def.schema as any)?.__isOnebaseSchema) throw new Error(`Component "${def.name}": schema must come from defineSchema({ ... }).`);
@@ -172,6 +215,7 @@ export function defineComponent<S extends SchemaDefinition<any>, Config = {}, co
     schema: def.schema,
     functions: def.functions,
     checkConfig: def.checkConfig,
+    hooks: def.hooks,
     mount(config, options = {}) {
       def.checkConfig?.(config);
       for (const key of Object.keys(options)) {

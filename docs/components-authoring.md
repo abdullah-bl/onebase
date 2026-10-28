@@ -68,8 +68,8 @@ The app mounts it with `counter: counter({ start: 0 })` and calls `ctx.component
 | `ctx.config` | The configuration the app mounted this copy with. It can hold functions, such as a callback that picks a field. |
 | `ctx.component.mount` | The name this copy is mounted under. |
 | `ctx.auth` | The caller's identity when mounted with `auth: true`, otherwise always null. |
-| `ctx.runQuery(fn, args)` / `ctx.runMutation(fn, args)` | Calls another of the component's functions. Pass the function itself (`ctx.runMutation(add, {...})`), since components don't have generated references. |
-| `ctx.scheduler.runAfter(ms, fn, args)` | Schedules one of the component's functions, the same way. |
+| `ctx.runQuery(fn, args)` / `ctx.runMutation(fn, args)` | Calls another of the component's functions. Pass the function itself (`ctx.runMutation(add, {...})`), since components don't have generated references. Also takes a [function handle](./components.md#function-handles) the app passed in, which can be one of the app's functions. |
+| `ctx.scheduler.runAfter(ms, fn, args)` | Schedules one of the component's functions or a handle, the same way. `ctx.scheduler.cancel(id)` cancels only the component's own jobs. |
 | `ctx.vectorSearch(...)` | In actions, over the component's tables. |
 | `ctx.hooks.status(table?)` | Whether a table hook has caught up with its table: `{ table, state, ready }`. |
 
@@ -116,6 +116,27 @@ How hooks run:
 - **Rebuilds:** a different `fingerprint` (typically derived from the configuration) resets and rebuilds.
 - **Progress:** `ctx.hooks.status(table)` returns `{ state, ready }`, so the component can report whether it has caught up.
 - **Validation:** the hooked table must be in the app's `schema.ts`. `onChange` and `reset` must be listed in the component's `functions`.
+
+## Cron jobs and HTTP routes
+
+```ts
+const { internalMutation, httpAction } = componentServer<DataModel, Config>();
+
+const cleanUp = internalMutation({ args: {}, handler: async (ctx) => { /* ... */ } });
+
+export const definition = defineComponent({
+  name: "sessions",
+  schema,
+  functions: { cleanUp /* , ... */ },
+  crons: (config) => [{ name: "cleanUp", schedule: { minutes: 10 }, fn: cleanUp }],
+  http: (config) => [
+    { path: "/webhook", method: "POST", handler: httpAction(async (ctx, request) => new Response("ok")) },
+  ],
+});
+```
+
+- **Cron schedules:** an interval (`{ seconds, minutes, hours }`, at least 1 second) or a cron expression (`"0 3 * * *"`, UTC). The job must run one of the component's own functions.
+- **HTTP routes:** take `path` or `pathPrefix`, relative to the mount's `httpPrefix`. Their `ctx` is the component's action ctx, so they reach the component's tables through `ctx.runQuery` and `ctx.runMutation`.
 
 ## Public and internal functions
 

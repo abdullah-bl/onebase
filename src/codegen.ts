@@ -71,15 +71,17 @@ export type DatabaseWriter = GenericDatabaseWriter<DataModel>;
     for (const seg of segments.slice(0, -1)) node = (node[seg] ??= {}) as Tree;
     node[segments[segments.length - 1]!] = alias;
   });
+  // Components' functions: the ones each mount exposes to clients in `api`, all public ones in `internal`.
+  const componentsType = (visibility: string) => (hasComponents ? ` & { components: ComponentsApi<typeof components, "${visibility}"> }` : "");
   const apiFile = `${HEADER}
-import { anyApi, type ApiFromModule } from "onebase/server";
+import { anyApi, type ApiFromModule } from "onebase/server";${hasComponents ? `\nimport type { ComponentsApi } from "onebase/components";\nimport type components from "../components";` : ""}
 ${imports.join("\n")}
 
 /** References to public functions, e.g. \`api.messages.list\`. */
-export const api: ${renderTree(tree, "public", "")} = anyApi;
+export const api: ${renderTree(tree, "public", "")}${componentsType("public")} = anyApi;
 
 /** References to internal functions (callable from other functions only). */
-export const internal: ${renderTree(tree, "internal", "")} = anyApi;
+export const internal: ${renderTree(tree, "internal", "")}${componentsType("internal")} = anyApi;
 `;
 
   return {

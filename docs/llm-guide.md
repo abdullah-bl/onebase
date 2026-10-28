@@ -234,7 +234,9 @@ await ctx.components.limiter.limit({ name: "send", key: userId, throws: true });
 
 - Queries call component queries; mutations call queries and mutations in the same transaction; actions call anything.
 - Your `ctx.db` can't see component tables (stored as `limiter.rateLimits`), and components can't see yours. Pass ids as strings.
-- Clients can't call components directly: wrap them in your own query or mutation.
+- Clients can't call components directly: wrap them in your own query or mutation, or mount with `expose: ["fn"]` to make `api.components.<mount>.<fn>` callable.
+- To let a component call one of your functions (a callback, a queued job), pass the reference in the args (`{ fn: internal.x.y }`) or a handle from `createFunctionHandle(internal.x.y)`.
+- Counters written by many requests at once: `shardedCounter()` from `onebase/components/sharded-counter`, then `ctx.components.counter.inc({ name })` and `.count({ name })`.
 - Components get `ctx.auth` only when mounted with `auth: true`.
 - Counts, sums and ranks over a table: mount `aggregate({ table: "scores", sortKey: (d: Doc<"scores">) => d.points })` from `onebase/components/aggregate` (it follows the table by itself), then `ctx.components.leaderboard.count()`, `.sum()`, `.indexOf({ key, order: "desc" })`, `.at({ index })`. Don't count with `.collect().length` on large tables.
 

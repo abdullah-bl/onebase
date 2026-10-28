@@ -405,7 +405,7 @@ export type ManualAggregateApi<K, N> = AggregateApi<K, N> & {
  * delete updates it in the same transaction, and existing documents are added in the background
  * (`status()` says when that's done). Without `table`, add items yourself with insert / delete / replace.
  */
-export function aggregate<D, K, N = undefined>(
+export function aggregate<D, K, N = undefined, const E extends keyof AggregateApi<K, N> & string = never>(
   opts: {
     table: string;
     sortKey: (doc: D) => K;
@@ -413,10 +413,12 @@ export function aggregate<D, K, N = undefined>(
     namespace?: (doc: NoInfer<D>) => N;
     filter?: (doc: NoInfer<D>) => boolean;
     maxNodeSize?: number;
-  } & MountOptions,
-): Mount<AggregateApi<K, N>>;
-export function aggregate<K = unknown, N = undefined>(opts?: { maxNodeSize?: number } & MountOptions): Mount<ManualAggregateApi<K, N>>;
-export function aggregate(opts: Config & MountOptions = {}): Mount<any> {
+  } & MountOptions<E>,
+): Mount<AggregateApi<K, N>, E>;
+export function aggregate<K = unknown, N = undefined, const E extends keyof AggregateApi<K, N> & string = never>(
+  opts?: { maxNodeSize?: number } & MountOptions<E>,
+): Mount<ManualAggregateApi<K, N>, E>;
+export function aggregate(opts: Config & MountOptions = {}): Mount<any, any> {
   const { config, options } = splitMountOptions(opts);
   return definition.mount(config, options);
 }

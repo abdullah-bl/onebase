@@ -33,7 +33,17 @@ export type ArgsAndOptions<F, Options> = keyof FunctionArgs<F> extends never
   ? [args?: FunctionArgs<F>, options?: Options]
   : [args: FunctionArgs<F>, options?: Options];
 
-/** Anything that names a function: a reference from `api` or a "module:export" string. */
+/**
+ * A signed, storable reference to a function, from `createFunctionHandle()`: "function://…".
+ * Pass it to a component (or keep it in a document) and call it later, even after a restart.
+ */
+export type FunctionHandle<Type extends FunctionType = FunctionType, Args = any, Returns = any> = string & {
+  readonly __handle?: [Type, Args, Returns];
+};
+
+export const isFunctionHandle = (x: unknown): x is FunctionHandle => typeof x === "string" && x.startsWith("function://");
+
+/** Anything that names a function: a reference from `api`, a "module:export" string or a handle. */
 export type FunctionLike = FunctionReference | string;
 
 /** Turns `api.messages.list` (or "messages:list") into "messages:list". */

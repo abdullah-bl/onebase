@@ -1,10 +1,12 @@
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getFunctionName, type FunctionLike, type FunctionType } from "../api";
-import type { ComponentDefinition, ComponentsDefinition, MountOptions } from "../components";
+import { functionPathSymbol, getFunctionName, isFunctionHandle, type FunctionLike, type FunctionType } from "../api";
+import type { ComponentDefinition, ComponentRoute, ComponentsDefinition, MountOptions } from "../components";
+import { parseCron } from "../cron";
 import type { SchemaDefinition } from "../schema";
-import { isRegisteredFunction, type CronJob, type HttpRouter, type RegisteredFunction, type UserIdentity } from "../server";
+import { isRegisteredFunction, type CronJob, type HttpAction, type HttpRouter, type RegisteredFunction, type UserIdentity } from "../server";
 import { ConvexError, describeValue, isPlainObject, validate, type AnyValidator } from "../values";
 import { buildCatalog, TableScope, tableMount, validatesTable, type Catalog } from "./catalog";
 import { CronRunner } from "./crons";
@@ -67,6 +69,9 @@ export type MountRuntime = {
   names: Map<RegisteredFunction, string>;
   /** App tables this mount follows. */
   hooks: ResolvedHook[];
+  /** HTTP routes, served under `httpPrefix` (null: not served). */
+  routes: ComponentRoute[];
+  httpPrefix: string | null;
 };
 
 /** Who is calling: the app (null), a component, or the system (scheduler, crons, dashboard), which may call anything. */
@@ -82,6 +87,8 @@ type PreparedCode = {
   componentFunctions: Map<string, { mount: MountRuntime; internal: boolean }>;
   mounts: Map<string, MountRuntime>;
   catalog: Catalog | null;
+  /** crons.ts's jobs and every mount's. */
+  crons: CronJob[];
   auth: AuthService | null;
   authenticate: Authenticate | null;
 };
@@ -204,6 +211,8 @@ export class Runtime {
   private heartbeat: ReturnType<typeof setInterval> | null = null;
   private lastCreationTime = 0;
   private readonly warnedQueries = new Set<string>();
+  /** Signs function handles; loaded from the database by init(). */
+  private handleKey: Buffer | null = null;
   private stopped = false;
 
   constructor(opts: RuntimeOptions) {
@@ -233,6 +242,7 @@ export class Runtime {
    */
   async init(): Promise<{ created: string[]; dropped: string[] }> {
     await this.driver.init();
+    this.handleKey = await this.loadHandleKey();
     let applied: { result: { created: string[]; dropped: string[] }; warnings: string[] } | null = null;
     while (!applied) {
       const stored = this.loadCode ? await this.driver.read((tx) => activeDeployment(tx)) : null;
@@ -261,6 +271,18 @@ export class Runtime {
     }
     this.startBackfills();
     return applied.result;
+  }
+
+  /** The key function handles are signed with: one per database, so handles work on every instance and after restarts. */
+  private async loadHandleKey(): Promise<Buffer> {
+    const value = await this.driver.write(async (tx) => {
+      // Keeps the stored key if there is one (another instance may have just written it).
+      await tx.run(`INSERT INTO _meta ("key", value) VALUES ('handles', ?) ON CONFLICT("key") DO UPDATE SET value = _meta.value`, [
+        randomBytes(32).toString("base64"),
+      ]);
+      return (await tx.get(`SELECT value FROM _meta WHERE "key" = 'handles'`))!.value as string;
+    });
+    return Buffer.from(value, "base64");
   }
 
   /** Startup's index update and document check, unless the active deployment is no longer `expected`. */
@@ -369,7 +391,10 @@ export class Runtime {
         scope: TableScope.component(name),
         names: new Map(),
         hooks: [],
+        routes: m.definition.http?.(m.config) ?? [],
+        httpPrefix: m.options?.httpPrefix === false ? null : (m.options?.httpPrefix ?? `/${name}`),
       };
+      const exposed = new Set((m.options?.expose ?? []).map(String));
       const walk = (tree: Record<string, unknown>, path: string[]) => {
         for (const [key, value] of Object.entries(tree)) {
           if (!isRegisteredFunction(value)) {
@@ -377,16 +402,20 @@ export class Runtime {
             continue;
           }
           const fullName = `components/${[name, ...path].join("/")}:${key}`;
-          // Not callable by clients: the app decides what to offer them.
-          functions.set(fullName, { ...value, visibility: "internal" });
+          // Clients reach only what the app exposed; everything else goes through the app's functions.
+          functions.set(fullName, { ...value, visibility: exposed.has([...path, key].join(".")) ? "public" : "internal" });
           componentFunctions.set(fullName, { mount, internal: value.visibility === "internal" });
           mount.names.set(value, fullName);
         }
       };
       walk(m.definition.functions, []);
       mount.hooks = this.resolveHooks(mount, code.schema, functions);
+      if (mount.httpPrefix && /^\/(api|_admin|_onebase)(\/|$)/.test(mount.httpPrefix)) {
+        throw new OnebaseError(`Component "${name}": httpPrefix "${mount.httpPrefix}" is taken by onebase itself; pick another.`);
+      }
       mounts.set(name, mount);
     }
+    const crons = [...code.crons, ...[...mounts.values()].flatMap((mount) => this.componentCrons(mount))];
     const catalog = buildCatalog(code.schema, [...mounts.values()].map((m) => ({ mount: m.name, schema: m.definition.schema })));
     return {
       code,
@@ -394,9 +423,51 @@ export class Runtime {
       componentFunctions,
       mounts,
       catalog,
+      crons,
       auth: code.auth?.methods?.length ? new AuthService(this, code.auth) : null,
       authenticate: this.customAuthenticate ?? (code.auth ? createAuthenticate(code.auth) : null),
     };
+  }
+
+  /** A mount's cron jobs, named "components/<mount>/<name>" so they can't clash with the app's. */
+  private componentCrons(mount: MountRuntime): CronJob[] {
+    const where = `Component "${mount.name}" (${mount.definition.name})`;
+    return (mount.definition.crons?.(mount.config) ?? []).map((cron) => {
+      if (typeof cron?.name !== "string" || !/^[A-Za-z0-9_.-]+$/.test(cron.name)) throw new OnebaseError(`${where}: cron jobs need a name (letters, digits, _ . -).`);
+      const fn = mount.names.get(cron.fn);
+      if (!fn) throw new OnebaseError(`${where}: cron "${cron.name}" must run one of the component's own functions.`);
+      let schedule: CronJob["schedule"];
+      if (typeof cron.schedule === "string") {
+        parseCron(cron.schedule);
+        schedule = { type: "cron", expression: cron.schedule };
+      } else {
+        const ms = ((cron.schedule?.hours ?? 0) * 3600 + (cron.schedule?.minutes ?? 0) * 60 + (cron.schedule?.seconds ?? 0)) * 1000;
+        if (!(ms >= 1000)) throw new OnebaseError(`${where}: cron "${cron.name}" needs an interval of at least 1 second, e.g. { minutes: 5 }.`);
+        schedule = { type: "interval", ms };
+      }
+      return { name: `components/${mount.name}/${cron.name}`, schedule, fn, args: cron.args ?? {} };
+    });
+  }
+
+  /**
+   * The handler for an HTTP request: an http.ts route first, then a component's route under its
+   * prefix (so the app can always override one).
+   */
+  lookupHttp(method: string, pathname: string): { handler: HttpAction; mount: MountRuntime | null } | null {
+    const own = this.http?.lookup(method, pathname);
+    if (own) return { handler: own, mount: null };
+    for (const mount of this.mounts.values()) {
+      const prefix = mount.httpPrefix;
+      if (!prefix || !mount.routes.length || (pathname !== prefix && !pathname.startsWith(prefix + "/"))) continue;
+      const rest = pathname.slice(prefix.length) || "/";
+      const exact = mount.routes.find((r) => r.method === method && r.path === rest);
+      const prefixed = mount.routes
+        .filter((r) => r.method === method && r.pathPrefix && rest.startsWith(r.pathPrefix))
+        .sort((a, b) => b.pathPrefix!.length - a.pathPrefix!.length)[0];
+      const route = exact ?? prefixed;
+      if (route) return { handler: route.handler, mount };
+    }
+    return null;
   }
 
   /** A mount's table hooks, checked: they follow app tables and run the component's own functions. */
@@ -438,7 +509,7 @@ export class Runtime {
     this.http = prepared.code.http;
     this.auth = prepared.auth;
     this.authenticate = prepared.authenticate;
-    this.crons = prepared.code.crons;
+    this.crons = prepared.crons;
     this.functions.clear();
     for (const [name, fn] of prepared.functions) this.functions.set(name, fn);
     this.deployment = deployment;
@@ -767,6 +838,10 @@ export class Runtime {
     caller: Caller = null,
   ): { name: string; fn: RegisteredFunction; mount: MountRuntime | null } {
     const name = this.functionName(ref, caller);
+    // A handle is a capability the app handed out: whoever holds it may call that function, but only
+    // from server code (a client never calls through one).
+    const viaHandle = isFunctionHandle(ref);
+    if (viaHandle && !allowInternal) throw new OnebaseError("Function handles can only be called from other functions.");
     const fn = this.functions.get(name);
     if (!fn) {
       const [mod] = name.split(":");
@@ -784,7 +859,7 @@ export class Runtime {
     }
     const info = this.componentFunctions.get(name);
     const target = info?.mount ?? null;
-    if (caller !== "system" && caller !== target) {
+    if (!viaHandle && caller !== "system" && caller !== target) {
       if (caller) {
         throw new OnebaseError(
           target
@@ -797,8 +872,30 @@ export class Runtime {
     return { name, fn, mount: target };
   }
 
+  private handleSignature(name: string): string {
+    if (!this.handleKey) throw new OnebaseError("Function handles work once the runtime has started (init()).");
+    return createHmac("sha256", this.handleKey).update(name).digest("base64url").slice(0, 22);
+  }
+
+  /** A signed handle to a function `caller` may call: anyone holding it can then call that function. */
+  createHandle(ref: unknown, caller: Caller): string {
+    const { name } = this.resolve(ref as FunctionLike, null, true, caller);
+    return `function://${name}#${this.handleSignature(name)}`;
+  }
+
+  /** The function a handle names, if its signature is right. */
+  private handleName(handle: string): string {
+    const [name, signature] = handle.slice("function://".length).split("#");
+    const expected = name ? Buffer.from(this.handleSignature(name)) : null;
+    if (!expected || !signature || signature.length !== expected.length || !timingSafeEqual(Buffer.from(signature), expected)) {
+      throw new OnebaseError("Invalid function handle: make handles with createFunctionHandle() rather than by hand.");
+    }
+    return name!;
+  }
+
   /** A component names its own functions by passing the function itself. */
   private functionName(ref: FunctionLike | RegisteredFunction, caller: Caller): string {
+    if (isFunctionHandle(ref)) return this.handleName(ref);
     if (!isRegisteredFunction(ref)) return getFunctionName(ref);
     const name = caller && caller !== "system" ? caller.names.get(ref) : undefined;
     if (!name) {
@@ -883,7 +980,15 @@ export class Runtime {
       runAfter: (delayMs: number, ref: FunctionLike, args?: unknown) => schedule(Date.now() + Math.max(0, delayMs), ref, args),
       runAt: (ts: number | Date, ref: FunctionLike, args?: unknown) => schedule(ts instanceof Date ? ts.getTime() : ts, ref, args),
       cancel: async (id: string) => {
-        const cancel = (tx: Exec) => tx.run("UPDATE _scheduled SET state = 'canceled' WHERE id = ? AND state = 'pending'", [id]);
+        const cancel = async (tx: Exec) => {
+          // A component cancels only its own jobs.
+          if (caller) {
+            const job = await tx.get("SELECT fn FROM _scheduled WHERE id = ?", [id]);
+            const own = `components/${caller.name}`;
+            if (!job || !(job.fn.startsWith(own + ":") || job.fn.startsWith(own + "/"))) return;
+          }
+          await tx.run("UPDATE _scheduled SET state = 'canceled' WHERE id = ? AND state = 'pending'", [id]);
+        };
         if (state) await cancel(state.tx);
         else await this.withWriter(cancel);
       },
@@ -1086,6 +1191,23 @@ export class Runtime {
   }
 
   /**
+   * Function references in a component call's arguments (`{ fn: internal.emails.send }`) become
+   * signed handles, so the component can call them back or schedule them.
+   */
+  private referencesToHandles(args: unknown): unknown {
+    if (!isPlainObject(args)) return args;
+    const out: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(args)) {
+      let path: unknown;
+      try {
+        path = typeof value === "object" && value !== null ? (value as any)[functionPathSymbol] : undefined;
+      } catch {}
+      out[key] = typeof path === "string" ? this.createHandle(value, null) : value;
+    }
+    return out;
+  }
+
+  /**
    * `ctx.components.<mount>.<fn>(args)`: calls a component's public function through the
    * context's own runQuery / runMutation / runAction, so it shares their transaction rules.
    */
@@ -1111,7 +1233,7 @@ export class Runtime {
               );
             }
             const name = mount.names.get(value)!;
-            return (args?: unknown) => call(name, args);
+            return (args?: unknown) => call(name, this.referencesToHandles(args));
           },
         },
       );
@@ -1130,14 +1252,24 @@ export class Runtime {
 
   private async invoke(name: string, fn: RegisteredFunction, ctx: unknown, args: unknown) {
     const checked = this.checkArgs(name, fn, args);
-    const result = await currentFunction.run({ type: fn.type, name }, () => fn.handler(ctx, checked));
+    const caller = this.componentFunctions.get(name)?.mount ?? null;
+    const handle = (ref: unknown) => this.createHandle(ref, caller);
+    const result = await currentFunction.run({ type: fn.type, name, handle }, () => fn.handler(ctx, checked));
     return this.checkReturn(name, fn, result);
   }
 
   /** Runs an http.ts route handler. */
-  async runHttpAction(handler: (ctx: any, request: Request) => Promise<Response> | Response, request: Request, identity: UserIdentity | null) {
+  async runHttpAction(
+    handler: (ctx: any, request: Request) => Promise<Response> | Response,
+    request: Request,
+    identity: UserIdentity | null,
+    mount: MountRuntime | null = null,
+  ) {
     const name = `${request.method} ${new URL(request.url).pathname}`;
-    return this.calls.track(name, "http", "http", () => currentFunction.run({ type: "action", name }, async () => handler(this.actionCtx(identity), request)));
+    const handle = (ref: unknown) => this.createHandle(ref, mount);
+    return this.calls.track(name, "http", "http", () =>
+      currentFunction.run({ type: "action", name, handle }, async () => handler(this.actionCtx(identity, mount), request)),
+    );
   }
 
   // ---- Entry points ----

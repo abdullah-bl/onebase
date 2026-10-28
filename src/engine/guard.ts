@@ -6,7 +6,12 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { FunctionType } from "../api";
 import { OnebaseError } from "./database";
 
-export type FunctionFrame = { type: FunctionType; name: string };
+export type FunctionFrame = {
+  type: FunctionType;
+  name: string;
+  /** Signs a handle to a function the running one may call (see createFunctionHandle). */
+  handle?: (ref: unknown) => string;
+};
 
 export const currentFunction = new AsyncLocalStorage<FunctionFrame>();
 

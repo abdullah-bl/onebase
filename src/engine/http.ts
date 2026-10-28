@@ -381,11 +381,11 @@ export function serve(opts: ServeOptions): Server<SocketData> {
       }
       if (opts.admin && (path === "/_admin" || path.startsWith("/_admin/"))) return opts.admin(req, url);
 
-      const httpAction = runtime.http?.lookup(req.method, path);
-      if (httpAction) {
+      const route = runtime.lookupHttp(req.method, path);
+      if (route) {
         try {
           const identity = await identityFromRequest(req);
-          return await runtime.runHttpAction(httpAction.handler, req, identity);
+          return await runtime.runHttpAction(route.handler.handler, req, identity, route.mount);
         } catch (err) {
           runtime.log.error(`HTTP ${req.method} ${path}: ${err instanceof Error ? err.message : String(err)}`);
           return new Response(runtime.toClientError(err).message, { status: 500 });

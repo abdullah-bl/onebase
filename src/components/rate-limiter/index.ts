@@ -158,9 +158,11 @@ export type RateLimiterApi<Name extends string> = {
 };
 
 /** Mounts a rate limiter with named limits: `rateLimiter({ rates: { send: { kind: "token bucket", rate: 10, period: MINUTE } } })`. */
-export function rateLimiter<const R extends Record<string, RateLimitConfig>>(opts: { rates: R } & MountOptions): Mount<RateLimiterApi<keyof R & string>> {
+export function rateLimiter<const R extends Record<string, RateLimitConfig>, const E extends keyof RateLimiterApi<string> = never>(
+  opts: { rates: R } & MountOptions<E>,
+): Mount<RateLimiterApi<keyof R & string>, E> {
   const { config, options } = splitMountOptions(opts);
-  return definition.mount(config as Config, options) as Mount<RateLimiterApi<keyof R & string>>;
+  return definition.mount(config as Config, options) as Mount<RateLimiterApi<keyof R & string>, E>;
 }
 
 export type RateLimitErrorData = { kind: "RateLimited"; name: string; retryAfter: number };

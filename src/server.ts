@@ -9,7 +9,8 @@ import type {
   FunctionType,
   FunctionVisibility,
 } from "./api";
-import { getFunctionName } from "./api";
+import { getFunctionName, type FunctionHandle } from "./api";
+import { currentFunction } from "./engine/guard";
 import { parseCron } from "./cron";
 import type { ComponentsCtx } from "./components";
 import type { AnyDataModel, GenericDataModel, GenericTableInfo, SearchIndexConfig, VectorIndexConfig } from "./schema";
@@ -22,8 +23,8 @@ import {
   type PropertyValidators,
 } from "./values";
 
-export { anyApi, getFunctionName } from "./api";
-export type { FunctionArgs, FunctionReference, FunctionReturnType } from "./api";
+export { anyApi, getFunctionName, isFunctionHandle } from "./api";
+export type { FunctionArgs, FunctionHandle, FunctionReference, FunctionReturnType } from "./api";
 export { defineSchema, defineTable } from "./schema";
 import { defineTable } from "./schema";
 export type { DataModelFromSchema } from "./schema";
@@ -203,10 +204,28 @@ export async function getAuthUserId(ctx: { auth: Auth }): Promise<GenericId<"use
   return identity?.tokenIdentifier.startsWith("onebase|") ? (identity.subject as GenericId<"users">) : null;
 }
 
-type Call<T extends FunctionType> = <F extends FunctionReference<T, any>>(
-  fn: F | string,
-  args?: FunctionArgs<F>,
-) => Promise<FunctionReturnType<F>>;
+type Call<T extends FunctionType> = {
+  <F extends FunctionReference<T, any>>(fn: F | string, args?: FunctionArgs<F>): Promise<FunctionReturnType<F>>;
+  <A, R>(fn: FunctionHandle<T, A, R>, args?: A): Promise<R>;
+};
+
+type HandleOf<F> =
+  F extends FunctionReference<infer T, any, infer A, infer R>
+    ? FunctionHandle<T, A, R>
+    : F extends RegisteredFunction<infer T, any, infer A, infer R>
+      ? FunctionHandle<T, A, R>
+      : FunctionHandle;
+
+/**
+ * A handle to a function, as a string you can store or pass to a component, which can then call it
+ * (ctx.runMutation(handle, args)) or schedule it. Handles are signed: one can't be made up, and
+ * it keeps working after restarts and on other instances. Like Convex, only inside functions.
+ */
+export async function createFunctionHandle<F extends FunctionReference | RegisteredFunction>(fn: F): Promise<HandleOf<F>> {
+  const frame = currentFunction.getStore();
+  if (!frame?.handle) throw new Error("createFunctionHandle() works inside a query, mutation or action.");
+  return frame.handle(fn) as HandleOf<F>;
+}
 
 export interface Scheduler {
   runAfter(delayMs: number, fn: FunctionLike, args?: Record<string, unknown>): Promise<string>;

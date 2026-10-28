@@ -133,6 +133,8 @@ export interface QueryInitializer<
 
 export interface DatabaseReader<DM> {
   get<T extends TableNames<DM>>(id: GenericId<T>): Promise<DocOf<DM, T> | null>;
+  /** Convex's table-first form: throws if `id` belongs to another table. */
+  get<T extends TableNames<DM>>(table: T, id: GenericId<NoInfer<T>>): Promise<DocOf<DM, T> | null>;
   query<T extends TableNames<DM>>(table: T): QueryInitializer<DocOf<DM, T>, IndexesOf<DM, T>, SearchIndexesOf<DM, T>>;
   /** Returns the id if it is a valid id for `table`, otherwise null. */
   normalizeId<T extends TableNames<DM>>(table: T, id: string): GenericId<T> | null;
@@ -142,8 +144,11 @@ export interface DatabaseWriter<DM> extends DatabaseReader<DM> {
   insert<T extends TableNames<DM>>(table: T, value: WithoutSystemFields<DocOf<DM, T>>): Promise<GenericId<T>>;
   /** Shallow merge. Setting a field to undefined removes it. */
   patch<T extends TableNames<DM>>(id: GenericId<T>, value: Partial<WithoutSystemFields<DocOf<DM, T>>>): Promise<void>;
+  patch<T extends TableNames<DM>>(table: T, id: GenericId<NoInfer<T>>, value: Partial<WithoutSystemFields<DocOf<DM, T>>>): Promise<void>;
   replace<T extends TableNames<DM>>(id: GenericId<T>, value: WithoutSystemFields<DocOf<DM, T>>): Promise<void>;
+  replace<T extends TableNames<DM>>(table: T, id: GenericId<NoInfer<T>>, value: WithoutSystemFields<DocOf<DM, T>>): Promise<void>;
   delete(id: GenericId<string>): Promise<void>;
+  delete<T extends TableNames<DM>>(table: T, id: GenericId<NoInfer<T>>): Promise<void>;
 }
 
 // ---- File storage ----

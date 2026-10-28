@@ -77,3 +77,20 @@ export default defineSchema({
     rmSync(join(project, ".."), { recursive: true, force: true });
   }
 });
+
+test("a leftover convex.config.ts is ignored and explained", async () => {
+  const project = join(mkdtempSync(join(tmpdir(), "onebase-doctor-")), "convex");
+  mkdirSync(project);
+  writeFileSync(join(project, "convex.config.ts"), `import { defineApp } from "convex/server";\nexport default defineApp();\n`);
+  writeFileSync(join(project, "notes.ts"), `import { query } from "onebase/server";\nexport const list = query({ args: {}, handler: () => [] });\n`);
+  try {
+    const findings = await doctor(project);
+    expect(findings.find((f) => f.where === "convex.config.ts")?.message).toBe(
+      "Convex components (app.use(...)) don't run on onebase, so this file is ignored.",
+    );
+    // It isn't loaded as a functions file (it would fail to import convex/server).
+    expect(findings.some((f) => f.message.startsWith("Failed to load"))).toBe(false);
+  } finally {
+    rmSync(join(project, ".."), { recursive: true, force: true });
+  }
+});

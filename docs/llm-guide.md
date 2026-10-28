@@ -236,7 +236,7 @@ await ctx.components.limiter.limit({ name: "send", key: userId, throws: true });
 - Your `ctx.db` can't see component tables (stored as `limiter.rateLimits`), and components can't see yours. Pass ids as strings.
 - Clients can't call components directly: wrap them in your own query or mutation, or mount with `expose: ["fn"]` to make `api.components.<mount>.<fn>` callable.
 - To let a component call one of your functions (a callback, a queued job), pass the reference in the args (`{ fn: internal.x.y }`) or a handle from `createFunctionHandle(internal.x.y)`.
-- Background jobs with limited parallelism or retries: `workQueue({ maxParallelism, retry: { maxAttempts } })` from `onebase/components/work-queue`, then `ctx.components.queue.enqueueAction({ fn: internal.x.y, args, onComplete: internal.x.done })`; `onComplete` takes `args: onCompleteValidator`.
+- Background jobs with limited parallelism or retries: `workQueue({ maxParallelism, retry: { maxAttempts } })` from `onebase/components/work-queue`, then `ctx.components.queue.enqueueAction({ fn: internal.x.y, args, onComplete: internal.x.done })`; `onComplete` takes `args: onCompleteArgs(v.object({ ... }))` (or `onCompleteValidator` for any context).
 - Counters written by many requests at once: `shardedCounter()` from `onebase/components/sharded-counter`, then `ctx.components.counter.inc({ name })` and `.count({ name })`.
 - Components get `ctx.auth` only when mounted with `auth: true`.
 - Counts, sums and ranks over a table: mount `aggregate({ table: "scores", sortKey: (d: Doc<"scores">) => d.points })` from `onebase/components/aggregate` (it follows the table by itself), then `ctx.components.leaderboard.count()`, `.sum()`, `.indexOf({ key, order: "desc" })`, `.at({ index })`. Don't count with `.collect().length` on large tables.
@@ -248,6 +248,7 @@ await ctx.components.limiter.limit({ name: "send", key: userId, throws: true });
 - `.filter` also accepts an object shorthand, and indexes are picked automatically for filters.
 - `auth.config.ts` can also export a custom `authenticate(token)`.
 - Components are mounted with `defineComponents` in `components.ts` and called as `ctx.components.x.fn(args)`, not through `convex.config.ts` and `ctx.runMutation(components.x.lib.fn)`.
+- `ctx.db.get("table", id)`, `patch("table", id, value)`, `replace` and `delete` also take the table first, as in current Convex.
 - Not supported yet: `ctx.db.system`.
 
 Run `onebase doctor` after changes: it checks the schema, indexes, imports and common mistakes, and prints the fix for each.

@@ -849,12 +849,29 @@ export class DatabaseImpl {
     return id;
   }
 
+  /**
+   * Convex's current form names the table first: db.get("messages", id), db.patch("messages",
+   * id, value), db.replace(...), db.delete("messages", id). Both forms work; with a table, an id
+   * from another table is an error. Returns the expected stored table (or null) and the rest.
+   */
+  private tableFirst(args: unknown[], idForm: number, verb: string): { table: string | null; rest: unknown[] } {
+    if (args.length <= idForm) return { table: null, rest: args };
+    const table = this.checkTable(args[0]);
+    const id = args[1];
+    if (typeof id === "string" && id && !isIdForTable(id, table)) {
+      throw new OnebaseError(`db.${verb}("${args[0]}", id): "${id}" isn't an id for "${args[0]}".`);
+    }
+    return { table, rest: args.slice(1) };
+  }
+
   // -- DatabaseReader --
 
-  async get(id: unknown): Promise<Doc | null> {
-    const docId = this.requireId(id, "get");
+  async get(...args: unknown[]): Promise<Doc | null> {
+    const { table, rest } = this.tableFirst(args, 1, "get");
+    const docId = this.requireId(rest[0], "get");
     this.readSet?.ids.add(docId);
     const raw = await this.loadRaw(docId);
+    if (raw && table && raw.table !== table) throw new OnebaseError(`db.get("${args[0]}", id): "${docId}" is a "${raw.table}" document.`);
     // Another component's (or the app's) documents don't exist as far as this scope is concerned.
     return raw && this.scope.owns(raw.table) ? raw.doc : null;
   }
@@ -882,10 +899,11 @@ export class DatabaseImpl {
     return id;
   }
 
-  private async existing(id: unknown, verb: string) {
+  private async existing(id: unknown, verb: string, table: string | null = null) {
     const docId = this.requireId(id, verb);
     const raw = await this.loadRaw(docId);
     if (!raw) throw new OnebaseError(`db.${verb}(): document "${docId}" doesn't exist (it may have been deleted).`);
+    if (table && raw.table !== table) throw new OnebaseError(`db.${verb}(): "${docId}" is a "${raw.table}" document, not "${table}".`);
     if (!this.scope.owns(raw.table)) {
       const owner = tableMount(raw.table);
       throw new OnebaseError(
@@ -904,8 +922,10 @@ export class DatabaseImpl {
     this.writes?.push({ table, id: before._id, before, after: { _id: before._id, _creationTime: before._creationTime, ...fields } });
   }
 
-  async patch(id: unknown, value: unknown): Promise<void> {
-    const { table, doc } = await this.existing(id, "patch");
+  async patch(...args: unknown[]): Promise<void> {
+    const { table: expected, rest } = this.tableFirst(args, 2, "patch");
+    const [id, value] = rest;
+    const { table, doc } = await this.existing(id, "patch", expected);
     if (!isPlainObject(value)) throw new OnebaseError(`db.patch() needs an object, got ${describeValue(value)}.`);
     const { _id, _creationTime, ...current } = doc;
     for (const sys of ["_id", "_creationTime"] as const) {
@@ -922,8 +942,10 @@ export class DatabaseImpl {
     await this.writeDoc(table, doc, this.prepareValue(table, merged, "patch"));
   }
 
-  async replace(id: unknown, value: unknown): Promise<void> {
-    const { table, doc } = await this.existing(id, "replace");
+  async replace(...args: unknown[]): Promise<void> {
+    const { table: expected, rest } = this.tableFirst(args, 2, "replace");
+    let [id, value] = rest;
+    const { table, doc } = await this.existing(id, "replace", expected);
     if (isPlainObject(value)) {
       const { _id, _creationTime, ...rest } = value;
       if (_id !== undefined && _id !== doc._id) throw new OnebaseError(`db.replace() can't change "_id".`);
@@ -932,8 +954,9 @@ export class DatabaseImpl {
     await this.writeDoc(table, doc, this.prepareValue(table, value, "replace"));
   }
 
-  async delete(id: unknown): Promise<void> {
-    const { id: docId, table, doc } = await this.existing(id, "delete");
+  async delete(...args: unknown[]): Promise<void> {
+    const { table: expected, rest } = this.tableFirst(args, 1, "delete");
+    const { id: docId, table, doc } = await this.existing(rest[0], "delete", expected);
     await this.tx.run("DELETE FROM documents WHERE id = ?", [docId]);
     await this.syncSearch(table, docId, null);
     await this.syncVectors(table, docId, null);

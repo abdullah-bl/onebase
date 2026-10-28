@@ -11,7 +11,7 @@ onebase uses Convex's programming model and most of its API. If you know Convex,
 
 - `query`, `mutation`, `action` and their `internal*` versions, with `args` and `returns` validators
 - `v.*` validators, `defineSchema`, `defineTable`, `.index()`
-- `ctx.db.get / query / insert / patch / replace / delete / normalizeId`, `withIndex`, `filter`, `order`, `paginate`, `paginationOptsValidator`
+- `ctx.db.get / query / insert / patch / replace / delete / normalizeId`, `withIndex`, `filter`, `order`, `paginate`, `paginationOptsValidator`, including the table-first forms `ctx.db.get("messages", id)` and `ctx.db.patch("messages", id, value)`
 - `ctx.scheduler.runAfter / runAt / cancel`, `cronJobs()`
 - `ctx.storage.generateUploadUrl / getUrl / delete / store / get`, `v.id("_storage")`
 - `ctx.auth.getUserIdentity()` and the `auth.config.ts` provider format
@@ -48,3 +48,26 @@ onebase uses Convex's programming model and most of its API. If you know Convex,
 5. In the frontend, import from `onebase/react` instead of `convex/react`.
 
 Data doesn't migrate automatically. Export it from Convex as JSON and insert it with a mutation.
+
+## Components
+
+onebase has its own [components](./components.md) and doesn't run `@convex-dev/*` packages. The common ones have built-in equivalents:
+
+| Convex | onebase |
+|---|---|
+| `@convex-dev/rate-limiter` | [Rate limiter](./rate-limiter.md) |
+| `@convex-dev/aggregate` | [Aggregate](./aggregate.md); it follows its table, so the triggers go away |
+| `@convex-dev/sharded-counter` | [Sharded counter](./sharded-counter.md) |
+| `@convex-dev/workpool` | [Work queue](./work-queue.md) |
+
+Other components can be ported into local onebase components; their source ships in the npm package. `onebase doctor` reports a leftover `convex.config.ts`.
+
+## Migrating with an AI agent
+
+onebase ships a skill that walks an agent such as Claude Code through the whole migration: the inventory, imports, each component's exact before/after mapping, porting the rest, and the checks to run. To install it into a project for Claude Code:
+
+```bash
+mkdir -p .claude/skills && cp -r node_modules/onebase/skills/convex-to-onebase .claude/skills/
+```
+
+Then ask: "migrate this project from Convex to onebase". Other agents can be pointed at `node_modules/onebase/skills/convex-to-onebase/SKILL.md`, which links to the rest.

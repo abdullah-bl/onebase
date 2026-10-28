@@ -1,7 +1,7 @@
 // `onebase doctor`: catches the mistakes people (and LLMs) commonly make, with the fix.
 
-import { readFileSync } from "node:fs";
-import { relative, resolve } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { join, relative, resolve } from "node:path";
 import { staleGeneratedFiles } from "./codegen";
 import { listSourceFiles, loadProject, modulePathFor, type Project } from "./project";
 import { isRegisteredFunction } from "./server";
@@ -284,6 +284,14 @@ export async function doctor(dirInput: string): Promise<Finding[]> {
   checkSchema(project, findings);
   checkFunctions(project, findings);
   checkComponents(project, files, findings);
+  if (["ts", "js", "mts", "mjs"].some((ext) => existsSync(join(dir, `convex.config.${ext}`)))) {
+    findings.push({
+      level: "error",
+      where: "convex.config.ts",
+      message: "Convex components (app.use(...)) don't run on onebase, so this file is ignored.",
+      fix: "Mount onebase components in components.ts instead. The convex-to-onebase skill (node_modules/onebase/skills/convex-to-onebase) maps each Convex component to its onebase equivalent.",
+    });
+  }
   const stale = await staleGeneratedFiles(dir);
   if (stale.length) {
     findings.push({

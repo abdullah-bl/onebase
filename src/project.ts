@@ -71,6 +71,8 @@ export async function listSourceFiles(dir: string): Promise<string[]> {
   for await (const rel of glob.scan({ cwd: dir, onlyFiles: true })) {
     const p = rel.replace(/\\/g, "/");
     if (p.startsWith("_generated/") || p.includes("node_modules/") || p.endsWith(".d.ts") || /\.test\.|\.spec\./.test(p)) continue;
+    // A Convex project's component config: onebase doesn't run it (doctor explains what to do).
+    if (/^convex\.config\.[mc]?[jt]s$/.test(p)) continue;
     files.push(join(dir, rel));
   }
   return files.sort();

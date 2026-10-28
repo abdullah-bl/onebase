@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defineComponents } from "../src/components";
-import { onCompleteValidator, workQueue } from "../src/components/work-queue";
+import { onCompleteArgs, onCompleteValidator, workQueue } from "../src/components/work-queue";
 import type { Driver } from "../src/engine/driver";
 import type { Runtime } from "../src/engine/runtime";
 import { action, anyApi, defineSchema, defineTable, internalAction, internalMutation, mutation, query } from "../src/server";
@@ -61,6 +61,17 @@ const modules = {
       handler: async (ctx, { id, context, result }) => {
         await ctx.db.insert("log", { text: `done ${context} ${result.kind}${result.kind === "success" ? ` ${JSON.stringify(result.returnValue)}` : result.kind === "failed" ? ` ${result.error}` : ""}` });
       },
+    }),
+    typedDone: internalMutation({
+      args: onCompleteArgs(v.object({ n: v.number() })),
+      handler: async (ctx, { context, result }) => {
+        const n: number = context.n;
+        await ctx.db.insert("log", { text: `typed ${n + 1} ${result.kind}` });
+      },
+    }),
+    typed: mutation({
+      args: { context: v.any() },
+      handler: (ctx: any, { context }) => ctx.components.queue.enqueueMutation({ fn: internal.work.write, args: { text: "t" }, onComplete: internal.work.typedDone, context }),
     }),
     enqueue: mutation({ args: { kind: v.string(), args: v.any() }, handler: (ctx: any, { kind, args }) => ctx.components.queue[kind]({ ...args, fn: internal.work[args.fn], onComplete: args.onComplete ? internal.work.done : undefined }) }),
     cancel: mutation({ args: { id: v.string() }, handler: (ctx: any, { id }) => ctx.components.queue.cancel({ id }) }),
@@ -134,6 +145,13 @@ for (const D of DRIVERS) describe(`${D.name}: work queue`, () => {
     expect(await status(later)).toMatchObject({ state: "canceled" });
     expect(await runtime.runMutation("work:cancel", { id: later })).toBe(false);
     expect(await log()).toEqual(["done l canceled"]);
+  });
+
+  test("onCompleteArgs checks the context; a bad one fails only the callback", async () => {
+    const good = (await runtime.runMutation("work:typed", { context: { n: 1 } })) as string;
+    const bad = (await runtime.runMutation("work:typed", { context: { n: "one" } })) as string;
+    await until(async () => (await status(good)).state === "succeeded" && (await status(bad)).state === "succeeded");
+    expect((await log()).sort()).toEqual(["t", "t", "typed 2 success"]);
   });
 
   test("actions can enqueue too", async () => {

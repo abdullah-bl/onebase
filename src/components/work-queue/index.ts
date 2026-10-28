@@ -11,7 +11,7 @@ import type { FunctionHandle, FunctionReference } from "../../api";
 import { componentServer, defineComponent, splitMountOptions, type ComponentFn, type Mount, type MountOptions } from "..";
 import { defineSchema, defineTable, type DataModelFromSchema } from "../../schema";
 import { paginationOptsValidator } from "../../server";
-import { v, type GenericId } from "../../values";
+import { v, type AnyValidator, type GenericId, type Validator } from "../../values";
 
 const state = v.union(v.literal("pending"), v.literal("running"), v.literal("succeeded"), v.literal("failed"), v.literal("canceled"));
 
@@ -67,7 +67,15 @@ const parallelism = (c: Config) => c.maxParallelism ?? 10;
 /** What onComplete receives. */
 export type WorkResult = { kind: "success"; returnValue: unknown } | { kind: "failed"; error: string } | { kind: "canceled" };
 /** onComplete's args: `internalMutation({ args: onCompleteValidator, handler: (ctx, { id, context, result }) => ... })`. */
-export const onCompleteValidator = { id: v.string(), context: v.any(), result: v.any() };
+export const onCompleteValidator = { id: v.string(), context: v.any(), result: v.any() as Validator<WorkResult, false> };
+
+/**
+ * onComplete's args with `context` checked and typed by a validator, like Convex's vOnCompleteArgs:
+ * `internalMutation({ args: onCompleteArgs(v.object({ userId: v.id("users") })), handler: ... })`.
+ */
+export function onCompleteArgs<C extends AnyValidator>(context: C) {
+  return { id: v.string(), context, result: onCompleteValidator.result };
+}
 
 /** Makes sure `pump` runs by `at`: one scheduled run at a time. */
 async function wake(ctx: Ctx, at: number) {

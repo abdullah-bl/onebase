@@ -50,7 +50,7 @@ export const signUp = mutation({
 });
 
 export const welcomeSent = internalMutation({
-  args: onCompleteValidator, // from "onebase/components/work-queue"
+  args: onCompleteArgs(v.object({ userId: v.id("users") })), // from "onebase/components/work-queue"
   handler: async (ctx, { context, result }) => {
     if (result.kind === "success") await ctx.db.patch(context.userId, { welcomed: true });
     if (result.kind === "failed") console.error(`Welcome email failed: ${result.error}`);
@@ -69,7 +69,7 @@ The item is queued in your mutation's transaction, so if the mutation fails, not
 | `status({ id })` | `{ id, state, attempts, runAt, error, result }`, or null once the item has been forgotten. `state` is `pending`, `running`, `succeeded`, `failed` or `canceled`. |
 | `list({ state, paginationOpts })` | Items in one state, oldest first. |
 
-`onComplete` receives `{ id, context, result }`. `result` is `{ kind: "success", returnValue }`, `{ kind: "failed", error }` (after the last attempt) or `{ kind: "canceled" }`. If `onComplete` throws, its writes are rolled back and the error is logged; the item's own result stands.
+`onComplete` receives `{ id, context, result }`. Its args are `onCompleteArgs(contextValidator)`, which checks and types `context`, or `onCompleteValidator` for any context. `result` is `{ kind: "success", returnValue }`, `{ kind: "failed", error }` (after the last attempt) or `{ kind: "canceled" }`. If `onComplete` throws, its writes are rolled back and the error is logged; the item's own result stands.
 
 ## How it runs
 

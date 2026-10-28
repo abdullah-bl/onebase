@@ -817,7 +817,7 @@ export class Runtime {
     };
     return {
       db: {
-        get: (id: string) => read((db) => db.get(id)),
+        get: (...args: unknown[]) => read((db) => db.get(...args)),
         query,
         normalizeId: (table: string, id: string) => (isIdForTable(id, table) ? id : null),
       } as any,

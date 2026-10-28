@@ -35,6 +35,7 @@ onebase uses Convex's programming model and most of its API. If you know Convex,
 | Functions folder | `convex/` | `onebase/` (a `convex/` folder also works) |
 | Full-text search | ✓ | ✓ (`searchIndex`, `withSearchIndex`) |
 | Vector search | ✓ | ✓ (`vectorIndex`, `ctx.vectorSearch`) |
+| Components | `convex.config.ts`, `ctx.runMutation(components.x.lib.fn)` | `components.ts`, `ctx.components.x.fn()`; Convex component packages don't run unmodified yet |
 | Dashboard | ✓ | ✓ (built in, at `/_admin`) |
 
 ## Porting a project

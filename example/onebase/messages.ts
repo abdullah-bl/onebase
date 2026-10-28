@@ -52,6 +52,8 @@ export const send = mutation({
   handler: async (ctx, args) => {
     const body = args.body.trim();
     if (!body && !args.image) throw new ConvexError("Message can't be empty");
+    const { ok, retryAfter } = await ctx.components.limiter.limit({ name: "sendMessage", key: args.author });
+    if (!ok) throw new ConvexError(`Slow down: you can send another message in ${Math.ceil(retryAfter / 1000)}s.`);
     const id = await ctx.db.insert("messages", { ...args, body });
     if (body.startsWith("/tmp ")) {
       // Self-destructing message: deleted by a scheduled internal mutation.

@@ -1,0 +1,101 @@
+---
+title: Writing components
+description: Define a component's tables, functions and configuration with defineComponent, and publish it as an npm package.
+---
+
+# Writing components
+
+A component is a schema, some functions and, optionally, a configuration check. You write it with the same API the components that ship with onebase use (the [rate limiter](./rate-limiter.md) is a short example to read).
+
+```ts
+// counter/index.ts
+import { componentServer, defineComponent, splitMountOptions, type ComponentFn, type Mount, type MountOptions } from "onebase/components";
+import { defineSchema, defineTable, type DataModelFromSchema } from "onebase/server";
+import { v } from "onebase/values";
+
+// 1. Tables, only the component can use them.
+const schema = defineSchema({
+  counters: defineTable({ name: v.string(), value: v.number() }).index("by_name", ["name"]),
+});
+
+// 2. Builders typed with those tables and the configuration.
+type Config = { start: number };
+const { query, mutation } = componentServer<DataModelFromSchema<typeof schema>, Config>();
+
+const find = (ctx: { db: any }, name: string) =>
+  ctx.db.query("counters").withIndex("by_name", (q: any) => q.eq("name", name)).unique();
+
+const add = mutation({
+  args: { name: v.string(), by: v.optional(v.number()) },
+  handler: async (ctx, { name, by = 1 }) => {
+    const row = await find(ctx, name);
+    const value = (row?.value ?? ctx.config.start) + by;
+    if (row) await ctx.db.patch(row._id, { value });
+    else await ctx.db.insert("counters", { name, value });
+    return value;
+  },
+});
+
+const get = query({
+  args: { name: v.string() },
+  handler: async (ctx, { name }) => (await find(ctx, name))?.value ?? ctx.config.start,
+});
+
+// 3. The component.
+export const definition = defineComponent({
+  name: "counter",
+  schema,
+  functions: { add, get },
+  checkConfig: (config: Config) => {
+    if (typeof config?.start !== "number") throw new Error("counter({ start }) needs a number.");
+  },
+});
+
+// 4. A factory apps call in components.ts.
+export function counter(opts: Config & MountOptions) {
+  const { config, options } = splitMountOptions(opts);
+  return definition.mount(config, options);
+}
+```
+
+The app mounts it with `counter: counter({ start: 0 })` and calls `ctx.components.counter.add({ name: "visits" })`.
+
+## What a component's functions get
+
+| | |
+|---|---|
+| `ctx.db` | The component's own tables, by their names in its schema (`"counters"`, not `"counter.counters"`). Documents are validated against its schema, always. |
+| `ctx.config` | The configuration the app mounted this copy with. It can hold functions, such as a callback that picks a field. |
+| `ctx.component.mount` | The name this copy is mounted under. |
+| `ctx.auth` | The caller's identity when mounted with `auth: true`, otherwise always null. |
+| `ctx.runQuery(fn, args)` / `ctx.runMutation(fn, args)` | Calls another of the component's functions. Pass the function itself (`ctx.runMutation(add, {...})`), since components don't have generated references. |
+| `ctx.scheduler.runAfter(ms, fn, args)` | Schedules one of the component's functions, the same way. |
+| `ctx.vectorSearch(...)` | In actions, over the component's tables. |
+
+`ctx.storage` isn't available to components.
+
+## Public and internal functions
+
+Functions built with `query`, `mutation` and `action` are the component's API: the app can call them. Ones built with `internalQuery`, `internalMutation` and `internalAction` can only be called by the component itself, for example from its scheduler.
+
+Group functions with nesting: `functions: { lib: { add, get } }` is called as `ctx.components.counter.lib.add()`.
+
+## Typing the API
+
+The app's types come from the functions' validators, with no codegen. To make them more precise than the validators can, such as accepting only the limit names the app configured, give the mount a hand-written API type, as the rate limiter does:
+
+```ts
+export type CounterApi<Name extends string> = {
+  add: ComponentFn<"mutation", (args: { name: Name; by?: number }) => Promise<number>>;
+  get: ComponentFn<"query", (args: { name: Name }) => Promise<number>>;
+};
+
+export function counter<const N extends string>(opts: { names: N[] } & Config & MountOptions): Mount<CounterApi<N>> {
+  const { config, options } = splitMountOptions(opts);
+  return definition.mount(config, options) as Mount<CounterApi<N>>;
+}
+```
+
+## Publishing
+
+A component is an ordinary npm package that imports `onebase/components`, `onebase/server` and `onebase/values`. List `onebase` as a peer dependency: the server provides those modules itself, also to code pushed with `onebase deploy` and inside compiled binaries.

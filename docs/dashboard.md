@@ -45,7 +45,9 @@ Edits go through the same path as a mutation:
 
 **Saving replaces the whole document.** The editor shows the document without `_id` and `_creationTime`.
 
-Tables that have documents but are no longer in `schema.ts` still show up, marked "not in schema", so you can inspect old data.
+Tables that have documents but are no longer in `schema.ts` still show up, marked "not in schema", so you can inspect old data. **Delete all** empties such a table.
+
+[Components](./components.md)' tables are listed under each component's name, and are checked against the component's schema when you edit them. Their functions show up under `components/<name>` on the Functions page, where you can run them.
 
 ## Running functions
 

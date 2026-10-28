@@ -216,12 +216,34 @@ const like = useMutation(api.posts.like).withOptimisticUpdate((store, { id }) =>
 });
 ```
 
+## Components
+
+Mount packages with their own tables in `onebase/components.ts`, then call them from functions:
+
+```ts
+// onebase/components.ts (import types only from ./_generated/dataModel here)
+import { defineComponents } from "onebase/components";
+import { rateLimiter, MINUTE } from "onebase/components/rate-limiter";
+export default defineComponents({
+  limiter: rateLimiter({ rates: { send: { kind: "token bucket", rate: 10, period: MINUTE } } }),
+});
+
+// in a mutation
+await ctx.components.limiter.limit({ name: "send", key: userId, throws: true });
+```
+
+- Queries call component queries; mutations call queries and mutations in the same transaction; actions call anything.
+- Your `ctx.db` can't see component tables (stored as `limiter.rateLimits`), and components can't see yours. Pass ids as strings.
+- Clients can't call components directly: wrap them in your own query or mutation.
+- Components get `ctx.auth` only when mounted with `auth: true`.
+
 ## Differences from Convex
 
 - Functions run in Bun, on SQLite by default, or on Postgres, MySQL or Turso with `--db`. Any npm package works anywhere, and there is no `"use node"`.
 - Mutations run one at a time; reads use a consistent snapshot.
 - `.filter` also accepts an object shorthand, and indexes are picked automatically for filters.
 - `auth.config.ts` can also export a custom `authenticate(token)`.
+- Components are mounted with `defineComponents` in `components.ts` and called as `ctx.components.x.fn(args)`, not through `convex.config.ts` and `ctx.runMutation(components.x.lib.fn)`.
 - Not supported yet: `ctx.db.system`.
 
 Run `onebase doctor` after changes: it checks the schema, indexes, imports and common mistakes, and prints the fix for each.

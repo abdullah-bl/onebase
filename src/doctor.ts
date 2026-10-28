@@ -138,6 +138,7 @@ function checkFunctions(project: Project, findings: Finding[]) {
     }
   }
   const names = new Set(Object.entries(project.modules).flatMap(([m, ex]) => Object.keys(ex).map((e) => `${m}:${e}`)));
+  for (const name of componentFunctionNames(project)) names.add(name);
   for (const job of project.crons?.jobs ?? []) {
     if (!names.has(job.fn)) {
       findings.push({ level: "error", where: `crons.ts › ${job.name}`, message: `Cron calls "${job.fn}", which doesn't exist.` });
@@ -150,6 +151,61 @@ function checkFunctions(project: Project, findings: Finding[]) {
       message: "No functions found.",
       fix: 'Export one: export const list = query({ args: {}, handler: async (ctx) => ctx.db.query("messages").collect() })',
     });
+  }
+}
+
+/** Every mounted component function's name, e.g. "components/limiter:limit". */
+function componentFunctionNames(project: Project): string[] {
+  const names: string[] = [];
+  const walk = (tree: Record<string, unknown>, prefix: string[]) => {
+    for (const [key, value] of Object.entries(tree)) {
+      if (isRegisteredFunction(value)) names.push(`components/${prefix.join("/")}:${key}`);
+      else walk(value as Record<string, unknown>, [...prefix, key]);
+    }
+  };
+  for (const [mount, m] of Object.entries(project.components?.mounts ?? {})) walk(m.definition.functions, [mount]);
+  return names;
+}
+
+function checkComponents(project: Project, files: string[], findings: Finding[]) {
+  const file = files.find((f) => modulePathFor(project.dir, f) === "components");
+  if (!file) return;
+  readFileSync(file, "utf8")
+    .split("\n")
+    .forEach((line, i) => {
+      if (/from\s+["']\.\/_generated\/(server|api)(\.[jt]s)?["']/.test(line)) {
+        findings.push({
+          level: "error",
+          where: `components.ts:${i + 1}`,
+          message: "components.ts imports _generated/server or _generated/api, which are typed from components.ts: a type cycle.",
+          fix: 'Import only types from "./_generated/dataModel" here (e.g. Doc<"scores">).',
+        });
+      }
+    });
+  for (const modulePath of Object.keys(project.modules)) {
+    if (modulePath === "components" || modulePath.startsWith("components/")) {
+      findings.push({
+        level: "error",
+        where: `${modulePath}.ts`,
+        message: "The components/ folder name is reserved for the components mounted in components.ts.",
+        fix: "Move these functions to another folder.",
+      });
+    }
+  }
+  for (const [mount, m] of Object.entries(project.components?.mounts ?? {})) {
+    const own = Object.keys(m.definition.schema.tables);
+    for (const [table, def] of Object.entries(m.definition.schema.tables) as [string, any][]) {
+      const ids: string[] = [];
+      collectIds(def.validator, ids);
+      for (const target of ids.filter((t) => t !== "_storage" && !own.includes(t))) {
+        findings.push({
+          level: "error",
+          where: `components.ts › ${mount}.${table}`,
+          message: `v.id("${target}") points outside component "${m.definition.name}"; its tables are ${own.join(", ")}.`,
+          fix: "Store ids of the app's documents as v.string(): a component can't read the app's tables.",
+        });
+      }
+    }
   }
 }
 
@@ -227,6 +283,7 @@ export async function doctor(dirInput: string): Promise<Finding[]> {
   }
   checkSchema(project, findings);
   checkFunctions(project, findings);
+  checkComponents(project, files, findings);
   const stale = await staleGeneratedFiles(dir);
   if (stale.length) {
     findings.push({

@@ -5,6 +5,7 @@ import { Empty, ago, errorText, fullTime, preview, sample, toast, typeText } fro
 
 type Table = {
   name: string;
+  component: string | null;
   count: number;
   inSchema: boolean;
   fields: string[];
@@ -111,6 +112,13 @@ function Editor({
   );
 }
 
+/** App tables first, then each component's under its name. */
+function groupByComponent(tables: Table[]): [string | null, Table[]][] {
+  const groups = new Map<string | null, Table[]>([[null, []]]);
+  for (const t of tables) groups.set(t.component, [...(groups.get(t.component) ?? []), t]);
+  return [...groups].filter(([, list]) => list.length);
+}
+
 export function DataView({ table: selected, go }: { table?: string; go: (route: string) => void }) {
   const [tables, setTables] = useState<Table[] | null>(null);
   const [rows, setRows] = useState<Doc[]>([]);
@@ -185,6 +193,17 @@ export function DataView({ table: selected, go }: { table?: string; go: (route: 
     return [...keys].slice(0, 10);
   }, [rows, table]);
 
+  const clearTable = async (t: Table) => {
+    if (!confirm(`Delete all ${t.count.toLocaleString()} documents in ${t.name}? This can't be undone.`)) return;
+    try {
+      await call("clearTable", { table: t.name });
+      void loadTables();
+      void load();
+    } catch (e) {
+      setError(errorText(e));
+    }
+  };
+
   const applyFilter = (e: Event) => {
     e.preventDefault();
     const t = filterText.trim();
@@ -206,11 +225,16 @@ export function DataView({ table: selected, go }: { table?: string; go: (route: 
         <p class="list-title">Tables</p>
         {tables === null && <p class="muted pad">Loading…</p>}
         {tables?.length === 0 && <p class="muted pad">No tables yet.</p>}
-        {tables?.map((t) => (
-          <a href={`#/data/${t.name}`} aria-current={t.name === selected ? "page" : undefined}>
-            <span>{t.name}</span>
-            <small>{t.count.toLocaleString()}</small>
-          </a>
+        {groupByComponent(tables ?? []).map(([component, list]) => (
+          <>
+            {component && <p class="list-title">Component: {component}</p>}
+            {list.map((t) => (
+              <a href={`#/data/${t.name}`} aria-current={t.name === selected ? "page" : undefined}>
+                <span>{component ? t.name.slice(component.length + 1) : t.name}</span>
+                <small>{t.count.toLocaleString()}</small>
+              </a>
+            ))}
+          </>
         ))}
       </nav>
 
@@ -228,7 +252,9 @@ export function DataView({ table: selected, go }: { table?: string; go: (route: 
                   {table.inSchema
                     ? `Indexes: ${table.indexes.map((i) => i.name).join(", ")}` +
                       (table.searchIndexes.length ? ` · Search: ${table.searchIndexes.map((i) => `${i.name} (${i.searchField})`).join(", ")}` : "")
-                    : "This table has documents but isn't in schema.ts."}
+                    : table.component
+                      ? `Component "${table.component}" isn't mounted in components.ts anymore; these documents are kept until you delete them.`
+                      : "This table has documents but isn't in schema.ts."}
                 </p>
               </div>
               <div class="toolbar">
@@ -244,6 +270,11 @@ export function DataView({ table: selected, go }: { table?: string; go: (route: 
                   {order === "desc" ? "Newest first" : "Oldest first"}
                 </button>
                 {table.inSchema && <button class="btn primary" onClick={() => setEditing("new")}>Add document</button>}
+                {!table.inSchema && table.count > 0 && (
+                  <button class="btn danger" onClick={() => void clearTable(table)}>
+                    Delete all
+                  </button>
+                )}
               </div>
             </header>
             {error && <p class="error-box">{error}</p>}

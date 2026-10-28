@@ -11,6 +11,7 @@ import type {
 } from "./api";
 import { getFunctionName } from "./api";
 import { parseCron } from "./cron";
+import type { ComponentsCtx } from "./components";
 import type { AnyDataModel, GenericDataModel, GenericTableInfo, SearchIndexConfig, VectorIndexConfig } from "./schema";
 import {
   asObjectValidator,
@@ -213,19 +214,25 @@ export interface Scheduler {
   cancel(id: string): Promise<void>;
 }
 
-export interface QueryCtx<DM = AnyDataModel> {
+export interface QueryCtx<DM = AnyDataModel, C = {}> {
   db: DatabaseReader<DM>;
   auth: Auth;
   storage: StorageReader;
+  /** Runs another query in the same snapshot; what it reads makes this query re-run too. */
+  runQuery: Call<"query">;
+  /** The components mounted in components.ts (queries can call their queries). */
+  components: ComponentsCtx<C, "query">;
 }
 
-export interface MutationCtx<DM = AnyDataModel> {
+export interface MutationCtx<DM = AnyDataModel, C = {}> {
   db: DatabaseWriter<DM>;
   auth: Auth;
   storage: StorageWriter;
   scheduler: Scheduler;
   runQuery: Call<"query">;
   runMutation: Call<"mutation">;
+  /** The components mounted in components.ts, in this mutation's transaction. */
+  components: ComponentsCtx<C, "mutation">;
 }
 
 export type VectorFilter = { readonly __vectorFilter: true };
@@ -245,8 +252,10 @@ export type VectorSearchQuery<Doc, Index extends VectorIndexConfig> = {
   filter?: (q: VectorFilterBuilder<Doc, Index>) => VectorFilter;
 };
 
-export interface ActionCtx<DM = AnyDataModel> {
+export interface ActionCtx<DM = AnyDataModel, C = {}> {
   auth: Auth;
+  /** The components mounted in components.ts; each call is its own transaction. */
+  components: ComponentsCtx<C, "action">;
   storage: StorageActionWriter;
   scheduler: Scheduler;
   runQuery: Call<"query">;
@@ -295,7 +304,7 @@ export interface FunctionBuilder<Type extends FunctionType, Visibility extends F
   ): RegisteredFunction<Type, Visibility, {}, Awaited<R>>;
 }
 
-function builder(type: FunctionType, visibility: FunctionVisibility): any {
+export function functionBuilder(type: FunctionType, visibility: FunctionVisibility): any {
   return (def: any) => {
     const d = typeof def === "function" ? { handler: def } : def;
     if (typeof d?.handler !== "function") {
@@ -315,17 +324,20 @@ function builder(type: FunctionType, visibility: FunctionVisibility): any {
   };
 }
 
-/** Typed builders for a data model. `_generated/server.ts` calls this with your schema's types. */
-export function makeServer<DM extends GenericDataModel | AnyDataModel = AnyDataModel>() {
+/**
+ * Typed builders for a data model (and the components mounted in components.ts).
+ * `_generated/server.ts` calls this with your schema's types.
+ */
+export function makeServer<DM extends GenericDataModel | AnyDataModel = AnyDataModel, C = {}>() {
   return {
-    query: builder("query", "public") as FunctionBuilder<"query", "public", QueryCtx<DM>>,
-    mutation: builder("mutation", "public") as FunctionBuilder<"mutation", "public", MutationCtx<DM>>,
-    action: builder("action", "public") as FunctionBuilder<"action", "public", ActionCtx<DM>>,
-    internalQuery: builder("query", "internal") as FunctionBuilder<"query", "internal", QueryCtx<DM>>,
-    internalMutation: builder("mutation", "internal") as FunctionBuilder<"mutation", "internal", MutationCtx<DM>>,
-    internalAction: builder("action", "internal") as FunctionBuilder<"action", "internal", ActionCtx<DM>>,
+    query: functionBuilder("query", "public") as FunctionBuilder<"query", "public", QueryCtx<DM, C>>,
+    mutation: functionBuilder("mutation", "public") as FunctionBuilder<"mutation", "public", MutationCtx<DM, C>>,
+    action: functionBuilder("action", "public") as FunctionBuilder<"action", "public", ActionCtx<DM, C>>,
+    internalQuery: functionBuilder("query", "internal") as FunctionBuilder<"query", "internal", QueryCtx<DM, C>>,
+    internalMutation: functionBuilder("mutation", "internal") as FunctionBuilder<"mutation", "internal", MutationCtx<DM, C>>,
+    internalAction: functionBuilder("action", "internal") as FunctionBuilder<"action", "internal", ActionCtx<DM, C>>,
     httpAction: httpAction as (
-      handler: (ctx: ActionCtx<DM>, request: Request) => Promise<Response> | Response,
+      handler: (ctx: ActionCtx<DM, C>, request: Request) => Promise<Response> | Response,
     ) => HttpAction,
   };
 }

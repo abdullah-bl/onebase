@@ -3,6 +3,7 @@ import type { PaginationOptions, PaginationResult } from "../server";
 import { describeValue, isPlainObject, validate, type AnyValidator } from "../values";
 import { cosineDistance, FIELD_PATH, isIdForTable, newId, systemKind, tableLiteral, type Dialect, type ValueKind } from "./dialect";
 import type { Exec } from "./driver";
+import { indexIdent, TableScope, tableMount, validatesTable, type Catalog } from "./catalog";
 
 export type Doc = Record<string, unknown> & { _id: string; _creationTime: number };
 
@@ -22,7 +23,10 @@ export type Write = { table: string; id: string; before: Doc | null; after: Doc 
 export type DbOptions = {
   tx: Exec;
   dialect: Dialect;
-  schema: SchemaDefinition<any> | null;
+  /** Every table's definition; null when there is no schema.ts and no component (any table, unvalidated). */
+  catalog: Catalog | null;
+  /** The tables this handle may use (default: the app's). */
+  scope?: TableScope;
   nextCreationTime: () => number;
   readSet?: ReadSet;
   writes?: Write[];
@@ -267,7 +271,7 @@ function decodeCursor(cursor: string): unknown[] {
 /** Search queries return at most this many results, like Convex. */
 export const MAX_SEARCH_RESULTS = 1024;
 
-export const searchIndexName = (table: string, index: string) => `sx_${table}__${index}`;
+export const searchIndexName = (table: string, index: string) => indexIdent("sx", table, index);
 
 /** Words in a search string (letters, digits and combining marks), at most 16. */
 export function searchTerms(text: string): string[] {
@@ -287,7 +291,7 @@ function searchOffset(cursor: string): number {
 export const DEFAULT_VECTOR_RESULTS = 10;
 export const MAX_VECTOR_RESULTS = 256;
 
-export const vectorIndexName = (table: string, index: string) => `vx_${table}__${index}`;
+export const vectorIndexName = (table: string, index: string) => indexIdent("vx", table, index);
 
 export type VectorSearchQuery = { vector: unknown; limit?: unknown; filter?: (q: any) => unknown };
 type VectorFilter = { __vectorFilter: true; op: "eq"; field: string; value: unknown } | { __vectorFilter: true; op: "or"; args: VectorFilter[] };
@@ -619,16 +623,18 @@ export class DatabaseImpl {
   readonly tx: Exec;
   readonly dialect: Dialect;
   readonly readSet?: ReadSet;
-  private readonly schema: SchemaDefinition<any> | null;
+  readonly scope: TableScope;
+  private readonly catalog: Catalog | null;
   private readonly writes?: Write[];
   private readonly onWarning?: (message: string) => void;
   private readonly explain?: DbOptions["explain"];
   private readonly nextCreationTime: () => number;
 
-  constructor(opts: DbOptions) {
+  constructor(private readonly opts: DbOptions) {
     this.tx = opts.tx;
     this.dialect = opts.dialect;
-    this.schema = opts.schema;
+    this.catalog = opts.catalog;
+    this.scope = opts.scope ?? TableScope.app;
     this.readSet = opts.readSet;
     this.writes = opts.writes;
     this.onWarning = opts.onWarning;
@@ -637,20 +643,26 @@ export class DatabaseImpl {
     this.warned = opts.warned ?? new Set();
   }
 
+  /** The same transaction, read set and writes, limited to another scope's tables. */
+  withScope(scope: TableScope): DatabaseImpl {
+    return scope === this.scope ? this : new DatabaseImpl({ ...this.opts, warned: this.warned, scope });
+  }
+
+  /** Checks a table name this scope uses and returns its stored name. */
   private checkTable(table: unknown): string {
     if (typeof table !== "string") {
       throw new OnebaseError(`Expected a table name string, got ${describeValue(table)}.`);
     }
-    if (this.schema && !(table in this.schema.tables)) {
-      const known = Object.keys(this.schema.tables).join(", ") || "(none)";
-      throw new OnebaseError(`Table "${table}" is not in schema.ts. Known tables: ${known}. Add it with defineTable() first.`);
-    }
-    return table;
+    return this.scope.table(table, this.catalog);
+  }
+
+  private tableDef(table: string) {
+    return this.catalog?.tables[table] as any;
   }
 
   indexFields(table: string, indexName: string): string[] {
     if (indexName === "by_creation_time") return ["_creationTime"];
-    const def = this.schema?.tables[table];
+    const def = this.tableDef(table);
     const index = def?.indexes.find((i: { name: string }) => i.name === indexName);
     if (!index) {
       const names = ["by_creation_time", ...(def?.indexes.map((i: { name: string }) => i.name) ?? [])].join(", ");
@@ -665,7 +677,7 @@ export class DatabaseImpl {
   private readonly warned: Set<string>;
 
   searchIndex(table: string, indexName: string): SearchIndexDef {
-    const indexes = (this.schema?.tables[table]?.searchIndexes ?? []) as SearchIndexDef[];
+    const indexes = (this.tableDef(table)?.searchIndexes ?? []) as SearchIndexDef[];
     const index = indexes.find((i) => i.name === indexName);
     if (!index) {
       throw new OnebaseError(
@@ -679,7 +691,7 @@ export class DatabaseImpl {
   }
 
   vectorIndex(table: string, indexName: unknown): VectorIndexDef {
-    const indexes = (this.schema?.tables[table]?.vectorIndexes ?? []) as VectorIndexDef[];
+    const indexes = (this.tableDef(table)?.vectorIndexes ?? []) as VectorIndexDef[];
     const index = indexes.find((i) => i.name === indexName);
     if (!index) {
       throw new OnebaseError(
@@ -694,7 +706,7 @@ export class DatabaseImpl {
 
   /** Checks the table's vector fields and keeps vector indexes in step with a write (where the database doesn't index documents itself). */
   private async syncVectors(table: string, id: string, doc: Record<string, unknown> | null) {
-    const indexes = (this.schema?.tables[table]?.vectorIndexes ?? []) as VectorIndexDef[];
+    const indexes = (this.tableDef(table)?.vectorIndexes ?? []) as VectorIndexDef[];
     if (!indexes.length) return;
     const entries = indexes.map((i) => ({ name: vectorIndexName(table, i.name), vector: doc ? documentVector(i, table, doc) : null }));
     await this.dialect.syncVector?.(this.tx, id, entries);
@@ -771,7 +783,7 @@ export class DatabaseImpl {
 
   /** Keeps the table's search indexes in step with a write (a no-op where the database indexes documents itself). */
   private async syncSearch(table: string, id: string, doc: Record<string, unknown> | null) {
-    const indexes = (this.schema?.tables[table]?.searchIndexes ?? []) as SearchIndexDef[];
+    const indexes = (this.tableDef(table)?.searchIndexes ?? []) as SearchIndexDef[];
     if (!indexes.length || !this.dialect.syncSearch) return;
     const entries = indexes.map((i) => {
       const value = doc ? getPath(doc, i.searchField) : undefined;
@@ -786,12 +798,13 @@ export class DatabaseImpl {
     this.warned.add(sql);
     const fields = [...new Set(filters.flatMap(equalityConditions).map(([f]) => f))];
     let indexed: boolean;
+    const indexes = (this.tableDef(table)?.indexes ?? []) as { name: string; fields: string[] }[];
     if (this.explain) {
       const plan = await this.explain(this.tx, sql, params);
-      indexed = plan.some((line) => line.includes(`cl_${table}__`));
+      const names = indexes.map((i) => indexIdent("cl", table, i.name));
+      indexed = plan.some((line) => names.some((n) => line.includes(n)));
     } else {
       // Without a query planner to ask, check whether some index starts with a filtered field.
-      const indexes = (this.schema?.tables[table]?.indexes ?? []) as { fields: string[] }[];
       indexed = indexes.some((i) => fields.includes(i.fields[0]!));
     }
     if (indexed) return;
@@ -802,8 +815,8 @@ export class DatabaseImpl {
   }
 
   private validateDoc(table: string, value: Record<string, unknown>) {
-    const tableDef = this.schema?.tables[table];
-    if (!tableDef || !this.schema?.schemaValidation) return;
+    const tableDef = this.tableDef(table);
+    if (!tableDef || !validatesTable(this.catalog!, table)) return;
     const errors = validate(tableDef.validator as AnyValidator, value, "document");
     if (errors.length) {
       throw new OnebaseError(`Invalid "${table}" document:\n  - ${errors.join("\n  - ")}`);
@@ -841,7 +854,9 @@ export class DatabaseImpl {
   async get(id: unknown): Promise<Doc | null> {
     const docId = this.requireId(id, "get");
     this.readSet?.ids.add(docId);
-    return (await this.loadRaw(docId))?.doc ?? null;
+    const raw = await this.loadRaw(docId);
+    // Another component's (or the app's) documents don't exist as far as this scope is concerned.
+    return raw && this.scope.owns(raw.table) ? raw.doc : null;
   }
 
   query(table: unknown) {
@@ -850,8 +865,7 @@ export class DatabaseImpl {
 
   /** Synchronous, like Convex: ids carry a tag for their table. */
   normalizeId(table: string, id: string): string | null {
-    this.checkTable(table);
-    return isIdForTable(id, table) ? id : null;
+    return isIdForTable(id, this.checkTable(table)) ? id : null;
   }
 
   // -- DatabaseWriter --
@@ -872,6 +886,14 @@ export class DatabaseImpl {
     const docId = this.requireId(id, verb);
     const raw = await this.loadRaw(docId);
     if (!raw) throw new OnebaseError(`db.${verb}(): document "${docId}" doesn't exist (it may have been deleted).`);
+    if (!this.scope.owns(raw.table)) {
+      const owner = tableMount(raw.table);
+      throw new OnebaseError(
+        owner
+          ? `db.${verb}(): document "${docId}" belongs to component "${owner}"; change it through the component's functions.`
+          : `db.${verb}(): document "${docId}" isn't in this component's tables.`,
+      );
+    }
     return { id: docId, table: raw.table, doc: raw.doc };
   }
 
@@ -958,7 +980,7 @@ export async function applySchema(
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(index.name)) {
         throw new Error(`Invalid index name "${index.name}" on table "${table}".`);
       }
-      const name = `cl_${table}__${index.name}`;
+      const name = indexIdent("cl", table, index.name);
       const columns = [...index.fields.map((f) => dialect.field(f)), "ct", "id"];
       const sql = dialect.createIndex(name, table, columns);
       wanted.set(name, { def: sql, create: [sql] });

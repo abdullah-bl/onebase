@@ -25,7 +25,10 @@ export async function generateFiles(dirInput: string): Promise<Record<string, st
   const files = await listSourceFiles(dir);
   const modulePaths = files.map((f) => modulePathFor(dir, f));
   const hasSchema = modulePaths.includes("schema");
-  const fnModules = modulePaths.filter((m) => m !== "schema" && m !== "auth.config");
+  const hasComponents = modulePaths.includes("components");
+  const fnModules = modulePaths.filter((m) => m !== "schema" && m !== "auth.config" && m !== "components");
+  // ctx.components is typed from components.ts, which may import only dataModel (anything else is a cycle).
+  const typeArgs = hasComponents ? "DataModel, typeof components" : "DataModel";
 
   const dataModel = `${HEADER}
 import type { ${hasSchema ? "DataModelFromSchema, " : ""}GenericId } from "onebase/server";
@@ -46,14 +49,14 @@ import {
   type MutationCtx as GenericMutationCtx,
   type QueryCtx as GenericQueryCtx,
 } from "onebase/server";
-import type { DataModel } from "./dataModel";
+import type { DataModel } from "./dataModel";${hasComponents ? `\nimport type components from "../components";` : ""}
 
 export const { query, mutation, action, internalQuery, internalMutation, internalAction, httpAction } =
-  makeServer<DataModel>();
+  makeServer<${typeArgs}>();
 
-export type QueryCtx = GenericQueryCtx<DataModel>;
-export type MutationCtx = GenericMutationCtx<DataModel>;
-export type ActionCtx = GenericActionCtx<DataModel>;
+export type QueryCtx = GenericQueryCtx<${typeArgs}>;
+export type MutationCtx = GenericMutationCtx<${typeArgs}>;
+export type ActionCtx = GenericActionCtx<${typeArgs}>;
 export type DatabaseReader = GenericDatabaseReader<DataModel>;
 export type DatabaseWriter = GenericDatabaseWriter<DataModel>;
 `;

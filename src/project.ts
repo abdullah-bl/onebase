@@ -4,6 +4,9 @@ import { plugin } from "bun";
 import { existsSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import * as auth from "./auth";
+import * as components from "./components";
+import type { ComponentsDefinition } from "./components";
+import * as rateLimiter from "./components/rate-limiter";
 import type { AuthConfig } from "./engine/jwt";
 import type { Modules } from "./engine/runtime";
 import type { SchemaDefinition } from "./schema";
@@ -19,11 +22,16 @@ export type Project = {
   crons: Crons | null;
   /** auth.config.ts's default export. */
   authConfig: AuthConfig | null;
+  /** components.ts's default export. */
+  components: ComponentsDefinition | null;
   /** Module path → source file. */
   sources: Record<string, string>;
 };
 
-const SPECIAL = new Set(["schema", "auth.config"]);
+const SPECIAL = new Set(["schema", "auth.config", "components"]);
+
+/** The components that ship with onebase, importable as onebase/components/<name>. */
+export const BUILT_IN_COMPONENTS: Record<string, Record<string, unknown>> = { "rate-limiter": rateLimiter };
 
 let registered = false;
 
@@ -40,6 +48,10 @@ export function registerVirtualModules() {
       build.module("onebase/server", () => ({ exports: server, loader: "object" }));
       build.module("onebase/values", () => ({ exports: values, loader: "object" }));
       build.module("onebase/auth", () => ({ exports: auth, loader: "object" }));
+      build.module("onebase/components", () => ({ exports: components, loader: "object" }));
+      for (const [name, exports] of Object.entries(BUILT_IN_COMPONENTS)) {
+        build.module(`onebase/components/${name}`, () => ({ exports, loader: "object" }));
+      }
       build.module("onebase", () => ({ exports: server, loader: "object" }));
     },
   });
@@ -73,18 +85,20 @@ export async function projectEntry(dir: string): Promise<{ imports: string[]; fi
   let http = "null";
   let auth = "null";
   let crons = "null";
+  let components = "null";
   files.forEach((file, i) => {
     const modulePath = modulePathFor(dir, file);
     imports.push(`import * as m${i} from ${JSON.stringify(file)};`);
     if (modulePath === "schema") schema = `m${i}.default`;
     else if (modulePath === "auth.config") auth = `m${i}.default`;
+    else if (modulePath === "components") components = `(m${i}.default?.__onebase === "components" ? m${i}.default : null)`;
     else {
       modules.push(`${JSON.stringify(modulePath)}: m${i}`);
       if (modulePath === "http") http = `(m${i}.default?.__onebase === "httpRouter" ? m${i}.default : null)`;
       if (modulePath === "crons") crons = `(m${i}.default?.__onebase === "crons" ? m${i}.default : null)`;
     }
   });
-  const fields = `schema: ${schema}, modules: { ${modules.join(", ")} }, http: ${http}, authConfig: ${auth}, crons: ${crons}`;
+  const fields = `schema: ${schema}, modules: { ${modules.join(", ")} }, http: ${http}, authConfig: ${auth}, crons: ${crons}, components: ${components}`;
   return { imports, fields, files: files.length };
 }
 
@@ -112,7 +126,7 @@ export async function loadProject(dirInput: string, onError?: (err: ProjectLoadE
   if (!existsSync(dir)) {
     throw new Error(`Functions directory not found: ${dir}\nCreate it (e.g. mkdir onebase) or pass --dir <path>.`);
   }
-  const project: Project = { dir, schema: null, modules: {}, http: null, crons: null, authConfig: null, sources: {} };
+  const project: Project = { dir, schema: null, modules: {}, http: null, crons: null, authConfig: null, components: null, sources: {} };
   for (const file of await listSourceFiles(dir)) {
     const modulePath = modulePathFor(dir, file);
     let exports: Record<string, unknown>;
@@ -133,6 +147,13 @@ export async function loadProject(dirInput: string, onError?: (err: ProjectLoadE
     }
     if (modulePath === "auth.config") {
       project.authConfig = (exports.default as AuthConfig) ?? null;
+      continue;
+    }
+    if (modulePath === "components") {
+      if ((exports.default as any)?.__onebase !== "components") {
+        throw new Error(`components.ts must \`export default defineComponents({ ... })\` (import defineComponents from "onebase/components").`);
+      }
+      project.components = exports.default as ComponentsDefinition;
       continue;
     }
     if (modulePath === "http" && (exports.default as any)?.__onebase === "httpRouter") {

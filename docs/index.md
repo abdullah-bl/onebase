@@ -51,6 +51,7 @@ onebase follows [Convex](https://convex.dev)'s programming model and API, and ma
 | [File storage](./file-storage.md) | Uploads and downloads, on local disk or in S3 / R2 / MinIO |
 | [Auth](./auth.md) | Built-in password and OAuth sign-in with sessions, or tokens from Clerk, Auth0, WorkOS and any OIDC provider |
 | [HTTP actions](./http-actions.md) | Webhooks and custom HTTP endpoints |
+| [Components](./components.md) | Reusable packages with their own tables, such as the built-in [rate limiter](./rate-limiter.md), called as `ctx.components.<name>` |
 | [Databases](./databases.md) | SQLite, Postgres, MySQL or Turso, including multiple instances |
 | [Backups](./backups.md) | SQLite snapshots to S3, with restore |
 | [Dashboard](./dashboard.md) | Browse and edit data, run functions, and watch logs, jobs and files at `/_admin` |

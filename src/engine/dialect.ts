@@ -70,8 +70,11 @@ export function checkPath(path: string): string {
   return path;
 }
 
+/** A stored table name: an app table, or a component's as "<mount>.<table>". */
+export const STORED_TABLE = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$/;
+
 export function tableLiteral(table: string): string {
-  if (!IDENT.test(table)) throw new Error(`Invalid table name "${table}".`);
+  if (!STORED_TABLE.test(table)) throw new Error(`Invalid table name "${table}".`);
   return `'${table}'`;
 }
 

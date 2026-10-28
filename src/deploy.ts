@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { codegen } from "./codegen";
 import { doctor, printFindings } from "./doctor";
+import { buildCatalog } from "./engine/catalog";
 import { OnebaseError } from "./engine/database";
 import { rememberModule } from "./engine/deployments";
 import type { DeployResult, ProjectCode } from "./engine/runtime";
@@ -75,6 +76,7 @@ export async function importBundle(source: string, id: string): Promise<ProjectC
     http: project.http ?? null,
     auth: project.authConfig ?? null,
     crons: project.crons?.jobs ?? [],
+    components: project.components ?? null,
   };
 }
 
@@ -95,17 +97,26 @@ async function readPublic(dir: string): Promise<Record<string, string>> {
  */
 async function dryRunFacts(entry: string): Promise<{ schema: string | null; functions: number }> {
   const project = ((await import(entry)) as { default?: any }).default ?? {};
-  const schema = project.schema ?? null;
-  const json = schema
+  const mounts = Object.entries(project.components?.mounts ?? {}).map(([mount, m]: [string, any]) => ({ mount, schema: m.definition.schema }));
+  const catalog = buildCatalog(project.schema ?? null, mounts);
+  const json = catalog
     ? JSON.stringify({
-        schemaValidation: schema.schemaValidation ?? true,
-        tables: Object.fromEntries(Object.entries(schema.tables ?? {}).map(([name, table]: [string, any]) => [name, { validator: table.validator }])),
+        schemaValidation: catalog.schemaValidation,
+        open: catalog.open,
+        tables: Object.fromEntries(Object.entries(catalog.tables).map(([name, table]: [string, any]) => [name, { validator: table.validator }])),
       })
     : null;
   let functions = 0;
+  const count = (tree: Record<string, unknown>) => {
+    for (const value of Object.values(tree ?? {})) {
+      if (isRegisteredFunction(value)) functions++;
+      else if (typeof value === "object" && value !== null) count(value as Record<string, unknown>);
+    }
+  };
   for (const exports of Object.values(project.modules ?? {}) as Record<string, unknown>[]) {
     for (const value of Object.values(exports ?? {})) if (isRegisteredFunction(value)) functions++;
   }
+  for (const m of Object.values(project.components?.mounts ?? {}) as any[]) count(m.definition.functions);
   return { schema: json, functions };
 }
 

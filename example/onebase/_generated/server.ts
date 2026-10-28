@@ -10,12 +10,13 @@ import {
   type QueryCtx as GenericQueryCtx,
 } from "onebase/server";
 import type { DataModel } from "./dataModel";
+import type components from "../components";
 
 export const { query, mutation, action, internalQuery, internalMutation, internalAction, httpAction } =
-  makeServer<DataModel>();
+  makeServer<DataModel, typeof components>();
 
-export type QueryCtx = GenericQueryCtx<DataModel>;
-export type MutationCtx = GenericMutationCtx<DataModel>;
-export type ActionCtx = GenericActionCtx<DataModel>;
+export type QueryCtx = GenericQueryCtx<DataModel, typeof components>;
+export type MutationCtx = GenericMutationCtx<DataModel, typeof components>;
+export type ActionCtx = GenericActionCtx<DataModel, typeof components>;
 export type DatabaseReader = GenericDatabaseReader<DataModel>;
 export type DatabaseWriter = GenericDatabaseWriter<DataModel>;

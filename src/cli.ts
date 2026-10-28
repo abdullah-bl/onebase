@@ -16,6 +16,7 @@ import type { AuthConfig } from "./engine/jwt";
 import type { Modules } from "./engine/runtime";
 import { loadEnv, withoutBunEnv } from "./env";
 import { loadProject, projectEntry, type Project } from "./project";
+import type { ComponentsDefinition } from "./components";
 import type { SchemaDefinition } from "./schema";
 import type { Crons, HttpRouter } from "./server";
 
@@ -26,6 +27,7 @@ export type EmbeddedProject = {
   http: HttpRouter | null;
   authConfig: AuthConfig | null;
   crons: Crons | null;
+  components: ComponentsDefinition | null;
   publicFiles: Record<string, string>;
 };
 
@@ -222,7 +224,7 @@ function publicDir(explicit: string | undefined): string | null {
 
 async function serveCommand(opts: ReturnType<typeof options>) {
   // A server that only runs what `onebase deploy` pushes needs no functions folder.
-  const empty: Project = { dir: resolve(opts.dir), schema: null, modules: {}, http: null, crons: null, authConfig: null, sources: {} };
+  const empty: Project = { dir: resolve(opts.dir), schema: null, modules: {}, http: null, crons: null, authConfig: null, components: null, sources: {} };
   const project = !opts.givenDir && !existsSync(opts.dir) && !opts.dev ? empty : await loadProject(opts.dir);
   const pub = publicDir(opts.public);
   await startApp({
@@ -231,6 +233,7 @@ async function serveCommand(opts: ReturnType<typeof options>) {
     http: project.http,
     auth: project.authConfig,
     crons: project.crons,
+    components: project.components,
     dataDir: opts.data,
     ...serverOptions(opts),
     port: opts.port,
@@ -336,6 +339,7 @@ export async function runEmbedded(project: EmbeddedProject, argv = process.argv.
     http: project.http,
     auth: project.authConfig,
     crons: project.crons,
+    components: project.components,
     dataDir: opts.data,
     ...serverOptions(opts),
     port: opts.port,

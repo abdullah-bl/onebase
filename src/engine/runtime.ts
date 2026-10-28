@@ -2,9 +2,11 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getFunctionName, type FunctionLike, type FunctionType } from "../api";
+import type { ComponentDefinition, ComponentsDefinition, MountOptions } from "../components";
 import type { SchemaDefinition } from "../schema";
 import { isRegisteredFunction, type CronJob, type HttpRouter, type RegisteredFunction, type UserIdentity } from "../server";
 import { ConvexError, describeValue, isPlainObject, validate, type AnyValidator } from "../values";
+import { buildCatalog, TableScope, tableMount, validatesTable, type Catalog } from "./catalog";
 import { CronRunner } from "./crons";
 import { applySchema, DatabaseImpl, OnebaseError, readerView, writerView, type ReadSet, type VectorSearchQuery, type Write } from "./database";
 import { isIdForTable, newId } from "./dialect";
@@ -38,6 +40,8 @@ export type ProjectCode = {
   http: HttpRouter | null;
   auth: AuthConfig | null;
   crons: CronJob[];
+  /** components.ts's default export. */
+  components: ComponentsDefinition | null;
 };
 
 export type DeployResult = {
@@ -51,10 +55,30 @@ export type DeployResult = {
   dryRun: boolean;
 };
 
+/** A component mounted in components.ts, as the runtime runs it. */
+export type MountRuntime = {
+  name: string;
+  definition: ComponentDefinition<any, any, any>;
+  config: unknown;
+  options: MountOptions;
+  scope: TableScope;
+  /** The component's function objects → their names in this mount ("components/limiter:limit"). */
+  names: Map<RegisteredFunction, string>;
+};
+
+/** Who is calling: the app (null), a component, or the system (scheduler, crons, dashboard), which may call anything. */
+type Caller = MountRuntime | null | "system";
+
+const SYSTEM_SOURCES = new Set<CallSource>(["scheduler", "cron", "dashboard"]);
+
 /** Code checked and ready to install. */
 type PreparedCode = {
   code: ProjectCode;
   functions: Map<string, RegisteredFunction>;
+  /** Component functions: which mount each belongs to, and whether it's internal to the component. */
+  componentFunctions: Map<string, { mount: MountRuntime; internal: boolean }>;
+  mounts: Map<string, MountRuntime>;
+  catalog: Catalog | null;
   auth: AuthService | null;
   authenticate: Authenticate | null;
 };
@@ -71,6 +95,8 @@ export type RuntimeOptions = {
   /** A token verifier to use instead of the one built from `auth`. */
   authenticate?: Authenticate | null;
   crons?: CronJob[];
+  /** components.ts's default export. */
+  components?: ComponentsDefinition | null;
   /** Public base URL used for file URLs, e.g. https://api.example.com. */
   siteUrl?: string;
   /** Dev mode: full error messages to clients and index warnings. */
@@ -88,6 +114,8 @@ export type RuntimeOptions = {
 export type CallOptions = {
   identity?: UserIdentity | null;
   allowInternal?: boolean;
+  /** The component making the call (null: the app); by default the system for the scheduler, crons and dashboard. */
+  caller?: Caller;
   /** Where the call came from, for the dashboard's call log (default: "function"). */
   source?: CallSource;
 };
@@ -134,7 +162,11 @@ export class Runtime {
   readonly driver: Driver;
   // The project's code. A deploy replaces it; calls already running finish with the old code.
   schema: SchemaDefinition<any> | null = null;
+  /** The app's tables and every mounted component's. */
+  catalog: Catalog | null = null;
   readonly functions = new Map<string, RegisteredFunction>();
+  readonly mounts = new Map<string, MountRuntime>();
+  private readonly componentFunctions = new Map<string, { mount: MountRuntime; internal: boolean }>();
   http: HttpRouter | null = null;
   /** Built-in sign-in, when auth.config.ts lists methods. */
   auth: AuthService | null = null;
@@ -179,7 +211,14 @@ export class Runtime {
     this.loadTimeoutMs = opts.loadTimeoutMs ?? 30_000;
     this.files = new FileStore(opts.blobs ?? new LocalBlobs(mkdtempSync(join(tmpdir(), "onebase-files-"))), () => this.nextCreationTime());
     this.siteUrl = (opts.siteUrl ?? "http://localhost:8090").replace(/\/$/, "");
-    const code = { schema: opts.schema, modules: opts.modules, http: opts.http ?? null, auth: opts.auth ?? null, crons: opts.crons ?? [] };
+    const code = {
+      schema: opts.schema,
+      modules: opts.modules,
+      http: opts.http ?? null,
+      auth: opts.auth ?? null,
+      crons: opts.crons ?? [],
+      components: opts.components ?? null,
+    };
     this.setCode(this.prepare(code), null);
   }
 
@@ -223,25 +262,27 @@ export class Runtime {
     const applied = await this.driver.write(async (tx) => {
       // Applying this schema after another instance deployed would drop that deployment's indexes.
       if (this.loadCode && (await activeDeploymentId(tx)) !== expected) return null;
-      const result = await applySchema(tx, this.driver.dialect, this.schema);
-      return { result, warnings: await this.checkDocuments(tx, this.schema) };
+      const result = await applySchema(tx, this.driver.dialect, this.catalog);
+      return { result, warnings: await this.checkDocuments(tx, this.catalog) };
     });
     if (applied?.result.created.length) await this.driver.optimize?.(); // new indexes need statistics too
     return applied;
   }
 
   /**
-   * When schema.ts changes, every stored document is checked against it, like a Convex deploy.
-   * The schema's fingerprint is saved once the data matches (unless `record` is false, for a dry
-   * run), so unchanged schemas cost nothing. Returns warnings about data the schema ignores.
+   * When schema.ts (or a component's schema) changes, every stored document is checked against
+   * it, like a Convex deploy. The schema's fingerprint is saved once the data matches (unless
+   * `record` is false, for a dry run), so unchanged schemas cost nothing. Returns warnings about
+   * data the schema ignores.
    */
-  private async checkDocuments(tx: Exec, schema: SchemaDefinition<any> | null, record = true): Promise<string[]> {
-    if (!schema?.schemaValidation) {
-      // Writes aren't validated now, so check everything again once validation is turned back on.
+  private async checkDocuments(tx: Exec, catalog: Catalog | null, record = true): Promise<string[]> {
+    if (!catalog) {
       if (record) await tx.run("DELETE FROM _meta WHERE \"key\" = 'schema'");
       return [];
     }
-    const tables = Object.entries(schema.tables) as [string, { validator: AnyValidator }][];
+    // With schemaValidation off only component tables are checked; turning it back on changes
+    // the fingerprint, so everything is checked again then.
+    const tables = Object.entries(catalog.tables).filter(([t]) => validatesTable(catalog, t)) as [string, { validator: AnyValidator }][];
     const fingerprint = new Bun.CryptoHasher("sha256").update(JSON.stringify(tables.map(([t, d]) => [t, d.validator]))).digest("hex");
     const stored = await tx.get("SELECT value FROM _meta WHERE \"key\" = 'schema'");
     if (stored?.value === fingerprint) return [];
@@ -274,27 +315,70 @@ export class Runtime {
           `defineSchema({ ... }, { schemaValidation: false }), update the documents in a mutation (or the dashboard), then turn validation back on.`,
       );
     }
-    const known = new Set(tables.map(([t]) => t));
-    const orphans = (await tx.all("SELECT DISTINCT tbl FROM documents")).map((r) => r.tbl as string).filter((t) => !known.has(t));
+    const known = new Set(Object.keys(catalog.tables));
+    const orphans = (await tx.all("SELECT DISTINCT tbl FROM documents"))
+      .map((r) => r.tbl as string)
+      .filter((t) => !known.has(t) && !(catalog.open && tableMount(t) === null));
     if (record) {
       await tx.run("INSERT INTO _meta (\"key\", value) VALUES ('schema', ?) ON CONFLICT(\"key\") DO UPDATE SET value = excluded.value", [fingerprint]);
     }
-    return orphans.map((t) => `Table "${t}" has documents but isn't in schema.ts, so functions can't read them. Add it back to keep using them.`);
+    const unmounted = new Map<string, string[]>();
+    for (const t of orphans) {
+      const mount = tableMount(t);
+      if (mount) unmounted.set(mount, [...(unmounted.get(mount) ?? []), t]);
+    }
+    return [
+      ...orphans
+        .filter((t) => tableMount(t) === null)
+        .map((t) => `Table "${t}" has documents but isn't in schema.ts, so functions can't read them. Add it back to keep using them.`),
+      ...[...unmounted].map(
+        ([mount, ts]) =>
+          `Component "${mount}" isn't mounted in components.ts anymore, but its tables (${ts.join(", ")}) keep their documents. ` +
+          `Mount it again under the same name to use them, or delete them from the dashboard.`,
+      ),
+    ];
   }
 
   // ---- Code & deploys ----
 
-  /** Collects a project's functions and builds its sign-in, without installing anything yet. */
+  /** Collects a project's functions and components and builds its sign-in, without installing anything yet. */
   private prepare(code: ProjectCode): PreparedCode {
     const functions = new Map<string, RegisteredFunction>();
+    const mounts = new Map<string, MountRuntime>();
+    const componentFunctions: PreparedCode["componentFunctions"] = new Map();
     for (const [modulePath, exports] of Object.entries(code.modules)) {
+      if (code.components && (modulePath === "components" || modulePath.startsWith("components/"))) {
+        throw new OnebaseError(`${modulePath}: functions can't live in a components/ folder; that name is reserved for the components mounted in components.ts.`);
+      }
       for (const [exportName, value] of Object.entries(exports)) {
         if (isRegisteredFunction(value)) functions.set(`${modulePath}:${exportName}`, value);
       }
     }
+    for (const [name, m] of Object.entries(code.components?.mounts ?? {})) {
+      const mount: MountRuntime = { name, definition: m.definition, config: m.config, options: m.options ?? {}, scope: TableScope.component(name), names: new Map() };
+      const walk = (tree: Record<string, unknown>, path: string[]) => {
+        for (const [key, value] of Object.entries(tree)) {
+          if (!isRegisteredFunction(value)) {
+            walk(value as Record<string, unknown>, [...path, key]);
+            continue;
+          }
+          const fullName = `components/${[name, ...path].join("/")}:${key}`;
+          // Not callable by clients: the app decides what to offer them.
+          functions.set(fullName, { ...value, visibility: "internal" });
+          componentFunctions.set(fullName, { mount, internal: value.visibility === "internal" });
+          mount.names.set(value, fullName);
+        }
+      };
+      walk(m.definition.functions, []);
+      mounts.set(name, mount);
+    }
+    const catalog = buildCatalog(code.schema, [...mounts.values()].map((m) => ({ mount: m.name, schema: m.definition.schema })));
     return {
       code,
       functions,
+      componentFunctions,
+      mounts,
+      catalog,
       auth: code.auth?.methods?.length ? new AuthService(this, code.auth) : null,
       authenticate: this.customAuthenticate ?? (code.auth ? createAuthenticate(code.auth) : null),
     };
@@ -302,6 +386,11 @@ export class Runtime {
 
   private setCode(prepared: PreparedCode, deployment: Deployment | null) {
     this.schema = prepared.code.schema;
+    this.catalog = prepared.catalog;
+    this.mounts.clear();
+    for (const [name, mount] of prepared.mounts) this.mounts.set(name, mount);
+    this.componentFunctions.clear();
+    for (const [name, info] of prepared.componentFunctions) this.componentFunctions.set(name, info);
     this.http = prepared.code.http;
     this.auth = prepared.auth;
     this.authenticate = prepared.authenticate;
@@ -434,8 +523,8 @@ export class Runtime {
     });
   }
 
-  /** The schema a dry run ships as JSON, checked against the data without running the bundle. */
-  private dryRunSchema(input: string | null): SchemaDefinition<any> | null {
+  /** The tables a dry run ships as JSON (app and components), checked against the data without running the bundle. */
+  private dryRunSchema(input: string | null): Catalog | null {
     if (input === null || input === "") return null;
     let parsed: unknown;
     try {
@@ -447,7 +536,7 @@ export class Runtime {
     if (!parsed || typeof parsed !== "object" || !tables || typeof tables !== "object") {
       throw new OnebaseError("A dry run's schema must be { schemaValidation, tables: { name: { validator } } }.");
     }
-    return { ...(parsed as object), __isOnebaseSchema: true } as SchemaDefinition<any>;
+    return { schemaValidation: true, open: false, ...(parsed as object), __isOnebaseSchema: true } as Catalog;
   }
 
   private async activate(
@@ -455,7 +544,7 @@ export class Runtime {
     opts: { save: boolean; dryRun: boolean; schema: string | null; functions: number },
   ): Promise<DeployResult> {
     const prepared = opts.dryRun ? null : await this.load(stored);
-    const schema = opts.dryRun ? this.dryRunSchema(opts.schema) : prepared!.code.schema;
+    const schema = opts.dryRun ? this.dryRunSchema(opts.schema) : prepared!.catalog;
     const apply = async (tx: Exec) => {
       const warnings = await this.checkDocuments(tx, schema, !opts.dryRun);
       if (opts.dryRun) return { indexes: { created: [], dropped: [] }, warnings };
@@ -621,8 +710,18 @@ export class Runtime {
 
   // ---- Lookup & validation ----
 
-  resolve(ref: FunctionLike, expected: FunctionType | null, allowInternal: boolean): { name: string; fn: RegisteredFunction } {
-    const name = getFunctionName(ref);
+  /**
+   * Finds a function and checks that `caller` may call it: the app reaches components' public
+   * functions, a component reaches only its own (passed as the function itself), and the system
+   * (scheduler, crons, dashboard) reaches everything.
+   */
+  resolve(
+    ref: FunctionLike | RegisteredFunction,
+    expected: FunctionType | null,
+    allowInternal: boolean,
+    caller: Caller = null,
+  ): { name: string; fn: RegisteredFunction; mount: MountRuntime | null } {
+    const name = this.functionName(ref, caller);
     const fn = this.functions.get(name);
     if (!fn) {
       const [mod] = name.split(":");
@@ -638,7 +737,38 @@ export class Runtime {
     if (fn.visibility === "internal" && !allowInternal) {
       throw new OnebaseError(`"${name}" is internal and can only be called from other functions (ctx.run*, scheduler).`);
     }
-    return { name, fn };
+    const info = this.componentFunctions.get(name);
+    const target = info?.mount ?? null;
+    if (caller !== "system" && caller !== target) {
+      if (caller) {
+        throw new OnebaseError(
+          target
+            ? `Component "${caller.name}" can't call component "${target.name}"'s "${name}"; only the app can.`
+            : `Component "${caller.name}" can't call the app's "${name}"; components only run their own functions.`,
+        );
+      }
+      if (info?.internal) throw new OnebaseError(`"${name}" is internal to component "${target!.name}"; call its public functions instead.`);
+    }
+    return { name, fn, mount: target };
+  }
+
+  /** A component names its own functions by passing the function itself. */
+  private functionName(ref: FunctionLike | RegisteredFunction, caller: Caller): string {
+    if (!isRegisteredFunction(ref)) return getFunctionName(ref);
+    const name = caller && caller !== "system" ? caller.names.get(ref) : undefined;
+    if (!name) {
+      throw new OnebaseError(
+        caller && caller !== "system"
+          ? `Component "${caller.name}" passed a function that isn't one of its own.`
+          : `Pass a function reference (api.messages.list) or name ("messages:list"), not the function itself.`,
+      );
+    }
+    return name;
+  }
+
+  private callerOf(opts: CallOptions): Caller {
+    if (opts.caller !== undefined) return opts.caller;
+    return opts.source && SYSTEM_SOURCES.has(opts.source) ? "system" : null;
   }
 
   private checkArgs(name: string, fn: RegisteredFunction, args: unknown): Record<string, unknown> {
@@ -675,11 +805,12 @@ export class Runtime {
 
   private warn = (message: string) => this.log.warn(message);
 
-  private newDb(tx: Exec, extra: { readSet?: ReadSet; writes?: Write[] }) {
+  private newDb(tx: Exec, extra: { readSet?: ReadSet; writes?: Write[] }, scope = TableScope.app) {
     return new DatabaseImpl({
       tx,
       dialect: this.driver.dialect,
-      schema: this.schema,
+      catalog: this.catalog,
+      scope,
       nextCreationTime: () => this.nextCreationTime(),
       onWarning: this.dev ? this.warn : undefined,
       explain: this.driver.explain?.bind(this.driver),
@@ -688,9 +819,9 @@ export class Runtime {
     });
   }
 
-  private schedulerFor(state: TxState | null) {
+  private schedulerFor(state: TxState | null, caller: MountRuntime | null = null) {
     const schedule = async (runAt: number, ref: FunctionLike, args: unknown) => {
-      const { name } = this.resolve(ref, null, true);
+      const { name } = this.resolve(ref, null, true, caller);
       const id = newId();
       const insert = (tx: Exec) =>
         tx.run("INSERT INTO _scheduled (id, fn, args, run_at, state) VALUES (?, ?, ?, ?, 'pending')", [id, name, JSON.stringify(args ?? {}), runAt]);
@@ -777,47 +908,85 @@ export class Runtime {
     return this.files.backend.serve(id, meta);
   }
 
-  private queryCtx(db: DatabaseImpl, identity: UserIdentity | null) {
-    return { db: readerView(db), auth: this.authFor(identity), storage: this.storageReader(db.tx) };
+  /** A component sees the caller's identity only when mounted with `auth: true`. */
+  private identityFor(mount: MountRuntime | null, identity: UserIdentity | null) {
+    return mount && !mount.options.auth ? null : identity;
   }
 
-  private mutationCtx(state: TxState, identity: UserIdentity | null) {
+  /** What a component's functions get besides their database. */
+  private componentBase(mount: MountRuntime, identity: UserIdentity | null) {
+    return { auth: this.authFor(identity), config: mount.config, component: { mount: mount.name } };
+  }
+
+  private queryCtx(db: DatabaseImpl, identity: UserIdentity | null, mount: MountRuntime | null = null): any {
+    const id = this.identityFor(mount, identity);
+    // Nested queries read in the same snapshot and into the same read set, so they stay reactive.
+    const runQuery = (ref: FunctionLike, args?: unknown) => {
+      const { name, fn, mount: target } = this.resolve(ref, "query", true, mount);
+      return this.invoke(name, fn, this.queryCtx(db, id, target), args);
+    };
+    const scoped = readerView(db.withScope(mount?.scope ?? TableScope.app));
+    if (mount) return { db: scoped, ...this.componentBase(mount, id), runQuery };
+    return { db: scoped, auth: this.authFor(id), storage: this.storageReader(db.tx), runQuery, components: this.componentsProxy("query", { runQuery }) };
+  }
+
+  private mutationCtx(state: TxState, identity: UserIdentity | null, mount: MountRuntime | null = null): any {
+    const id = this.identityFor(mount, identity);
+    const runQuery = (ref: FunctionLike, args?: unknown) => {
+      const { name, fn, mount: target } = this.resolve(ref, "query", true, mount);
+      return this.invoke(name, fn, this.queryCtx(state.db, id, target), args);
+    };
+    const runMutation = (ref: FunctionLike, args?: unknown) => {
+      const { name, fn, mount: target } = this.resolve(ref, "mutation", true, mount);
+      return this.nestedMutation(state, name, fn, id, target, args);
+    };
+    const db = writerView(state.db.withScope(mount?.scope ?? TableScope.app));
+    const scheduler = this.schedulerFor(state, mount);
+    if (mount) return { db, ...this.componentBase(mount, id), scheduler, runQuery, runMutation };
     return {
-      db: writerView(state.db),
-      auth: this.authFor(identity),
+      db,
+      auth: this.authFor(id),
       storage: this.storageWriter(state),
-      scheduler: this.schedulerFor(state),
-      runQuery: (ref: FunctionLike, args?: unknown) => {
-        const { name, fn } = this.resolve(ref, "query", true);
-        return this.invoke(name, fn, this.queryCtx(state.db, identity), args);
-      },
-      runMutation: async (ref: FunctionLike, args?: unknown) => {
-        const { name, fn } = this.resolve(ref, "mutation", true);
-        // Nested mutations share the transaction; a savepoint rolls back just this call on error.
-        const mark = state.writes.length;
-        const commitMark = state.afterCommit.length;
-        try {
-          return await savepoint(state.tx, () => this.invoke(name, fn, this.mutationCtx(state, identity), args));
-        } catch (err) {
-          state.writes.length = mark;
-          state.afterCommit.length = commitMark;
-          throw err;
-        }
-      },
+      scheduler,
+      runQuery,
+      runMutation,
+      components: this.componentsProxy("mutation", { runQuery, runMutation }),
     };
   }
 
-  actionCtx(identity: UserIdentity | null) {
-    const ctx = {
-      auth: this.authFor(identity),
-      storage: this.storageForActions(),
-      scheduler: this.schedulerFor(null),
-      runQuery: (ref: FunctionLike, args?: unknown) => this.runQuery(ref, args, { identity, allowInternal: true }).then((r) => r.value),
-      runMutation: (ref: FunctionLike, args?: unknown) => this.runMutation(ref, args, { identity, allowInternal: true }),
-      runAction: (ref: FunctionLike, args?: unknown) => this.runAction(ref, args, { identity, allowInternal: true }),
-      vectorSearch: (table: string, index: string, query: VectorSearchQuery) =>
-        this.driver.read((tx) => this.newDb(tx, {}).vectorSearch(table, index, query)),
-    };
+  /** Nested mutations share the transaction; a savepoint rolls back just this call on error. */
+  private async nestedMutation(state: TxState, name: string, fn: RegisteredFunction, identity: UserIdentity | null, mount: MountRuntime | null, args: unknown) {
+    const mark = state.writes.length;
+    const commitMark = state.afterCommit.length;
+    try {
+      return await savepoint(state.tx, () => this.invoke(name, fn, this.mutationCtx(state, identity, mount), args));
+    } catch (err) {
+      state.writes.length = mark;
+      state.afterCommit.length = commitMark;
+      throw err;
+    }
+  }
+
+  actionCtx(identity: UserIdentity | null, mount: MountRuntime | null = null): any {
+    const id = this.identityFor(mount, identity);
+    const opts: CallOptions = { identity: id, allowInternal: true, caller: mount };
+    const runQuery = (ref: FunctionLike, args?: unknown) => this.runQuery(ref, args, opts).then((r) => r.value);
+    const runMutation = (ref: FunctionLike, args?: unknown) => this.runMutation(ref, args, opts);
+    const runAction = (ref: FunctionLike, args?: unknown) => this.runAction(ref, args, opts);
+    const vectorSearch = (table: string, index: string, query: VectorSearchQuery) =>
+      this.driver.read((tx) => this.newDb(tx, {}, mount?.scope).vectorSearch(table, index, query));
+    const ctx: Record<string, unknown> = mount
+      ? { ...this.componentBase(mount, id), scheduler: this.schedulerFor(null, mount), runQuery, runMutation, runAction, vectorSearch }
+      : {
+          auth: this.authFor(id),
+          storage: this.storageForActions(),
+          scheduler: this.schedulerFor(null),
+          runQuery,
+          runMutation,
+          runAction,
+          vectorSearch,
+          components: this.componentsProxy("action", { runQuery, runMutation, runAction }),
+        };
     Object.defineProperty(ctx, "db", {
       get() {
         throw new OnebaseError(
@@ -826,6 +995,49 @@ export class Runtime {
       },
     });
     return ctx;
+  }
+
+  /**
+   * `ctx.components.<mount>.<fn>(args)`: calls a component's public function through the
+   * context's own runQuery / runMutation / runAction, so it shares their transaction rules.
+   */
+  private componentsProxy(kind: FunctionType, run: Partial<Record<"runQuery" | "runMutation" | "runAction", (ref: FunctionLike, args?: unknown) => Promise<unknown>>>) {
+    const mounts = this.mounts;
+    const node = (mount: MountRuntime, tree: Record<string, unknown>, path: string[]): unknown =>
+      new Proxy(
+        {},
+        {
+          get: (_target, prop) => {
+            if (typeof prop !== "string" || prop === "then") return undefined;
+            const value = tree[prop];
+            const where = `ctx.components.${[mount.name, ...path, prop].join(".")}`;
+            if (value === undefined) {
+              throw new OnebaseError(`${where} doesn't exist. Component "${mount.name}" has: ${Object.keys(tree).join(", ") || "(nothing)"}.`);
+            }
+            if (!isRegisteredFunction(value)) return node(mount, value as Record<string, unknown>, [...path, prop]);
+            if (value.visibility === "internal") throw new OnebaseError(`${where} is internal to the component.`);
+            const call = run[`run${cap(value.type)}` as "runQuery"];
+            if (!call) {
+              throw new OnebaseError(
+                `${where} is a ${value.type}; a ${kind} can only call component ${kind === "query" ? "queries" : "queries and mutations"}.`,
+              );
+            }
+            const name = mount.names.get(value)!;
+            return (args?: unknown) => call(name, args);
+          },
+        },
+      );
+    return new Proxy(
+      {},
+      {
+        get: (_target, prop) => {
+          if (typeof prop !== "string" || prop === "then") return undefined;
+          const mount = mounts.get(prop);
+          if (!mount) throw new OnebaseError(`No component "${prop}" in components.ts. Mounted: ${[...mounts.keys()].join(", ") || "(none)"}.`);
+          return node(mount, mount.definition.functions, []);
+        },
+      },
+    );
   }
 
   private async invoke(name: string, fn: RegisteredFunction, ctx: unknown, args: unknown) {
@@ -844,12 +1056,12 @@ export class Runtime {
 
   /** Runs a query against a committed snapshot and reports what it read. */
   async runQuery(ref: FunctionLike, args: unknown, opts: CallOptions = {}): Promise<{ value: unknown; readSet: ReadSet }> {
-    const { name, fn } = this.resolve(ref, "query", opts.allowInternal ?? false);
+    const { name, fn, mount } = this.resolve(ref, "query", opts.allowInternal ?? false, this.callerOf(opts));
     return this.calls.track(name, "query", opts.source ?? "function", () =>
       this.driver.read(async (tx) => {
         const readSet: ReadSet = { ids: new Set(), ranges: [] };
         const db = this.newDb(tx, { readSet });
-        const value = await this.invoke(name, fn, this.queryCtx(db, opts.identity ?? null), args);
+        const value = await this.invoke(name, fn, this.queryCtx(db, opts.identity ?? null, mount), args);
         return { value, readSet };
       }),
     );
@@ -864,10 +1076,10 @@ export class Runtime {
       beforeCommit?: () => void;
     } = {},
   ): Promise<unknown> {
-    const { name, fn } = this.resolve(ref, "mutation", opts.allowInternal ?? false);
+    const { name, fn, mount } = this.resolve(ref, "mutation", opts.allowInternal ?? false, this.callerOf(opts));
     return this.calls.track(name, "mutation", opts.source ?? "function", () =>
       this.transact(async (state) => {
-        const value = await this.invoke(name, fn, this.mutationCtx(state, opts.identity ?? null), args);
+        const value = await this.invoke(name, fn, this.mutationCtx(state, opts.identity ?? null, mount), args);
         await opts.inTransaction?.(state.tx);
         return value;
       }, opts.beforeCommit),
@@ -878,12 +1090,12 @@ export class Runtime {
    * Runs `body` in a write transaction with everything a mutation gets: commit broadcast,
    * post-commit hooks, scheduler wake-up and live-query invalidation.
    */
-  private async transact<T>(body: (state: TxState) => Promise<T>, beforeCommit?: () => void): Promise<T> {
+  private async transact<T>(body: (state: TxState) => Promise<T>, beforeCommit?: () => void, scope = TableScope.app): Promise<T> {
     const { value, writes, scheduled, afterCommit, revoked } = await this.mutations.run(() =>
       // The driver may run this more than once if another instance conflicts; each attempt starts fresh.
       this.driver.write(async (tx) => {
         const state: TxState = { tx, db: undefined as any, writes: [], scheduled: false, afterCommit: [], revoked: [] };
-        state.db = this.newDb(tx, { writes: state.writes });
+        state.db = this.newDb(tx, { writes: state.writes }, scope);
         const value = await body(state);
         if (this.driver.shared && this.driver.publish && (state.writes.length || state.scheduled || state.revoked.length)) {
           for (const message of this.broadcastMessages(state)) await this.driver.publish(tx, message);
@@ -901,12 +1113,14 @@ export class Runtime {
 
   /**
    * Dashboard edits: a schema-validated write that live queries see like any mutation.
-   * `db` can read and write any table, including ones no longer in schema.ts.
+   * `db` can read and write any table (components' too), including ones no longer in schema.ts.
    */
   adminWrite<T>(body: (db: DatabaseImpl, state: { tx: Exec; deleteFileAfterCommit(id: string): void }) => Promise<T>): Promise<T> {
     return this.calls.track("dashboard edit", "mutation", "dashboard", () =>
-      this.transact((state) =>
-        body(state.db, { tx: state.tx, deleteFileAfterCommit: (id) => state.afterCommit.push(() => this.files.backend.remove(id)) }),
+      this.transact(
+        (state) => body(state.db, { tx: state.tx, deleteFileAfterCommit: (id) => state.afterCommit.push(() => this.files.backend.remove(id)) }),
+        undefined,
+        TableScope.admin,
       ),
     );
   }
@@ -921,14 +1135,9 @@ export class Runtime {
     );
   }
 
-  /** Dashboard reads: a snapshot `db` that isn't limited to schema.ts tables. */
+  /** Dashboard reads: a snapshot `db` that can read any table, including ones no longer in schema.ts. */
   adminRead<T>(body: (db: DatabaseImpl, tx: Exec) => Promise<T>): Promise<T> {
-    return this.driver.read((tx) =>
-      body(
-        new DatabaseImpl({ tx, dialect: this.driver.dialect, schema: null, nextCreationTime: () => this.nextCreationTime() }),
-        tx,
-      ),
-    );
+    return this.driver.read((tx) => body(this.newDb(tx, {}, TableScope.admin), tx));
   }
 
   private broadcastMessages(state: TxState): string[] {
@@ -942,13 +1151,13 @@ export class Runtime {
   }
 
   async runAction(ref: FunctionLike, args: unknown, opts: CallOptions = {}): Promise<unknown> {
-    const { name, fn } = this.resolve(ref, "action", opts.allowInternal ?? false);
-    return this.calls.track(name, "action", opts.source ?? "function", () => this.invoke(name, fn, this.actionCtx(opts.identity ?? null), args));
+    const { name, fn, mount } = this.resolve(ref, "action", opts.allowInternal ?? false, this.callerOf(opts));
+    return this.calls.track(name, "action", opts.source ?? "function", () => this.invoke(name, fn, this.actionCtx(opts.identity ?? null, mount), args));
   }
 
   /** Runs any function by name, whatever its type. */
   async call(ref: FunctionLike, args: unknown, opts: CallOptions = {}): Promise<unknown> {
-    const { fn } = this.resolve(ref, null, opts.allowInternal ?? false);
+    const { fn } = this.resolve(ref, null, opts.allowInternal ?? false, this.callerOf(opts));
     if (fn.type === "query") return (await this.runQuery(ref, args, opts)).value;
     if (fn.type === "mutation") return this.runMutation(ref, args, opts);
     return this.runAction(ref, args, opts);

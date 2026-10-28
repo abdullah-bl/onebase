@@ -6,6 +6,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "n
 import { join } from "node:path";
 import { isPlainObject } from "../values";
 import type { CallRecord } from "./calllog";
+import { tableMount } from "./catalog";
 import { OnebaseError } from "./database";
 import type { Runtime } from "./runtime";
 
@@ -63,12 +64,14 @@ export function createAdmin(opts: { runtime: Runtime; key: string; assets: Dashb
 
   const tables = async () => {
     const counts = await tableCounts();
-    const schemaTables = runtime.schema?.tables ?? {};
+    const schemaTables = runtime.catalog?.tables ?? {};
     const names = [...new Set([...Object.keys(schemaTables), ...counts.keys()])].sort();
     return names.map((name) => {
       const def = (schemaTables as any)[name];
       return {
         name,
+        /** The component that owns the table ("limiter" for "limiter.rateLimits"), or null for the app's. */
+        component: tableMount(name),
         count: counts.get(name) ?? 0,
         inSchema: Boolean(def),
         fields: def?.validator?.kind === "object" ? Object.keys(def.validator.fields) : [],
@@ -132,9 +135,32 @@ export function createAdmin(opts: { runtime: Runtime; key: string; assets: Dashb
         return null;
       }),
 
+    /** Deletes every document of a table that's no longer in any schema (say, of a component that was unmounted). */
+    clearTable: async ({ table }) => {
+      if (typeof table !== "string") throw new OnebaseError("table is required.");
+      if (runtime.catalog?.tables[table]) throw new OnebaseError(`"${table}" is in use; only tables no schema declares can be cleared.`);
+      let deleted = 0;
+      for (;;) {
+        const n = await runtime.adminWrite(async (db) => {
+          const docs = await db.query(table).take(500);
+          for (const doc of docs) await db.delete(doc._id);
+          return docs.length;
+        });
+        deleted += n;
+        if (n < 500) return { deleted };
+      }
+    },
+
     functions: () =>
       [...runtime.functions.entries()]
-        .map(([name, fn]) => ({ name, type: fn.type, visibility: fn.visibility, args: fn.args ?? null, returns: fn.returns ?? null }))
+        .map(([name, fn]) => ({
+          name,
+          component: name.startsWith("components/") ? name.slice(11).split(/[/:]/)[0]! : null,
+          type: fn.type,
+          visibility: fn.visibility,
+          args: fn.args ?? null,
+          returns: fn.returns ?? null,
+        }))
         .sort((a, b) => a.name.localeCompare(b.name)),
 
     run: async ({ name, args, identity }) => {

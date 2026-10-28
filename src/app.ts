@@ -8,6 +8,7 @@ import { createDriver } from "./engine/driver";
 import { LocalBlobs, parseS3Url, S3Blobs } from "./engine/files";
 import type { AuthConfig } from "./engine/jwt";
 import { consoleLogger, Runtime, type Authenticate, type Modules } from "./engine/runtime";
+import type { ComponentsDefinition } from "./components";
 import type { SchemaDefinition } from "./schema";
 import type { Crons, HttpRouter } from "./server";
 import { clientBundle } from "./client/bundle.generated";
@@ -31,6 +32,8 @@ export type AppOptions = {
   /** A token verifier to use instead of the one built from `auth`. */
   authenticate?: Authenticate | null;
   crons?: Crons | null;
+  /** components.ts's default export. */
+  components?: ComponentsDefinition | null;
   dataDir: string;
   /** Database URL: a SQLite path (default <dataDir>/db.sqlite), postgres://… or libsql://… */
   db?: string;
@@ -91,6 +94,7 @@ export async function startApp(opts: AppOptions) {
     auth: opts.auth,
     authenticate: opts.authenticate,
     crons: opts.crons?.jobs ?? [],
+    components: opts.components ?? null,
     dev: opts.dev,
     log: consoleLogger,
     loadCode: opts.deploys === false ? null : importBundle,
@@ -117,7 +121,7 @@ export async function startApp(opts: AppOptions) {
   const backups = opts.backup ? startBackups(driver, opts.backup, runtime.log, blobs) : null;
 
   if (!opts.quiet) {
-    const names = [...runtime.functions.keys()];
+    const names = [...runtime.functions.keys()].filter((n) => !n.startsWith("components/"));
     console.log(`\x1b[1monebase\x1b[0m v${VERSION}${opts.dev ? " (dev)" : ""}`);
     console.log(`  functions  ${names.length}${names.length ? ` (${names.slice(0, 6).join(", ")}${names.length > 6 ? ", …" : ""})` : ""}`);
     if (created.length || dropped.length) console.log(`  indexes    +${created.length} -${dropped.length}`);
@@ -126,6 +130,9 @@ export async function startApp(opts: AppOptions) {
       console.log(`  deployment ${d.id}, pushed ${new Date(d.created).toLocaleString()}${d.assets ? ` (${d.assets.size} static files)` : ""}`);
     } else if (!names.length && opts.deploys !== false && !opts.dev) {
       console.log(`  \x1b[2mno functions yet: add some to ./onebase, or push them with onebase deploy\x1b[0m`);
+    }
+    if (runtime.mounts.size) {
+      console.log(`  components ${[...runtime.mounts.values()].map((m) => `${m.name} (${m.definition.name})`).join(", ")}`);
     }
     if (runtime.cronJobs.length) console.log(`  crons      ${runtime.cronJobs.map((j) => j.name).join(", ")}`);
     if (runtime.auth) console.log(`  sign-in    ${runtime.auth.ids.join(", ")}`);

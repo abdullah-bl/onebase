@@ -7,6 +7,7 @@ A lightweight, Convex-style reactive backend: TypeScript functions, a typed docu
 - **Convex-shaped API:** `query`, `mutation`, `action`, `v.*`, `ctx.db`, `api.module.fn`, `useQuery`. Code and LLM knowledge carry over.
 - **Forgiving and explicit:** errors say how to fix the problem, indexes are picked automatically for filters, and `onebase doctor` checks your project.
 - **Batteries included:** sign-in with passwords and OAuth, full-text search, optimistic updates, scheduler, cron jobs, file storage, JWT auth (Clerk, Auth0, any OIDC), HTTP routes and pagination.
+- **Components:** mount packages with their own tables, like the built-in rate limiter, and call them as `ctx.components.limiter.limit({ ... })`, in your transaction.
 - **Dashboard built in** at `/_admin`: browse and edit data, run functions, live logs, jobs and files.
 - **Your choice of database:** SQLite by default; Postgres, MySQL or Turso (libSQL) when you need several instances. Files on disk or in S3/R2/MinIO, and SQLite backups to S3.
 - **Single file deploy**, PocketBase style.
@@ -128,6 +129,7 @@ Send `Authorization: Bearer <token>` for auth: a built-in session token, or a to
 - **Drivers:** the engine talks to a small async driver interface (`read`, `write`, `publish`, `subscribe`) with SQLite (`bun:sqlite`), Postgres and MySQL (`Bun.SQL`), and libSQL implementations. The same tests run against all four.
 - **Transactions:** mutations from one process run one at a time in a serializable transaction. Queries read a consistent snapshot (a separate WAL reader on SQLite; `REPEATABLE READ` on Postgres).
 - **Reactivity:** each query records the documents, equality ranges, index bounds and the slice of rows it read (for example `messages where channel = X`, the latest 50). After a commit, only subscriptions whose reads overlap the writes re-run. Identical subscriptions share one execution, and results are pushed only when they change.
+- **Components:** each mount's tables are stored as `<mount>.<table>` in the same `documents` table; every database handle is scoped to the app's tables or one component's, and component calls reuse the nested query and mutation paths (one snapshot, or a savepoint in the caller's transaction).
 - **Search:** SQLite and Turso keep an FTS5 table per search index; Postgres uses a GIN `tsvector` index on the documents table; MySQL a `FULLTEXT` side table.
 - **Vector search:** SQLite and Turso keep a float32 side table per vector index (compared with `vector_distance_cos`, built into libSQL and added to `bun:sqlite`); Postgres uses a pgvector HNSW index; MySQL ranks in the server.
 - **Scheduler and crons:** jobs and cron schedules are stored in SQLite, so they survive restarts. Scheduled mutations run exactly once.

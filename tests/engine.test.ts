@@ -6,7 +6,9 @@ import { Runtime } from "../src/engine/runtime";
 import { MAX_PAGE_SIZE } from "../src/engine/database";
 import { createDriver, SqliteDriver, type Driver } from "../src/engine/driver";
 import { SubscriptionManager, type QueryUpdate } from "../src/engine/sync";
-import { defineSchema, defineTable, internalMutation, mutation, paginationOptsValidator, query } from "../src/server";
+import { defineSchema, defineTable, internalAction, internalMutation, mutation, paginationOptsValidator, query } from "../src/server";
+
+let releaseStuck = () => {};
 import { ConvexError, v } from "../src/values";
 
 const schema = defineSchema({
@@ -77,6 +79,15 @@ const modules = {
       args: { channel: v.string() },
       handler: async (ctx, { channel }) => {
         await ctx.scheduler.runAfter(10, "messages:insertInternal", { channel });
+      },
+    }),
+    // Scheduled ahead of insertInternal; doesn't finish until the test lets it.
+    stuck: internalAction({ args: {}, handler: () => new Promise<void>((resolve) => (releaseStuck = resolve)) }),
+    stallThenInsert: mutation({
+      args: { channel: v.string() },
+      handler: async (ctx, { channel }) => {
+        await ctx.scheduler.runAfter(0, "messages:stuck", {});
+        await ctx.scheduler.runAfter(50, "messages:insertInternal", { channel });
       },
     }),
     insertInternal: internalMutation({
@@ -232,6 +243,13 @@ for (const D of DRIVERS) describe(D.name, () => {
       expect(await q("messages:count")).toBe(0);
       await Bun.sleep(150);
       expect((await q("messages:all"))[0]).toMatchObject({ author: "bot", body: "scheduled" });
+    });
+
+    test("a scheduled job that never finishes doesn't hold up the ones after it", async () => {
+      await m("messages:stallThenInsert", { channel: "c" });
+      await Bun.sleep(400);
+      expect((await q("messages:all")).map((d: any) => d.body)).toEqual(["scheduled"]);
+      releaseStuck();
     });
 
     test("data survives a restart", async () => {

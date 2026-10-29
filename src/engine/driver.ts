@@ -119,6 +119,8 @@ export class SqliteDriver implements Driver {
   readonly kind = "sqlite";
   readonly shared = false;
   readonly writer: Database;
+  /** The SQLite synchronous mode the writer runs with (ONEBASE_SYNCHRONOUS). */
+  readonly synchronous: string;
   reader: Database;
   private readonly reads = new SerialQueue();
   private readonly writes = new SerialQueue();
@@ -129,7 +131,12 @@ export class SqliteDriver implements Driver {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     this.writer = new Database(path, { create: true, strict: true });
     this.writer.run("PRAGMA journal_mode = WAL");
-    this.writer.run("PRAGMA synchronous = NORMAL");
+    // NORMAL skips fsync per commit (safe against app crashes, not power loss);
+    // ONEBASE_SYNCHRONOUS=FULL/EXTRA buys power-loss durability at write speed.
+    this.synchronous = ["OFF", "NORMAL", "FULL", "EXTRA"].includes(process.env.ONEBASE_SYNCHRONOUS ?? "")
+      ? process.env.ONEBASE_SYNCHRONOUS!
+      : "NORMAL";
+    this.writer.run(`PRAGMA synchronous = ${this.synchronous}`);
     this.writer.run("PRAGMA busy_timeout = 5000");
     addVectorFunctions(this.writer);
     for (const sql of this.dialect.ddl) this.writer.run(sql);
@@ -157,7 +164,7 @@ export class SqliteDriver implements Driver {
   }
 
   get description() {
-    return this.path;
+    return `${this.path} (synchronous=${this.synchronous})`;
   }
 
   /**

@@ -23,6 +23,11 @@ export interface Driver {
   readonly description: string;
   /** True when other processes can share this database, so commits must be broadcast. */
   readonly shared: boolean;
+  /**
+   * True when `write` runs transactions one at a time in call order, each seeing the ones before
+   * it, so callers may queue the next write before the last one commits.
+   */
+  readonly pipelined?: boolean;
   init(): Promise<void>;
   /** Runs `fn` on a consistent read-only snapshot. */
   read<T>(fn: (tx: Exec) => Promise<T>): Promise<T>;
@@ -104,6 +109,9 @@ async function retrying<T>(fn: () => Promise<T>, isConflict: (err: unknown) => b
 const OPTIMIZE_INTERVAL_MS = 60 * 60 * 1000;
 /** Also optimize after this many write transactions: a database that starts empty grows fast. */
 const OPTIMIZE_EVERY_WRITES = 1000;
+/** A group commit closes after this many writes or this long, even while more are waiting. */
+const GROUP_MAX_WRITES = 512;
+const GROUP_MAX_MS = 20;
 
 /** The vector functions libSQL has built in, so vector indexes use the same SQL on both. */
 function addVectorFunctions(db: Database) {
@@ -118,12 +126,18 @@ export class SqliteDriver implements Driver {
   readonly dialect = sqliteDialect;
   readonly kind = "sqlite";
   readonly shared = false;
+  readonly pipelined = true;
   readonly writer: Database;
   /** The SQLite synchronous mode the writer runs with (ONEBASE_SYNCHRONOUS). */
   readonly synchronous: string;
   reader: Database;
   private readonly reads = new SerialQueue();
   private readonly writes = new SerialQueue();
+  /** Writes queued but not started: while there are any, the open group keeps going. */
+  private waitingWrites = 0;
+  /** Writes done in the open transaction, answered when it commits. */
+  private group: { resolve: () => void; reject: (err: unknown) => void }[] = [];
+  private groupStarted = 0;
   private optimizeTimer: ReturnType<typeof setInterval> | null = null;
   private writeCount = 0;
 
@@ -174,6 +188,7 @@ export class SqliteDriver implements Driver {
    */
   async optimize(): Promise<void> {
     const changed = await this.writes.run(async () => {
+      this.commitGroup();
       const before = this.statistics();
       this.writer.run("PRAGMA optimize");
       return this.statistics() !== before;
@@ -205,8 +220,14 @@ export class SqliteDriver implements Driver {
   async init() {}
 
   read<T>(fn: (tx: Exec) => Promise<T>): Promise<T> {
-    // In-memory databases have a single connection, so reads queue behind writes.
-    if (this.reader === this.writer) return this.writes.run(() => fn(this.exec(this.writer)));
+    // In-memory databases have a single connection, so reads queue behind writes (and must not
+    // see a group that hasn't committed).
+    if (this.reader === this.writer) {
+      return this.writes.run(() => {
+        this.commitGroup();
+        return fn(this.exec(this.writer));
+      });
+    }
     return this.reads.run(async () => {
       this.reader.run("BEGIN");
       try {
@@ -217,19 +238,77 @@ export class SqliteDriver implements Driver {
     });
   }
 
+  /**
+   * Group commit: writes queued behind each other share one transaction, each in a savepoint so
+   * a failing one is undone alone. The group commits once no write is waiting (or it's grown
+   * big or old), and only then are its callers answered, so N writes cost one fsync.
+   */
   write<T>(fn: (tx: Exec) => Promise<T>): Promise<T> {
-    return this.writes.run(async () => {
-      this.writer.run("BEGIN IMMEDIATE");
+    this.waitingWrites++;
+    const done = this.writes.run(async () => {
+      this.waitingWrites--;
+      if (!this.writer.inTransaction) {
+        this.writer.run("BEGIN IMMEDIATE");
+        this.groupStarted = performance.now();
+      }
+      this.writer.run("SAVEPOINT onebase_write");
+      let result: T;
       try {
-        const result = await fn(this.exec(this.writer));
-        this.writer.run("COMMIT");
-        if (++this.writeCount % OPTIMIZE_EVERY_WRITES === 0) void this.optimize().catch(() => {}); // queued behind this write
-        return result;
+        result = await fn(this.exec(this.writer));
+        this.writer.run("RELEASE onebase_write");
       } catch (err) {
-        this.writer.run("ROLLBACK");
+        if (this.writer.inTransaction) {
+          this.writer.run("ROLLBACK TO onebase_write");
+          this.writer.run("RELEASE onebase_write");
+          this.endGroupIfDone();
+        } else {
+          // SQLite rolled the whole transaction back (I/O error, disk full): the group is lost.
+          this.failGroup(err);
+        }
         throw err;
       }
+      const committed = new Promise<void>((resolve, reject) => this.group.push({ resolve, reject }));
+      this.endGroupIfDone();
+      return { result, committed };
     });
+    return done.then(async ({ result, committed }) => {
+      await committed;
+      return result;
+    });
+  }
+
+  private endGroupIfDone() {
+    if (this.waitingWrites === 0 || this.group.length >= GROUP_MAX_WRITES || performance.now() - this.groupStarted >= GROUP_MAX_MS) {
+      this.commitGroup();
+    }
+  }
+
+  /** Commits the open group, if any, and answers its writes. Runs on the write queue. */
+  private commitGroup() {
+    if (!this.writer.inTransaction) return;
+    try {
+      this.writer.run("COMMIT");
+    } catch (err) {
+      this.failGroup(err);
+      return;
+    }
+    const group = this.group;
+    this.group = [];
+    for (const w of group) w.resolve();
+    const before = this.writeCount;
+    this.writeCount += group.length;
+    if (Math.floor(before / OPTIMIZE_EVERY_WRITES) !== Math.floor(this.writeCount / OPTIMIZE_EVERY_WRITES)) {
+      void this.optimize().catch(() => {}); // queued behind the writes waiting now
+    }
+  }
+
+  private failGroup(err: unknown) {
+    try {
+      if (this.writer.inTransaction) this.writer.run("ROLLBACK");
+    } catch {}
+    const group = this.group;
+    this.group = [];
+    for (const w of group) w.reject(err);
   }
 
   /** Writes a consistent copy of the database to `path` without blocking writers. */

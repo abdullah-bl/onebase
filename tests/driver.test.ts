@@ -187,3 +187,52 @@ describe("mysql driver", () => {
     await driver.close();
   });
 });
+
+describe("sqlite group commit", () => {
+  test("queued writes share a commit, and a failing one is undone alone", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "onebase-group-"));
+    try {
+      const driver = new SqliteDriver(join(dir, "db.sqlite"));
+      await driver.write((tx) => tx.run("CREATE TABLE t (x INTEGER)"));
+      let commits = 0;
+      const run = driver.writer.run.bind(driver.writer);
+      (driver.writer as any).run = (sql: string) => (sql === "COMMIT" && commits++, run(sql));
+      const visible = async () => (await driver.read((tx) => tx.all("SELECT x FROM t ORDER BY x"))).map((r) => r.x);
+
+      const results = await Promise.allSettled(
+        Array.from({ length: 50 }, (_, i) =>
+          driver.write(async (tx) => {
+            await tx.run("INSERT INTO t (x) VALUES (?)", [i]);
+            if (i === 25) throw new Error("no");
+            return i;
+          }).then(async (value) => {
+            // Answered only once committed: the reader sees this write.
+            expect(await visible()).toContain(value);
+            return value;
+          }),
+        ),
+      );
+      expect(results.filter((r) => r.status === "rejected").map((r) => (r as PromiseRejectedResult).reason.message)).toEqual(["no"]);
+      expect(await visible()).toEqual(Array.from({ length: 50 }, (_, i) => i).filter((i) => i !== 25));
+      expect(commits).toBeGreaterThan(0);
+      expect(commits).toBeLessThan(10);
+      expect(driver.writer.inTransaction).toBe(false);
+      await driver.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("an in-memory read between writes runs outside the group", async () => {
+    const driver = new SqliteDriver(":memory:");
+    await driver.write((tx) => tx.run("CREATE TABLE t (x INTEGER)"));
+    const [, inTransaction] = await Promise.all([
+      driver.write((tx) => tx.run("INSERT INTO t (x) VALUES (1)")),
+      driver.read(async () => driver.writer.inTransaction),
+      driver.write((tx) => tx.run("INSERT INTO t (x) VALUES (2)")),
+    ]);
+    expect(inTransaction).toBe(false);
+    expect(await driver.read((tx) => tx.get("SELECT COUNT(*) AS n FROM t"))).toEqual({ n: 2 });
+    await driver.close();
+  });
+});

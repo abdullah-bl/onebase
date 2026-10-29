@@ -732,6 +732,8 @@ export class Runtime {
 
   /** Runs `fn` in a write transaction, queued behind this process's mutations. */
   withWriter<T>(fn: (tx: Exec) => Promise<T>): Promise<T> {
+    // A pipelined driver keeps the order itself, and lets queued writes share a commit.
+    if (this.driver.pipelined) return this.driver.write(fn);
     return this.mutations.run(() => this.driver.write(fn));
   }
 
@@ -1316,9 +1318,9 @@ export class Runtime {
    * post-commit hooks, scheduler wake-up and live-query invalidation.
    */
   private async transact<T>(body: (state: TxState) => Promise<T>, beforeCommit?: () => void, scope = TableScope.app): Promise<T> {
-    const { value, writes, scheduled, afterCommit, revoked } = await this.mutations.run(() =>
+    const { value, writes, scheduled, afterCommit, revoked } = await this.withWriter(
       // The driver may run this more than once if another instance conflicts; each attempt starts fresh.
-      this.driver.write(async (tx) => {
+      async (tx) => {
         const state: TxState = { tx, db: undefined as any, writes: [], scheduled: false, afterCommit: [], revoked: [], hookCursors: new Map() };
         state.db = this.newDb(tx, { writes: state.writes }, scope);
         const value = await body(state);
@@ -1329,7 +1331,7 @@ export class Runtime {
         }
         beforeCommit?.();
         return { value, writes: state.writes, scheduled: state.scheduled, afterCommit: state.afterCommit, revoked: state.revoked };
-      }),
+      },
     );
     if (revoked.length) this.notifyRevoked(revoked);
     for (const fn of afterCommit) await fn();

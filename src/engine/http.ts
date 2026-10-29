@@ -1,6 +1,7 @@
 import type { Server, ServerWebSocket } from "bun";
 import type { UserIdentity } from "../server";
 import { AuthError } from "./auth";
+import { TokenRejected } from "./jwt";
 import type { Runtime } from "./runtime";
 import { stableStringify, SubscriptionManager } from "./sync";
 
@@ -215,6 +216,8 @@ export function serve(opts: ServeOptions): Server<SocketData> {
   // accounts are deleted. While a connection is open, its identity is re-checked every
   // `sessionRecheckMs`; a still-valid session also has its expiry extended, like any other use.
   const recheckMs = opts.sessionRecheckMs ?? 60_000;
+  /** A session or token that is over for good: a built-in session that ended, or a JWT that no longer verifies. */
+  const endsSession = (err: unknown) => (err instanceof AuthError || err instanceof TokenRejected) && err.status === 401;
   let recheckTimer: ReturnType<typeof setInterval> | null = null;
   const recheckAll = async () => {
     for (const ws of sockets) {
@@ -235,7 +238,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
       } catch (err) {
         // `ended`: the session is gone for good. Anything else (say, the database timing out)
         // may pass, like on the auth message.
-        if (err instanceof AuthError && err.status === 401) signOutSocket(ws, err.message);
+        if (endsSession(err)) signOutSocket(ws, (err as Error).message);
       }
     }
   };
@@ -259,7 +262,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
         } catch (err) {
           ws.data.identity = null;
           // `ended`: the session is gone for good. Anything else (say, the database timing out) may pass.
-          const ended = err instanceof AuthError && err.status === 401;
+          const ended = endsSession(err);
           send(ws, { type: "auth", ok: false, ended, error: runtime.toClientError(err).message });
         }
         // Results depend on who is asking, so re-subscribe under the new identity.

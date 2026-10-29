@@ -106,6 +106,48 @@ describe("fetch() is only for actions", () => {
   });
 });
 
+describe("filter values from clients are compared, never compiled", () => {
+  let dir: string;
+  let driver: Driver;
+  let runtime: Runtime;
+  const schema = defineSchema({ invites: defineTable({ code: v.string(), role: v.string() }) });
+  const byCode = (q: any, code: unknown) => q.eq(q.field("code"), code);
+
+  beforeEach(async () => {
+    dir = mkdtempSync(join(tmpdir(), "onebase-expr-"));
+    const modules = {
+      invites: {
+        add: mutation({ args: { code: v.string(), role: v.string() }, handler: (ctx, a) => ctx.db.insert("invites", a) }),
+        // Handler-only and v.any() args reach filters unchecked: the shape a forged expression needs.
+        noArgs: query({ handler: async (ctx, args: any) => (await ctx.db.query("invites").filter((q) => byCode(q, args.code)).first())?.role ?? null }),
+        anyArg: query({ args: { code: v.any() }, handler: async (ctx, { code }) => (await ctx.db.query("invites").filter({ code }).first())?.role ?? null }),
+      },
+    };
+    ({ driver, runtime } = await openRuntime(() => DRIVERS[0]!.make(dir), { schema, modules }));
+    await runtime.runMutation("invites:add", { code: "secret-code", role: "admin" });
+  });
+  afterEach(async () => {
+    runtime.stop();
+    await driver.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("an object shaped like a q expression matches nothing", async () => {
+    const forged = { __expr: true, op: "field", path: "code" };
+    for (const fn of ["invites:noArgs", "invites:anyArg"]) {
+      expect((await runtime.runQuery(fn, { code: "secret-code" })).value).toBe("admin");
+      expect((await runtime.runQuery(fn, { code: forged })).value).toBeNull();
+      expect((await runtime.runQuery(fn, { code: { __expr: true, op: "not", args: [{ __expr: true, op: "lit", value: false }] } })).value).toBeNull();
+    }
+    // A callback still has to return something the builder made.
+    const bad = query({ handler: (ctx) => ctx.db.query("invites").filter(() => forged as any).collect() });
+    const other = await openRuntime(() => DRIVERS[0]!.make(dir), { schema, modules: { x: { bad } } });
+    expect(((await other.runtime.runQuery("x:bad", {}).catch((e) => e)) as Error).message).toContain("must return a q expression");
+    other.runtime.stop();
+    await other.driver.close();
+  });
+});
+
 describe("HTTP: CORS origins and rate limits", () => {
   const modules = { ping: { ping: query({ args: {}, handler: () => "pong" }) } };
   let app: Awaited<ReturnType<typeof startApp>>;

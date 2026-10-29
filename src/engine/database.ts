@@ -137,16 +137,23 @@ type Expr =
   | { __expr: true; op: "lit"; value: unknown }
   | { __expr: true; op: string; args: Expr[] };
 
-const lit = (value: unknown): Expr => ({ __expr: true, op: "lit", value });
-const toExpr = (x: unknown): Expr => (typeof x === "object" && x !== null && (x as any).__expr ? (x as Expr) : lit(x));
-const node = (op: string, args: unknown[]): Expr => ({ __expr: true, op, args: args.map(toExpr) });
+/**
+ * Filter values built here. A plain object that only looks like one (say from a client's
+ * arguments) is compared as a value, never compiled as an expression.
+ */
+const built = new WeakSet<object>();
+const mark = <T extends object>(x: T): T => (built.add(x), x);
+const isBuilt = (x: unknown): boolean => typeof x === "object" && x !== null && built.has(x);
+const lit = (value: unknown): Expr => mark({ __expr: true, op: "lit", value });
+const toExpr = (x: unknown): Expr => (isBuilt(x) && (x as any).__expr ? (x as Expr) : lit(x));
+const node = (op: string, args: unknown[]): Expr => mark({ __expr: true, op, args: args.map(toExpr) });
 
 export const filterBuilder = {
   field: (path: string): Expr => {
     if (path !== "_id" && path !== "_creationTime" && !FIELD_PATH.test(path)) {
       throw new OnebaseError(`q.field("${path}"): invalid field path.`);
     }
-    return { __expr: true, op: "field", path };
+    return mark({ __expr: true, op: "field", path });
   },
   eq: (a: unknown, b: unknown) => node("eq", [a, b]),
   neq: (a: unknown, b: unknown) => node("neq", [a, b]),
@@ -298,7 +305,7 @@ export const vectorIndexName = (table: string, index: string) => indexIdent("vx"
 export type VectorSearchQuery = { vector: unknown; limit?: unknown; filter?: (q: any) => unknown };
 type VectorFilter = { __vectorFilter: true; op: "eq"; field: string; value: unknown } | { __vectorFilter: true; op: "or"; args: VectorFilter[] };
 
-const isVectorFilter = (x: unknown): x is VectorFilter => typeof x === "object" && x !== null && (x as any).__vectorFilter === true;
+const isVectorFilter = (x: unknown): x is VectorFilter => isBuilt(x) && (x as any).__vectorFilter === true;
 
 /** The vector a document holds for `index`: null when the field is missing, an error when it isn't `dimensions` numbers. */
 function documentVector(index: VectorIndexDef, table: string, doc: Record<string, unknown>): number[] | null {
@@ -448,7 +455,7 @@ class QueryImpl {
   filter(predicate: unknown) {
     if (typeof predicate === "function") {
       const result = predicate(filterBuilder);
-      if (!result || typeof result !== "object" || !(result as any).__expr) {
+      if (!isBuilt(result) || !(result as any).__expr) {
         throw new OnebaseError(
           `.filter() callback must return a q expression, e.g. .filter(q => q.eq(q.field("done"), false)).\n` +
             `It receives a filter builder, not a document. For plain JS filtering use (await query.collect()).filter(doc => ...), ` +
@@ -751,11 +758,11 @@ export class DatabaseImpl {
           if (!index.filterFields.includes(field)) {
             throw new OnebaseError(`"${field}" isn't a filter field of ${where} (filterFields: ${index.filterFields.join(", ") || "none"}). Add it to filterFields in schema.ts.`);
           }
-          return { __vectorFilter: true, op: "eq", field, value };
+          return mark({ __vectorFilter: true, op: "eq", field, value });
         },
         or: (...args: VectorFilter[]): VectorFilter => {
           if (!args.every(isVectorFilter)) throw new OnebaseError(`q.or() takes q.eq(...) or q.or(...) filters.`);
-          return { __vectorFilter: true, op: "or", args };
+          return mark({ __vectorFilter: true, op: "or", args });
         },
       };
       const result = filter(builder);

@@ -290,16 +290,24 @@ for (const [backendName, filesUrl] of FILE_BACKENDS) describe(`file storage (${b
       ["text/html", "<script>localStorage.getItem('ob-admin-key')</script>"],
       ["image/svg+xml", "<svg xmlns='http://www.w3.org/2000/svg' onload='alert(1)'/>"],
       ["application/x-unknown", "?"],
+      // Browsers use the last type of a comma list, so these are HTML despite their first type.
+      ["text/plain;,text/html", "<script>1</script>"],
+      ["image/png;x=y, text/html", "<script>1</script>"],
+      ["application/pdf;,text/html", "<script>1</script>"],
     ] as const) {
       const res = await upload(type, body);
       expect(res.headers.get("content-disposition")).toBe("attachment");
       expect(res.headers.get("content-security-policy")).toContain("sandbox");
       expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+      if (type.includes(",")) expect(res.headers.get("content-type")).toBe("application/octet-stream");
     }
     // Images, media and plain text still show inline.
     const png = await upload("image/png", "png");
     expect(png.headers.get("content-disposition")).toBeNull();
     expect(png.headers.get("x-content-type-options")).toBe("nosniff");
+    const text = await upload("text/plain; charset=utf-8", "hi");
+    expect(text.headers.get("content-disposition")).toBeNull();
+    expect(text.headers.get("content-type")).toBe("text/plain; charset=utf-8");
   });
 
   test("actions can store and read blobs", async () => {

@@ -1,10 +1,12 @@
 // LibsqlDriver against a fake client, so the transaction limit and 429 retries are checked
 // without a libsql-server (CI only runs SQLite).
 
+import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { checkDatabase, type Finding } from "../src/doctor";
 import { applySchema } from "../src/engine/database";
 import { LibsqlDriver, MysqlDriver, SqliteDriver } from "../src/engine/driver";
 import { Runtime } from "../src/engine/runtime";
@@ -234,5 +236,71 @@ describe("sqlite group commit", () => {
     expect(inTransaction).toBe(false);
     expect(await driver.read((tx) => tx.get("SELECT COUNT(*) AS n FROM t"))).toEqual({ n: 2 });
     await driver.close();
+  });
+});
+
+describe("sqlite free space", () => {
+  /** Writes `mb` megabytes of rows into table pad, then deletes all but `keep` of them. */
+  async function churn(driver: SqliteDriver, mb: number, keep = 0) {
+    const row = "z".repeat(8000);
+    for (let i = 0; i < mb * 125; i += 1000) {
+      await driver.write(async (tx) => {
+        for (let j = i; j < Math.min(i + 1000, mb * 125); j++) await tx.run("INSERT INTO pad (n, x) VALUES (?, ?)", [j, row]);
+      });
+    }
+    await driver.write((tx) => tx.run("DELETE FROM pad WHERE n >= ?", [keep]));
+  }
+  const freeSpaceWarnings = (path: string) => {
+    const findings: Finding[] = [];
+    checkDatabase(path, findings);
+    return findings.map((f) => f.message);
+  };
+
+  test("a new database gives the space of deleted rows back in the background", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "onebase-space-"));
+    try {
+      const path = join(dir, "db.sqlite");
+      const driver = new SqliteDriver(path);
+      await driver.write((tx) => tx.run("CREATE TABLE pad (n INTEGER, x TEXT)"));
+      await churn(driver, 70, 10);
+      expect(driver.space()).toMatchObject({ autoVacuum: "incremental" });
+      expect(statSync(path).size).toBeGreaterThan(70e6);
+      expect(freeSpaceWarnings(path)).toHaveLength(1);
+
+      await driver.maintain();
+      expect(driver.space().free).toBe(0);
+      expect(statSync(path).size).toBeLessThan(1e6);
+      expect(statSync(`${path}-wal`).size).toBe(0);
+      expect(await driver.read((tx) => tx.get("SELECT COUNT(*) AS n FROM pad"))).toEqual({ n: 10 });
+      expect(freeSpaceWarnings(path)).toEqual([]);
+      await driver.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("onebase vacuum shrinks a database made before incremental vacuum, and turns it on", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "onebase-space-"));
+    try {
+      const path = join(dir, "db.sqlite");
+      const old = new Database(path, { create: true });
+      old.run("CREATE TABLE pad (n INTEGER, x TEXT)");
+      old.close();
+      const driver = new SqliteDriver(path);
+      await churn(driver, 70, 10);
+      expect(driver.space()).toMatchObject({ autoVacuum: "none" });
+      await driver.maintain(); // can't do anything without auto_vacuum
+      expect(statSync(path).size).toBeGreaterThan(70e6);
+      expect(freeSpaceWarnings(path)[0]).toMatch(/^\d+ MB \(\d+%\) of this \d+ MB database is free space/);
+
+      await driver.vacuum();
+      expect(driver.space()).toMatchObject({ autoVacuum: "incremental", free: 0 });
+      expect(statSync(path).size).toBeLessThan(1e6);
+      expect(await driver.read((tx) => tx.get("SELECT COUNT(*) AS n, SUM(n) AS s FROM pad"))).toEqual({ n: 10, s: 45 });
+      expect(freeSpaceWarnings(path)).toEqual([]);
+      await driver.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

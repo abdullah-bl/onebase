@@ -109,6 +109,13 @@ async function retrying<T>(fn: () => Promise<T>, isConflict: (err: unknown) => b
 const OPTIMIZE_INTERVAL_MS = 60 * 60 * 1000;
 /** Also optimize after this many write transactions: a database that starts empty grows fast. */
 const OPTIMIZE_EVERY_WRITES = 1000;
+/** How often free pages go back to the filesystem and the WAL is trimmed. */
+const MAINTAIN_INTERVAL_MS = 5 * 60 * 1000;
+/** Freed in slices this big, with writes going in between; at most the second per run. */
+const VACUUM_STEP_BYTES = 1 << 20;
+const VACUUM_MAX_BYTES = 256 << 20;
+/** The WAL file is cut back to this size after a checkpoint, instead of keeping its peak size. */
+const WAL_SIZE_LIMIT = 64 << 20;
 /** A group commit closes after this many writes or this long, even while more are waiting. */
 const GROUP_MAX_WRITES = 512;
 const GROUP_MAX_MS = 20;
@@ -120,6 +127,28 @@ function addVectorFunctions(db: Database) {
   }
   db.function("vector32", { deterministic: true }, vector32);
   db.function("vector_distance_cos", { deterministic: true }, vectorDistanceCos);
+}
+
+export type SqliteSpace = { pages: number; free: number; pageSize: number; autoVacuum: "none" | "full" | "incremental" };
+
+/** How big a SQLite file is, in pages, and how many of them are free. */
+export function sqliteSpace(db: Database): SqliteSpace {
+  const pragma = (name: string) => Number(Object.values(db.query(`PRAGMA ${name}`).get() as Row)[0]);
+  return {
+    pages: pragma("page_count"),
+    free: pragma("freelist_count"),
+    pageSize: pragma("page_size"),
+    autoVacuum: (["none", "full", "incremental"] as const)[pragma("auto_vacuum")] ?? "none",
+  };
+}
+
+/** Free pages are kept for reuse until they're this much of the file, and at least this big. */
+const VACUUM_MIN_FREE_RATIO = 0.25;
+const VACUUM_MIN_FREE_BYTES = 64 << 20;
+
+/** Is enough of the file free space that it's worth giving back to the filesystem? */
+export function worthVacuuming(space: SqliteSpace): boolean {
+  return space.free * space.pageSize >= VACUUM_MIN_FREE_BYTES && space.free >= space.pages * VACUUM_MIN_FREE_RATIO;
 }
 
 export class SqliteDriver implements Driver {
@@ -139,12 +168,16 @@ export class SqliteDriver implements Driver {
   private group: { resolve: () => void; reject: (err: unknown) => void }[] = [];
   private groupStarted = 0;
   private optimizeTimer: ReturnType<typeof setInterval> | null = null;
+  private maintainTimer: ReturnType<typeof setInterval> | null = null;
   private writeCount = 0;
 
   constructor(readonly path: string) {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     this.writer = new Database(path, { create: true, strict: true });
+    // Only takes effect before the first table exists; `onebase vacuum` turns it on for older files.
+    this.writer.run("PRAGMA auto_vacuum = INCREMENTAL");
     this.writer.run("PRAGMA journal_mode = WAL");
+    this.writer.run(`PRAGMA journal_size_limit = ${WAL_SIZE_LIMIT}`);
     // NORMAL skips fsync per commit (safe against app crashes, not power loss);
     // ONEBASE_SYNCHRONOUS=FULL/EXTRA buys power-loss durability at write speed.
     this.synchronous = ["OFF", "NORMAL", "FULL", "EXTRA"].includes(process.env.ONEBASE_SYNCHRONOUS ?? "")
@@ -162,6 +195,8 @@ export class SqliteDriver implements Driver {
     if (path !== ":memory:") {
       this.optimizeTimer = setInterval(() => void this.optimize().catch(() => {}), OPTIMIZE_INTERVAL_MS);
       this.optimizeTimer.unref?.();
+      this.maintainTimer = setInterval(() => void this.maintain().catch(() => {}), MAINTAIN_INTERVAL_MS);
+      this.maintainTimer.unref?.();
     }
     if (path === ":memory:") {
       this.reader = this.writer;
@@ -197,6 +232,58 @@ export class SqliteDriver implements Driver {
     await this.reads.run(async () => {
       this.reader.close();
       this.reader = this.openReader();
+    });
+  }
+
+  /** Page counts behind `onebase doctor`'s free-space warning and the vacuum below. */
+  space(): SqliteSpace {
+    return sqliteSpace(this.writer);
+  }
+
+  /**
+   * Gives free pages left by deleted documents back to the filesystem, a slice at a time once
+   * they're a good part of the file, and cuts the WAL back to nothing. Queued with the writes.
+   */
+  async maintain(): Promise<void> {
+    if (this.reader === this.writer) return;
+    for (let freed = 0; freed < VACUUM_MAX_BYTES; freed += VACUUM_STEP_BYTES) {
+      const took = await this.writes.run(async () => {
+        this.commitGroup();
+        const space = this.space();
+        // Once started, it frees them all rather than hovering at the threshold.
+        if (space.autoVacuum !== "incremental" || !space.free || (freed === 0 && !worthVacuuming(space))) return null;
+        const started = performance.now();
+        this.writer.run(`PRAGMA incremental_vacuum(${Math.floor(VACUUM_STEP_BYTES / space.pageSize)})`);
+        return performance.now() - started;
+      });
+      if (took === null) break;
+      await Bun.sleep(took); // writes get at least half the time
+    }
+    await this.writes.run(async () => {
+      this.commitGroup();
+      // A read in progress still uses the WAL, and waiting for it here would stall this thread
+      // (and so the read itself). Another process's reader makes the checkpoint stop short instead.
+      if (!this.reader.inTransaction) {
+        this.writer.run("PRAGMA busy_timeout = 0");
+        try {
+          this.writer.run("PRAGMA wal_checkpoint(TRUNCATE)");
+        } finally {
+          this.writer.run("PRAGMA busy_timeout = 5000");
+        }
+      }
+    });
+  }
+
+  /**
+   * Rewrites the whole file without free pages (`onebase vacuum`), turning on incremental vacuum
+   * for a database created before onebase did that. Writes wait until it's done.
+   */
+  async vacuum(): Promise<void> {
+    await this.writes.run(async () => {
+      this.commitGroup();
+      this.writer.run("PRAGMA auto_vacuum = INCREMENTAL");
+      this.writer.run("VACUUM");
+      this.writer.run("PRAGMA wal_checkpoint(TRUNCATE)");
     });
   }
 
@@ -332,6 +419,7 @@ export class SqliteDriver implements Driver {
 
   async close() {
     if (this.optimizeTimer) clearInterval(this.optimizeTimer);
+    if (this.maintainTimer) clearInterval(this.maintainTimer);
     try {
       await this.optimize();
     } catch {}

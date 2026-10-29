@@ -20,6 +20,7 @@ onebase <command> [flags]
 | `backup` | Take one SQLite snapshot to `--backup` now |
 | `backups` | List snapshots in `--backup` |
 | `restore` | Restore the newest snapshot (or `--at`) into `--data` |
+| `vacuum` | Shrink the SQLite file to the data it holds; stop the server first (see [vacuum](#vacuum)) |
 | `version` | Print the version |
 
 ## Flags
@@ -82,3 +83,14 @@ Each flag can also be set with an environment variable, which can come from a [.
 - `"use node"`
 - `.filter(doc => doc.x === …)` mistakes
 - stale `_generated/` files
+- a SQLite database (`--db`, or `<data>/db.sqlite`) where deleted documents left a lot of free space
+
+## vacuum
+
+SQLite doesn't shrink its file when documents are deleted: it keeps the free pages and reuses them for new writes. A database created by this version of onebase gives them back by itself. Every 5 minutes, once free pages are at least 64 MB and a quarter of the file, the server frees up to 256 MB, in small slices so writes keep going. The same pass cuts the WAL file back to nothing. Databases created by older versions can't do this until they've been vacuumed once:
+
+```
+onebase vacuum --data ./onebase_data
+```
+
+`vacuum` rewrites the whole file, so it needs about as much free disk as the data takes up. Writes wait while it runs, so stop the server first. `onebase doctor` tells you when it's worth running.

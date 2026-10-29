@@ -20,6 +20,8 @@ Postgres and MySQL support are built into Bun, and the libSQL client is pure Jav
 
 The default needs no setup. onebase uses WAL mode with a separate reader connection, so queries never wait for writes. Back it up to S3 with `--backup` (see [Backups](./backups.md)).
 
+The server gives space left by deleted documents back to the filesystem by itself; a database made by an older version needs one [`onebase vacuum`](./cli.md#vacuum) first.
+
 SQLite can only be used by one server process. When you need more than one, switch to Postgres, MySQL or Turso.
 
 ## Postgres

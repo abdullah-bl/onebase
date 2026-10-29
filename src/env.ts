@@ -99,10 +99,13 @@ function readFiles(cwd: string, names: string[], lookup: (key: string) => string
   return { values: expand(raw, lookup), loaded };
 }
 
-/** The files bun itself reads before onebase starts (`bun run` reads .env.development when NODE_ENV is unset). */
+/**
+ * The files bun itself reads before onebase starts, lowest priority first (`bun run` reads the
+ * development ones when NODE_ENV is unset).
+ */
 function bunAutoloadFiles(env: Record<string, string | undefined>): string[] {
   const mode = env.NODE_ENV === "production" || env.NODE_ENV === "test" ? env.NODE_ENV : "development";
-  return [".env", `.env.${mode}`, ...(mode === "test" ? [] : [".env.local"])];
+  return [".env", `.env.${mode}`, ...(mode === "test" ? [] : [".env.local"]), `.env.${mode}.local`];
 }
 
 export type LoadEnvOptions = {

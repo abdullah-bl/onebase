@@ -124,6 +124,21 @@ test("values bun loaded on its own get onebase's order, not a real variable's", 
   expect(overridden.A).toBe("from the shell");
 });
 
+/** The environment bun itself gives a script started in `cwd`, after loading .env files there. */
+async function bunEnv(cwd: string, extra: Record<string, string> = {}): Promise<Record<string, string | undefined>> {
+  writeFileSync(join(cwd, "print.ts"), "console.log(JSON.stringify(process.env))");
+  const proc = Bun.spawn([process.execPath, "print.ts"], { cwd, env: { PATH: process.env.PATH, ...extra }, stdout: "pipe" });
+  return JSON.parse(await new Response(proc.stdout).text());
+}
+
+test("values bun read from .env.development.local don't outrank the production files", async () => {
+  const cwd = project({ ".env.development.local": "ONEBASE_ADMIN_KEY=dev-local-key\nONEBASE_CORS=*", ".env.production": "ONEBASE_ADMIN_KEY=prod-key\nONEBASE_CORS=https://app.example" });
+  const env = await bunEnv(cwd);
+  expect(env.ONEBASE_ADMIN_KEY).toBe("dev-local-key"); // what bun loaded on its own
+  loadEnv({ mode: "production", cwd, env, bunAutoloaded: true });
+  expect([env.ONEBASE_ADMIN_KEY, env.ONEBASE_CORS]).toEqual(["prod-key", "https://app.example"]);
+});
+
 test("names like toString and __proto__ are ordinary variables", () => {
   const env = parseEnv("A=x$toString\n__proto__=p\nB=${constructor:-fallback}\nC=$hasOwnProperty");
   expect(Object.entries(env)).toEqual([["A", "x"], ["__proto__", "p"], ["B", "fallback"], ["C", ""]]);

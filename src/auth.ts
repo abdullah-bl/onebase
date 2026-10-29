@@ -64,7 +64,8 @@ export type AuthMethod = PasswordMethod | OAuthMethod;
  *
  * With `sendCode`, people can reset a forgotten password (`flow: "reset"`, then
  * `"reset-verification"`), and `verifyEmail: true` makes new accounts confirm their address
- * (`flow: "email-verification"`) before they can sign in.
+ * (`flow: "email-verification"` with the code and the password they signed up with) before they
+ * can sign in.
  */
 export function password(
   options: { minLength?: number; profile?: PasswordMethod["profile"]; sendCode?: SendCode; verifyEmail?: boolean } = {},

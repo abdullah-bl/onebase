@@ -391,7 +391,7 @@ export class OnebaseClient {
    * `{ signingIn: false }` when the next step happens elsewhere (an emailed code, an OAuth page).
    * - Password: `signIn("password", { flow: "signUp" | "signIn", email, password })`.
    * - Codes: `flow: "reset"` with `email`, then `"reset-verification"` with `email, code, newPassword`;
-   *   `"email-verification"` with `email, code` after signing up with verifyEmail.
+   *   `"email-verification"` with `email, code, password` (the one signed up with) after signing up with verifyEmail.
    * - OAuth: `signIn("github")` sends the browser to the provider and back to this page
    *   (or `redirectTo`); the client then finishes signing in on its own.
    */

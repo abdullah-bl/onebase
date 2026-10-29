@@ -272,7 +272,7 @@ export class AuthService {
       case "reset-verification":
         return this.resetPassword(method, email, params.code, this.checkPassword(params.newPassword, method.minLength), client);
       case "email-verification":
-        return this.confirmEmail(email, params.code, client);
+        return this.confirmEmail(email, params.code, this.checkPassword(params.password, 1), client);
       default:
         throw new AuthError(`flow must be one of signIn, signUp, reset, reset-verification, email-verification; got ${JSON.stringify(flow)}.`);
     }
@@ -404,20 +404,26 @@ export class AuthService {
   }
 
   /** Consumes a code and returns what was stored with it; wrong guesses count toward a lockout, like failed passwords. */
-  private async takeEmailCode(purpose: "verify" | "reset", email: string, code: unknown, client: string): Promise<{ secret?: string }> {
+  /**
+   * Uses up an emailed code. `password`, when given, must be the one the code carries: whoever
+   * asked for a verify code chose the password confirming it applies, and that may not be the
+   * inbox owner, so the person confirming has to know it too.
+   */
+  private async takeEmailCode(purpose: "verify" | "reset", email: string, code: unknown, client: string, password?: string): Promise<{ secret?: string }> {
     const key = `code:${email}|${client}`;
     await this.countAttempt(key, MAX_FAILURES, "wrong codes");
     const entered = typeof code === "string" ? code.replace(/\s/g, "") : "";
-    const data =
-      /^\d{8}$/.test(entered) &&
-      (await this.runtime.withWriter(async (tx) => {
-        const hash = sha256(`${purpose}|${email}|${entered}`);
-        const row = await tx.get("SELECT data, expires FROM _auth_codes WHERE code_hash = ? AND kind = ?", [hash, `${purpose}:${email}`]);
-        if (!row) return null;
-        await tx.run("DELETE FROM _auth_codes WHERE code_hash = ?", [hash]);
-        return Number(row.expires) >= Date.now() ? (JSON.parse(row.data as string) as { secret?: string }) : null;
-      }));
+    const hash = sha256(`${purpose}|${email}|${entered}`);
+    const row = /^\d{8}$/.test(entered)
+      ? await this.runtime.withReader((tx) => tx.get("SELECT data, expires FROM _auth_codes WHERE code_hash = ? AND kind = ?", [hash, `${purpose}:${email}`]))
+      : null;
+    const data = row && Number(row.expires) >= Date.now() ? (JSON.parse(row.data as string) as { secret?: string }) : null;
     if (!data) throw new AuthError("That code is wrong or has expired. Request a new one.", 401);
+    if (password !== undefined && !(data.secret && (await Bun.password.verify(password, data.secret)))) {
+      throw new AuthError("Enter the code together with the password you signed up with.", 401);
+    }
+    const { changes } = await this.runtime.withWriter((tx) => tx.run("DELETE FROM _auth_codes WHERE code_hash = ?", [hash]));
+    if (changes !== 1) throw new AuthError("That code is wrong or has expired. Request a new one.", 401); // used just now
     await this.runtime.withWriter((tx) => tx.run("DELETE FROM _auth_attempts WHERE \"key\" = ?", [key]));
     return data;
   }
@@ -455,8 +461,8 @@ export class AuthService {
   }
 
   /** Confirms the email of a new account (verifyEmail) and signs in. */
-  private async confirmEmail(email: string, code: unknown, client: string): Promise<SignInResult> {
-    const { secret } = await this.takeEmailCode("verify", email, code, client);
+  private async confirmEmail(email: string, code: unknown, password: string, client: string): Promise<SignInResult> {
+    const { secret } = await this.takeEmailCode("verify", email, code, client, password);
     return this.runtime.authWrite(async ({ db, tx, revoke }) => {
       const account = await tx.get("SELECT user_id FROM _auth_accounts WHERE provider = 'password' AND account_id = ?", [email]);
       const user = account ? await db.get(account.user_id) : null;
@@ -464,7 +470,8 @@ export class AuthService {
       if (typeof user.emailVerificationTime !== "number") {
         await db.patch(user._id, { emailVerificationTime: Date.now() });
         // Until now anyone could have created this account. The inbox owner keeps the password they
-        // just chose, and nothing from before confirmation (an earlier password, a session) survives.
+        // just chose (takeEmailCode checked they know it), and nothing from before confirmation (an
+        // earlier password, a session) survives.
         if (secret) await tx.run("UPDATE _auth_accounts SET secret = ? WHERE provider = 'password' AND account_id = ?", [secret, email]);
         revoke((await tx.all("SELECT id FROM _auth_sessions WHERE user_id = ?", [user._id])).map((r) => r.id as string));
         await tx.run("DELETE FROM _auth_sessions WHERE user_id = ?", [user._id]);

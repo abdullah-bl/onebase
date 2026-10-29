@@ -177,7 +177,7 @@ export default {
 
 - Client: `signIn("password", { flow: "signUp" | "signIn", email, password })`, `signIn("github")`, `signOut()`. React: `useAuthActions()`, `useOnebaseAuth()` (`{ isLoading, isAuthenticated }`), `<Authenticated>`, `<Unauthenticated>`, `<AuthLoading>`.
 - Functions: `const userId = await getAuthUserId(ctx)` (from `onebase/server`) returns `Id<"users"> | null`. Users are normal documents in `users`.
-- Password reset and email verification: `password({ sendCode: async ({ email, code, purpose }) => { /* email it */ }, verifyEmail: true })`. Flows: `"reset"` (email) → `"reset-verification"` (email, code, newPassword); with verifyEmail, `signUp` resolves `{ signingIn: false }` and `"email-verification"` (email, code) signs in.
+- Password reset and email verification: `password({ sendCode: async ({ email, code, purpose }) => { /* email it */ }, verifyEmail: true })`. Flows: `"reset"` (email) → `"reset-verification"` (email, code, newPassword); with verifyEmail, `signUp` resolves `{ signingIn: false }` and `"email-verification"` (email, code, password: the one signed up with) signs in.
 
 External providers use the Convex format, and `authenticate` checks any other token with read access to the database:
 

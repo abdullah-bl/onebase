@@ -441,8 +441,8 @@ for (const DB of DATABASES) describe(`${DB.name}: built-in auth`, () => {
       expect((await flow2("signIn", { email: "verify@example.com", password: "correct horse" })).body).toEqual({ codeSent: true });
       expect((await flow2("signIn", { email: "verify@example.com", password: "wrong password" })).status).toBe(401);
       const second = inbox.sent.findLast((m) => m.email === "verify@example.com")!.code;
-      if (first !== second) expect((await flow2("email-verification", { email: "verify@example.com", code: first })).status).toBe(401); // replaced
-      const confirmed = await flow2("email-verification", { email: "verify@example.com", code: second });
+      if (first !== second) expect((await flow2("email-verification", { email: "verify@example.com", code: first, password: "correct horse" })).status).toBe(401); // replaced
+      const confirmed = await flow2("email-verification", { email: "verify@example.com", code: second, password: "correct horse" });
       expect(confirmed.status).toBe(200);
       expect(typeof (await app2.runtime.adminRead((db) => db.get(confirmed.body.userId)))?.emailVerificationTime).toBe("number");
       expect((await flow2("signIn", { email: "verify@example.com", password: "correct horse" })).body.token).toStartWith("ob_s_");
@@ -453,14 +453,14 @@ for (const DB of DATABASES) describe(`${DB.name}: built-in auth`, () => {
       expect(await client.signIn("password", { flow: "signUp", email: "walk@example.com", password: "correct horse" })).toEqual({ signingIn: false });
       expect(client.authState.isAuthenticated).toBe(false);
       const code = await inbox.codeFor("walk@example.com", "verify");
-      expect(await client.signIn("password", { flow: "email-verification", email: "walk@example.com", code })).toEqual({ signingIn: true });
+      expect(await client.signIn("password", { flow: "email-verification", email: "walk@example.com", code, password: "correct horse" })).toEqual({ signingIn: true });
       expect(await client.query("auth:whoami", {})).toBeString();
       client.close();
     });
 
     test("a confirmed email lets OAuth join the same user", async () => {
       await flow2("signUp", { email: "link@example.com", password: "correct horse" });
-      const { userId } = (await flow2("email-verification", { email: "link@example.com", code: await inbox.codeFor("link@example.com", "verify") })).body;
+      const { userId } = (await flow2("email-verification", { email: "link@example.com", code: await inbox.codeFor("link@example.com", "verify"), password: "correct horse" })).body;
       const { verifier, challenge } = verifierPair();
       const start = await post2("signin", { provider: "fake", redirectTo: "https://app.example.com/", challenge });
       const authorize = new URL(start.body.redirect);
@@ -473,11 +473,11 @@ for (const DB of DATABASES) describe(`${DB.name}: built-in auth`, () => {
 
     test("signing up a taken address answers exactly like a new one", async () => {
       await flow2("signUp", { email: "taken@example.com", password: "correct horse" });
-      const existing = (await flow2("email-verification", { email: "taken@example.com", code: await inbox.codeFor("taken@example.com", "verify") })).body.userId;
+      const existing = (await flow2("email-verification", { email: "taken@example.com", code: await inbox.codeFor("taken@example.com", "verify"), password: "correct horse" })).body.userId;
 
       // A wrong password still gets the same reply (and the same emailed code) as a new address.
       expect(await flow2("signUp", { email: "taken@example.com", password: "totally wrong" })).toEqual({ status: 200, body: { codeSent: true } });
-      const confirmed = await flow2("email-verification", { email: "taken@example.com", code: await inbox.codeFor("taken@example.com", "verify") });
+      const confirmed = await flow2("email-verification", { email: "taken@example.com", code: await inbox.codeFor("taken@example.com", "verify"), password: "totally wrong" });
       expect(confirmed.status).toBe(200);
       expect(confirmed.body.userId).toBe(existing); // the code signs into the existing account
     });
@@ -487,13 +487,34 @@ for (const DB of DATABASES) describe(`${DB.name}: built-in auth`, () => {
       await flow2("signUp", { email: "pre@example.com", password: "attacker pass" });
       // The owner signs up later and confirms the code they were sent.
       await flow2("signUp", { email: "pre@example.com", password: "owner password" });
-      const owner = await flow2("email-verification", { email: "pre@example.com", code: await inbox.codeFor("pre@example.com", "verify") });
+      const owner = await flow2("email-verification", { email: "pre@example.com", code: await inbox.codeFor("pre@example.com", "verify"), password: "owner password" });
       expect(owner.status).toBe(200);
 
       expect((await flow2("signIn", { email: "pre@example.com", password: "attacker pass" })).status).toBe(401);
       const again = await flow2("signIn", { email: "pre@example.com", password: "owner password" });
       expect(again.status).toBe(200);
       expect(again.body.userId).toBe(owner.body.userId);
+    });
+
+    test("signing up again while the owner confirms can't choose the password their confirmation sets", async () => {
+      await flow2("signUp", { email: "mid@example.com", password: "owner password" });
+      // An attacker signs the same address up again: the newest code in the owner's inbox carries
+      // the attacker's password, and it replaces the owner's code.
+      await flow2("signUp", { email: "mid@example.com", password: "attacker pass" });
+      const code = await inbox.codeFor("mid@example.com", "verify");
+      expect(await flow2("email-verification", { email: "mid@example.com", code })).toMatchObject({ status: 400, body: { error: "Enter a password." } });
+      expect(await flow2("email-verification", { email: "mid@example.com", code, password: "owner password" })).toMatchObject({
+        status: 401,
+        body: { error: "Enter the code together with the password you signed up with." },
+      });
+      expect((await flow2("signIn", { email: "mid@example.com", password: "attacker pass" })).status).toBe(401);
+
+      // The owner asks for a fresh code and confirms it with their own password.
+      await flow2("signUp", { email: "mid@example.com", password: "owner password" });
+      const owner = await flow2("email-verification", { email: "mid@example.com", code: await inbox.codeFor("mid@example.com", "verify"), password: "owner password" });
+      expect(owner.status).toBe(200);
+      expect((await flow2("signIn", { email: "mid@example.com", password: "attacker pass" })).status).toBe(401);
+      expect((await flow2("signIn", { email: "mid@example.com", password: "owner password" })).body.userId).toBe(owner.body.userId);
     });
 
     test("a code that can't be sent is reported", async () => {

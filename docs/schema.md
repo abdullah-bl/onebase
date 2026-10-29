@@ -47,6 +47,8 @@ export default defineSchema({
 | `v.optional(x)` | field may be missing |
 | `v.any()` | anything |
 
+In function `args`, `v.id("table")` only accepts ids of that table (inside a component, the component's own table), so `ctx.db.get(id)` on a validated id can't reach another table.
+
 Values are stored as JSON. Store dates as numbers (`Date.now()`), not `Date` objects; onebase rejects a `Date` and tells you so.
 
 ## System fields

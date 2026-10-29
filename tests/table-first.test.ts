@@ -20,6 +20,9 @@ const modules = {
     patch: mutation({ args: { table: v.string(), id: v.string(), text: v.string() }, handler: (ctx: any, { table, id, text }) => ctx.db.patch(table, id, { text }) }),
     replace: mutation({ args: { id: v.string() }, handler: (ctx: any, { id }) => ctx.db.replace("notes", id, { text: "replaced" }) }),
     remove: mutation({ args: { table: v.string(), id: v.string() }, handler: (ctx: any, { table, id }) => ctx.db.delete(table, id) }),
+    // The documented Convex pattern: a v.id() argument, then the one-argument db calls.
+    typedGet: query({ args: { id: v.id("notes") }, handler: (ctx, { id }) => ctx.db.get(id) }),
+    typedRemove: mutation({ args: { id: v.id("notes") }, handler: (ctx, { id }) => ctx.db.delete(id) }),
     oldForm: mutation({
       args: { id: v.string() },
       handler: async (ctx: any, { id }) => {
@@ -47,6 +50,17 @@ for (const D of DRIVERS) describe(`${D.name}: table-first db calls`, () => {
   });
 
   const get = async (table: string, id: string) => (await runtime.runQuery("t:get", { table, id })).value as any;
+
+  test("a v.id() argument only takes ids of its own table", async () => {
+    const note = (await runtime.runMutation("t:add", { text: "a" })) as string;
+    const tag = (await runtime.runMutation("t:tag", {})) as string;
+    expect((await runtime.runQuery("t:typedGet", { id: note })).value).toMatchObject({ text: "a" });
+    for (const id of [tag, "x", note.slice(0, -1)]) {
+      await expect(runtime.runQuery("t:typedGet", { id })).rejects.toThrow('args.id must be an id for table "notes"');
+    }
+    await expect(runtime.runMutation("t:typedRemove", { id: tag })).rejects.toThrow('must be an id for table "notes"');
+    expect(await get("tags", tag)).toMatchObject({ name: "x" });
+  });
 
   test("get, patch, replace and delete take the table first", async () => {
     const id = (await runtime.runMutation("t:add", { text: "a" })) as string;

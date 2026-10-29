@@ -8,7 +8,7 @@ import { parseCron } from "../cron";
 import type { SchemaDefinition } from "../schema";
 import { isRegisteredFunction, type CronJob, type HttpAction, type HttpRouter, type RegisteredFunction, type UserIdentity } from "../server";
 import { ConvexError, describeValue, isPlainObject, validate, type AnyValidator } from "../values";
-import { buildCatalog, TableScope, tableMount, validatesTable, type Catalog } from "./catalog";
+import { buildCatalog, storedTable, TableScope, tableMount, validatesTable, type Catalog } from "./catalog";
 import { CronRunner } from "./crons";
 import { BACKFILL_BATCH, backfilled, coalesce, hookState, readProgress, writeProgress, type HookProgress, type ResolvedHook } from "./hooks";
 import { applySchema, DatabaseImpl, OnebaseError, readerView, writerView, type ReadSet, type VectorSearchQuery, type Write } from "./database";
@@ -917,7 +917,9 @@ export class Runtime {
     const value = args ?? {};
     if (!isPlainObject(value)) throw new OnebaseError(`Arguments to "${name}" must be an object, got ${describeValue(args)}.`);
     if (fn.args) {
-      const errors = validate(fn.args, value, "args");
+      // A component's v.id("t") names its own table, stored as "<mount>.t".
+      const mount = this.componentFunctions.get(name)?.mount.name ?? null;
+      const errors = validate(fn.args, value, "args", { idTable: (table) => storedTable(mount, table) });
       if (errors.length) throw new OnebaseError(`Invalid arguments for "${name}":\n  - ${errors.join("\n  - ")}`);
     }
     return value;

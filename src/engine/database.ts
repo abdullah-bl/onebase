@@ -270,6 +270,8 @@ function decodeCursor(cursor: string): unknown[] {
 
 /** Search queries return at most this many results, like Convex. */
 export const MAX_SEARCH_RESULTS = 1024;
+/** Most documents one .paginate() page returns. */
+export const MAX_PAGE_SIZE = 8192;
 
 export const searchIndexName = (table: string, index: string) => indexIdent("sx", table, index);
 
@@ -596,14 +598,20 @@ class QueryImpl {
         `.paginate() needs { numItems, cursor }. Take it from your args: args: { paginationOpts: paginationOptsValidator }.`,
       );
     }
+    if (!Number.isInteger(options.numItems) || options.numItems < 0) {
+      throw new OnebaseError(`.paginate() needs numItems to be a non-negative integer, got ${describeValue(options.numItems)}.`);
+    }
+    // numItems comes from the client: a larger page is cut to MAX_PAGE_SIZE, and the rest follows on the next page.
+    const numItems = Math.min(options.numItems, MAX_PAGE_SIZE);
     const cursor = options.cursor || null;
     if (options.endCursor) {
-      const rows = await this.run({ cursor, endCursor: options.endCursor });
+      const rows = await this.run({ cursor, endCursor: options.endCursor, limit: MAX_PAGE_SIZE + 1 });
+      if (rows.length > MAX_PAGE_SIZE) throw new OnebaseError(`.paginate() page between cursors has more than ${MAX_PAGE_SIZE} documents.`);
       return { page: rows.map((r) => r.doc), isDone: false, continueCursor: options.endCursor };
     }
-    const rows = await this.run({ cursor, limit: options.numItems + 1 });
-    const isDone = rows.length <= options.numItems;
-    const page = rows.slice(0, options.numItems);
+    const rows = await this.run({ cursor, limit: numItems + 1 });
+    const isDone = rows.length <= numItems;
+    const page = rows.slice(0, numItems);
     const last = page[page.length - 1];
     return {
       page: page.map((r) => r.doc),

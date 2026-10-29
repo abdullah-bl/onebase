@@ -24,7 +24,9 @@ const FAILURE_WINDOW = 3_600_000;
 const MAX_PASSWORD = 1024;
 const EMAIL_CODE_TTL = 15 * 60_000;
 const MAX_CODES_SENT = 5;
-const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const MAX_EMAIL = 254;
+// Domain labels can't contain dots, so no input can make the matcher backtrack.
+const EMAIL = /^[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+$/;
 
 /** An error for the person signing in, with the HTTP status to send. */
 export class AuthError extends OnebaseError {
@@ -258,7 +260,7 @@ export class AuthService {
 
   private async signInPassword(method: PasswordMethod, params: Record<string, unknown>, client: string): Promise<SignInResult> {
     const email = normalizeEmail(params.email);
-    if (!EMAIL.test(email)) throw new AuthError("Enter a valid email address.");
+    if (email.length > MAX_EMAIL || !EMAIL.test(email)) throw new AuthError("Enter a valid email address.");
     const flow = params.flow ?? "signIn";
     switch (flow) {
       case "signIn":

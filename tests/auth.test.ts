@@ -229,6 +229,17 @@ for (const DB of DATABASES) describe(`${DB.name}: built-in auth`, () => {
     expect(await ask("auth:whoami", created.body.token)).toBe(created.body.userId); // both sessions work
   });
 
+  test("checking an email address takes the same short time whatever is sent", async () => {
+    expect(await signUp("a@b.c")).toMatchObject({ status: 200 });
+    for (const email of ["a@b", "a@.b", "a@b..c", "a@b.c.", `${"x".repeat(250)}@b.co`]) {
+      expect(await signIn(email, "whatever1")).toMatchObject({ status: 400, body: { error: "Enter a valid email address." } });
+    }
+    // Used to backtrack quadratically: about a second of blocked event loop for 32k dots.
+    const started = performance.now();
+    expect(await signIn(`a@${".".repeat(32_000)}@`, "x")).toMatchObject({ status: 400 });
+    expect(performance.now() - started).toBeLessThan(200);
+  });
+
   test("repeated failed sign-ins for an email are locked out for a while", async () => {
     await signUp("locked@example.com");
     for (let i = 0; i < 10; i++) expect((await signIn("locked@example.com", "nope nope")).status).toBe(401);

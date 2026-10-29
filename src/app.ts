@@ -7,7 +7,7 @@ import { startBackups, type BackupOptions } from "./backup";
 import { createDriver } from "./engine/driver";
 import { LocalBlobs, parseS3Url, S3Blobs } from "./engine/files";
 import type { AuthConfig } from "./engine/jwt";
-import { consoleLogger, Runtime, type Authenticate, type Modules } from "./engine/runtime";
+import { consoleLogger, DEFAULT_TIME_LIMITS, formatMs, Runtime, type Authenticate, type Modules, type TimeLimits } from "./engine/runtime";
 import type { ComponentsDefinition } from "./components";
 import type { SchemaDefinition } from "./schema";
 import type { Crons, HttpRouter } from "./server";
@@ -56,6 +56,8 @@ export type AppOptions = {
   sessionRecheckMs?: number;
   /** Refuse a pushed bundle that takes longer than this to load (default 30s). */
   loadTimeoutMs?: number;
+  /** How long a query, mutation or action may run (default 10s, 10s and 10m). */
+  timeLimits?: Partial<TimeLimits>;
   quiet?: boolean;
 };
 
@@ -99,6 +101,7 @@ export async function startApp(opts: AppOptions) {
     log: consoleLogger,
     loadCode: opts.deploys === false ? null : importBundle,
     loadTimeoutMs: opts.loadTimeoutMs,
+    timeLimits: opts.timeLimits,
   });
   const { created, dropped } = await runtime.init();
   const adminKey = opts.dashboard === false ? null : loadAdminKey(opts.dataDir);
@@ -140,6 +143,11 @@ export async function startApp(opts: AppOptions) {
     console.log(`  files      ${blobs.description}`);
     if (opts.backup) console.log(`  backups    ${opts.backup.url} every ${Math.round(opts.backup.everyMs / 60_000)} min, keep ${opts.backup.keep}`);
     if (opts.cors?.length && !opts.cors.includes("*")) console.log(`  cors       ${opts.cors.join(", ")}`);
+    const limits = runtime.timeLimits;
+    if ((Object.keys(limits) as (keyof TimeLimits)[]).some((k) => limits[k] !== DEFAULT_TIME_LIMITS[k])) {
+      const show = (ms: number) => (ms ? formatMs(ms) : "off");
+      console.log(`  time limits query ${show(limits.queryMs)}, mutation ${show(limits.mutationMs)}, action ${show(limits.actionMs)}`);
+    }
     if (opts.rateLimit) console.log(`  rate limit ${new RateLimiter(opts.rateLimit).describe()} per IP${opts.trustProxy ? " (X-Forwarded-For)" : ""}`);
     console.log(`  http       http://${host}:${server.port}`);
     console.log(`  sync       ws://${host}:${server.port}/api/sync`);

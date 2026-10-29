@@ -23,6 +23,11 @@ export interface Driver {
   readonly description: string;
   /** True when other processes can share this database, so commits must be broadcast. */
   readonly shared: boolean;
+  /**
+   * True when `write` runs transactions one at a time in call order, each seeing the ones before
+   * it, so callers may queue the next write before the last one commits.
+   */
+  readonly pipelined?: boolean;
   init(): Promise<void>;
   /** Runs `fn` on a consistent read-only snapshot. */
   read<T>(fn: (tx: Exec) => Promise<T>): Promise<T>;
@@ -104,6 +109,16 @@ async function retrying<T>(fn: () => Promise<T>, isConflict: (err: unknown) => b
 const OPTIMIZE_INTERVAL_MS = 60 * 60 * 1000;
 /** Also optimize after this many write transactions: a database that starts empty grows fast. */
 const OPTIMIZE_EVERY_WRITES = 1000;
+/** How often free pages go back to the filesystem and the WAL is trimmed. */
+const MAINTAIN_INTERVAL_MS = 5 * 60 * 1000;
+/** Freed in slices this big, with writes going in between; at most the second per run. */
+const VACUUM_STEP_BYTES = 1 << 20;
+const VACUUM_MAX_BYTES = 256 << 20;
+/** The WAL file is cut back to this size after a checkpoint, instead of keeping its peak size. */
+const WAL_SIZE_LIMIT = 64 << 20;
+/** A group commit closes after this many writes or this long, even while more are waiting. */
+const GROUP_MAX_WRITES = 512;
+const GROUP_MAX_MS = 20;
 
 /** The vector functions libSQL has built in, so vector indexes use the same SQL on both. */
 function addVectorFunctions(db: Database) {
@@ -114,22 +129,61 @@ function addVectorFunctions(db: Database) {
   db.function("vector_distance_cos", { deterministic: true }, vectorDistanceCos);
 }
 
+export type SqliteSpace = { pages: number; free: number; pageSize: number; autoVacuum: "none" | "full" | "incremental" };
+
+/** How big a SQLite file is, in pages, and how many of them are free. */
+export function sqliteSpace(db: Database): SqliteSpace {
+  const pragma = (name: string) => Number(Object.values(db.query(`PRAGMA ${name}`).get() as Row)[0]);
+  return {
+    pages: pragma("page_count"),
+    free: pragma("freelist_count"),
+    pageSize: pragma("page_size"),
+    autoVacuum: (["none", "full", "incremental"] as const)[pragma("auto_vacuum")] ?? "none",
+  };
+}
+
+/** Free pages are kept for reuse until they're this much of the file, and at least this big. */
+const VACUUM_MIN_FREE_RATIO = 0.25;
+const VACUUM_MIN_FREE_BYTES = 64 << 20;
+
+/** Is enough of the file free space that it's worth giving back to the filesystem? */
+export function worthVacuuming(space: SqliteSpace): boolean {
+  return space.free * space.pageSize >= VACUUM_MIN_FREE_BYTES && space.free >= space.pages * VACUUM_MIN_FREE_RATIO;
+}
+
 export class SqliteDriver implements Driver {
   readonly dialect = sqliteDialect;
   readonly kind = "sqlite";
   readonly shared = false;
+  readonly pipelined = true;
   readonly writer: Database;
+  /** The SQLite synchronous mode the writer runs with (ONEBASE_SYNCHRONOUS). */
+  readonly synchronous: string;
   reader: Database;
   private readonly reads = new SerialQueue();
   private readonly writes = new SerialQueue();
+  /** Writes queued but not started: while there are any, the open group keeps going. */
+  private waitingWrites = 0;
+  /** Writes done in the open transaction, answered when it commits. */
+  private group: { resolve: () => void; reject: (err: unknown) => void }[] = [];
+  private groupStarted = 0;
   private optimizeTimer: ReturnType<typeof setInterval> | null = null;
+  private maintainTimer: ReturnType<typeof setInterval> | null = null;
   private writeCount = 0;
 
   constructor(readonly path: string) {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     this.writer = new Database(path, { create: true, strict: true });
+    // Only takes effect before the first table exists; `onebase vacuum` turns it on for older files.
+    this.writer.run("PRAGMA auto_vacuum = INCREMENTAL");
     this.writer.run("PRAGMA journal_mode = WAL");
-    this.writer.run("PRAGMA synchronous = NORMAL");
+    this.writer.run(`PRAGMA journal_size_limit = ${WAL_SIZE_LIMIT}`);
+    // NORMAL skips fsync per commit (safe against app crashes, not power loss);
+    // ONEBASE_SYNCHRONOUS=FULL/EXTRA buys power-loss durability at write speed.
+    this.synchronous = ["OFF", "NORMAL", "FULL", "EXTRA"].includes(process.env.ONEBASE_SYNCHRONOUS ?? "")
+      ? process.env.ONEBASE_SYNCHRONOUS!
+      : "NORMAL";
+    this.writer.run(`PRAGMA synchronous = ${this.synchronous}`);
     this.writer.run("PRAGMA busy_timeout = 5000");
     addVectorFunctions(this.writer);
     for (const sql of this.dialect.ddl) this.writer.run(sql);
@@ -141,6 +195,8 @@ export class SqliteDriver implements Driver {
     if (path !== ":memory:") {
       this.optimizeTimer = setInterval(() => void this.optimize().catch(() => {}), OPTIMIZE_INTERVAL_MS);
       this.optimizeTimer.unref?.();
+      this.maintainTimer = setInterval(() => void this.maintain().catch(() => {}), MAINTAIN_INTERVAL_MS);
+      this.maintainTimer.unref?.();
     }
     if (path === ":memory:") {
       this.reader = this.writer;
@@ -157,7 +213,7 @@ export class SqliteDriver implements Driver {
   }
 
   get description() {
-    return this.path;
+    return `${this.path} (synchronous=${this.synchronous})`;
   }
 
   /**
@@ -167,6 +223,7 @@ export class SqliteDriver implements Driver {
    */
   async optimize(): Promise<void> {
     const changed = await this.writes.run(async () => {
+      this.commitGroup();
       const before = this.statistics();
       this.writer.run("PRAGMA optimize");
       return this.statistics() !== before;
@@ -175,6 +232,58 @@ export class SqliteDriver implements Driver {
     await this.reads.run(async () => {
       this.reader.close();
       this.reader = this.openReader();
+    });
+  }
+
+  /** Page counts behind `onebase doctor`'s free-space warning and the vacuum below. */
+  space(): SqliteSpace {
+    return sqliteSpace(this.writer);
+  }
+
+  /**
+   * Gives free pages left by deleted documents back to the filesystem, a slice at a time once
+   * they're a good part of the file, and cuts the WAL back to nothing. Queued with the writes.
+   */
+  async maintain(): Promise<void> {
+    if (this.reader === this.writer) return;
+    for (let freed = 0; freed < VACUUM_MAX_BYTES; freed += VACUUM_STEP_BYTES) {
+      const took = await this.writes.run(async () => {
+        this.commitGroup();
+        const space = this.space();
+        // Once started, it frees them all rather than hovering at the threshold.
+        if (space.autoVacuum !== "incremental" || !space.free || (freed === 0 && !worthVacuuming(space))) return null;
+        const started = performance.now();
+        this.writer.run(`PRAGMA incremental_vacuum(${Math.floor(VACUUM_STEP_BYTES / space.pageSize)})`);
+        return performance.now() - started;
+      });
+      if (took === null) break;
+      await Bun.sleep(took); // writes get at least half the time
+    }
+    await this.writes.run(async () => {
+      this.commitGroup();
+      // A read in progress still uses the WAL, and waiting for it here would stall this thread
+      // (and so the read itself). Another process's reader makes the checkpoint stop short instead.
+      if (!this.reader.inTransaction) {
+        this.writer.run("PRAGMA busy_timeout = 0");
+        try {
+          this.writer.run("PRAGMA wal_checkpoint(TRUNCATE)");
+        } finally {
+          this.writer.run("PRAGMA busy_timeout = 5000");
+        }
+      }
+    });
+  }
+
+  /**
+   * Rewrites the whole file without free pages (`onebase vacuum`), turning on incremental vacuum
+   * for a database created before onebase did that. Writes wait until it's done.
+   */
+  async vacuum(): Promise<void> {
+    await this.writes.run(async () => {
+      this.commitGroup();
+      this.writer.run("PRAGMA auto_vacuum = INCREMENTAL");
+      this.writer.run("VACUUM");
+      this.writer.run("PRAGMA wal_checkpoint(TRUNCATE)");
     });
   }
 
@@ -198,8 +307,14 @@ export class SqliteDriver implements Driver {
   async init() {}
 
   read<T>(fn: (tx: Exec) => Promise<T>): Promise<T> {
-    // In-memory databases have a single connection, so reads queue behind writes.
-    if (this.reader === this.writer) return this.writes.run(() => fn(this.exec(this.writer)));
+    // In-memory databases have a single connection, so reads queue behind writes (and must not
+    // see a group that hasn't committed).
+    if (this.reader === this.writer) {
+      return this.writes.run(() => {
+        this.commitGroup();
+        return fn(this.exec(this.writer));
+      });
+    }
     return this.reads.run(async () => {
       this.reader.run("BEGIN");
       try {
@@ -210,19 +325,77 @@ export class SqliteDriver implements Driver {
     });
   }
 
+  /**
+   * Group commit: writes queued behind each other share one transaction, each in a savepoint so
+   * a failing one is undone alone. The group commits once no write is waiting (or it's grown
+   * big or old), and only then are its callers answered, so N writes cost one fsync.
+   */
   write<T>(fn: (tx: Exec) => Promise<T>): Promise<T> {
-    return this.writes.run(async () => {
-      this.writer.run("BEGIN IMMEDIATE");
+    this.waitingWrites++;
+    const done = this.writes.run(async () => {
+      this.waitingWrites--;
+      if (!this.writer.inTransaction) {
+        this.writer.run("BEGIN IMMEDIATE");
+        this.groupStarted = performance.now();
+      }
+      this.writer.run("SAVEPOINT onebase_write");
+      let result: T;
       try {
-        const result = await fn(this.exec(this.writer));
-        this.writer.run("COMMIT");
-        if (++this.writeCount % OPTIMIZE_EVERY_WRITES === 0) void this.optimize().catch(() => {}); // queued behind this write
-        return result;
+        result = await fn(this.exec(this.writer));
+        this.writer.run("RELEASE onebase_write");
       } catch (err) {
-        this.writer.run("ROLLBACK");
+        if (this.writer.inTransaction) {
+          this.writer.run("ROLLBACK TO onebase_write");
+          this.writer.run("RELEASE onebase_write");
+          this.endGroupIfDone();
+        } else {
+          // SQLite rolled the whole transaction back (I/O error, disk full): the group is lost.
+          this.failGroup(err);
+        }
         throw err;
       }
+      const committed = new Promise<void>((resolve, reject) => this.group.push({ resolve, reject }));
+      this.endGroupIfDone();
+      return { result, committed };
     });
+    return done.then(async ({ result, committed }) => {
+      await committed;
+      return result;
+    });
+  }
+
+  private endGroupIfDone() {
+    if (this.waitingWrites === 0 || this.group.length >= GROUP_MAX_WRITES || performance.now() - this.groupStarted >= GROUP_MAX_MS) {
+      this.commitGroup();
+    }
+  }
+
+  /** Commits the open group, if any, and answers its writes. Runs on the write queue. */
+  private commitGroup() {
+    if (!this.writer.inTransaction) return;
+    try {
+      this.writer.run("COMMIT");
+    } catch (err) {
+      this.failGroup(err);
+      return;
+    }
+    const group = this.group;
+    this.group = [];
+    for (const w of group) w.resolve();
+    const before = this.writeCount;
+    this.writeCount += group.length;
+    if (Math.floor(before / OPTIMIZE_EVERY_WRITES) !== Math.floor(this.writeCount / OPTIMIZE_EVERY_WRITES)) {
+      void this.optimize().catch(() => {}); // queued behind the writes waiting now
+    }
+  }
+
+  private failGroup(err: unknown) {
+    try {
+      if (this.writer.inTransaction) this.writer.run("ROLLBACK");
+    } catch {}
+    const group = this.group;
+    this.group = [];
+    for (const w of group) w.reject(err);
   }
 
   /** Writes a consistent copy of the database to `path` without blocking writers. */
@@ -246,6 +419,7 @@ export class SqliteDriver implements Driver {
 
   async close() {
     if (this.optimizeTimer) clearInterval(this.optimizeTimer);
+    if (this.maintainTimer) clearInterval(this.maintainTimer);
     try {
       await this.optimize();
     } catch {}

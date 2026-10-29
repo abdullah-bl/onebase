@@ -119,7 +119,43 @@ export type RuntimeOptions = {
   loadCode?: ((source: string, id: string) => Promise<ProjectCode>) | null;
   /** A bundle that takes longer than this to load is refused (default 30s). */
   loadTimeoutMs?: number;
+  /** How long a query, mutation or action may run (default: DEFAULT_TIME_LIMITS). */
+  timeLimits?: Partial<TimeLimits>;
 };
+
+/** How long one call may run, in ms; 0 means no limit. */
+export type TimeLimits = { queryMs: number; mutationMs: number; actionMs: number };
+export const DEFAULT_TIME_LIMITS: TimeLimits = { queryMs: 10_000, mutationMs: 10_000, actionMs: 10 * 60_000 };
+
+/**
+ * A call's time limit. A function can't be stopped mid-await, so once the limit passes the call
+ * is answered with an error, and whatever the function still tries afterwards fails here instead
+ * of reaching the database (by then, another call's transaction).
+ */
+class Deadline {
+  expired: OnebaseError | null = null;
+
+  check() {
+    if (this.expired) throw this.expired;
+  }
+
+  /** `fn`, refused once the deadline has passed. */
+  guard<A extends unknown[], R>(fn: (...args: A) => Promise<R>): (...args: A) => Promise<R> {
+    return async (...args) => {
+      this.check();
+      return fn(...args);
+    };
+  }
+
+  /** `tx`, refused once the deadline has passed. */
+  exec(tx: Exec): Exec {
+    return { all: this.guard(tx.all.bind(tx)), get: this.guard(tx.get.bind(tx)), run: this.guard(tx.run.bind(tx)) };
+  }
+}
+
+export function formatMs(ms: number): string {
+  return ms % 60_000 === 0 ? `${ms / 60_000}m` : ms % 1000 === 0 ? `${ms / 1000}s` : `${ms}ms`;
+}
 
 export type CallOptions = {
   identity?: UserIdentity | null;
@@ -200,6 +236,7 @@ export class Runtime {
   private readonly customAuthenticate: Authenticate | null;
   private readonly loadCode: RuntimeOptions["loadCode"];
   private readonly loadTimeoutMs: number;
+  readonly timeLimits: TimeLimits;
   private revokeListeners: ((sessionIds: string[]) => void)[] = [];
   private deployListeners: (() => Promise<void> | void)[] = [];
   private cronRunner: CronRunner | null = null;
@@ -226,6 +263,12 @@ export class Runtime {
     this.log = opts.log ?? consoleLogger;
     this.loadCode = this.dev ? null : opts.loadCode;
     this.loadTimeoutMs = opts.loadTimeoutMs ?? 30_000;
+    this.timeLimits = { ...DEFAULT_TIME_LIMITS };
+    for (const [key, ms] of Object.entries(opts.timeLimits ?? {}) as [keyof TimeLimits, number | undefined][]) {
+      if (ms === undefined) continue; // unset: keep the default
+      if (!(ms >= 0)) throw new Error(`timeLimits.${key} must be a number of ms (0 for no limit), got ${ms}.`);
+      this.timeLimits[key] = ms;
+    }
     this.files = new FileStore(opts.blobs ?? new LocalBlobs(mkdtempSync(join(tmpdir(), "onebase-files-"))), () => this.nextCreationTime());
     this.siteUrl = (opts.siteUrl ?? "http://localhost:8090").replace(/\/$/, "");
     const code = {
@@ -732,6 +775,8 @@ export class Runtime {
 
   /** Runs `fn` in a write transaction, queued behind this process's mutations. */
   withWriter<T>(fn: (tx: Exec) => Promise<T>): Promise<T> {
+    // A pipelined driver keeps the order itself, and lets queued writes share a commit.
+    if (this.driver.pipelined) return this.driver.write(fn);
     return this.mutations.run(() => this.driver.write(fn));
   }
 
@@ -1165,20 +1210,24 @@ export class Runtime {
     }
   }
 
-  actionCtx(identity: UserIdentity | null, mount: MountRuntime | null = null): any {
+  /** `deadline`: once the action's time limit passes, what it still tries to do is refused. */
+  actionCtx(identity: UserIdentity | null, mount: MountRuntime | null = null, deadline = new Deadline()): any {
     const id = this.identityFor(mount, identity);
     const opts: CallOptions = { identity: id, allowInternal: true, caller: mount };
-    const runQuery = (ref: FunctionLike, args?: unknown) => this.runQuery(ref, args, opts).then((r) => r.value);
-    const runMutation = (ref: FunctionLike, args?: unknown) => this.runMutation(ref, args, opts);
-    const runAction = (ref: FunctionLike, args?: unknown) => this.runAction(ref, args, opts);
-    const vectorSearch = (table: string, index: string, query: VectorSearchQuery) =>
-      this.driver.read((tx) => this.newDb(tx, {}, mount?.scope).vectorSearch(table, index, query));
+    const guardAll = <T extends Record<string, any>>(obj: T): T =>
+      Object.fromEntries(Object.entries(obj).map(([k, v]) => [k, typeof v === "function" ? deadline.guard(v) : v])) as T;
+    const runQuery = deadline.guard((ref: FunctionLike, args?: unknown) => this.runQuery(ref, args, opts).then((r) => r.value));
+    const runMutation = deadline.guard((ref: FunctionLike, args?: unknown) => this.runMutation(ref, args, opts));
+    const runAction = deadline.guard((ref: FunctionLike, args?: unknown) => this.runAction(ref, args, opts));
+    const vectorSearch = deadline.guard((table: string, index: string, query: VectorSearchQuery) =>
+      this.driver.read((tx) => this.newDb(tx, {}, mount?.scope).vectorSearch(table, index, query)),
+    );
     const ctx: Record<string, unknown> = mount
-      ? { ...this.componentBase(mount, id, null), scheduler: this.schedulerFor(null, mount), runQuery, runMutation, runAction, vectorSearch }
+      ? { ...this.componentBase(mount, id, null), scheduler: guardAll(this.schedulerFor(null, mount)), runQuery, runMutation, runAction, vectorSearch }
       : {
           auth: this.authFor(id),
-          storage: this.storageForActions(),
-          scheduler: this.schedulerFor(null),
+          storage: guardAll(this.storageForActions()),
+          scheduler: guardAll(this.schedulerFor(null)),
           runQuery,
           runMutation,
           runAction,
@@ -1263,6 +1312,28 @@ export class Runtime {
     return this.checkReturn(name, fn, result);
   }
 
+  /**
+   * Runs `body` under the time limit for `kind`. It gets the call's deadline, to fence the
+   * transaction and context it hands the function.
+   */
+  private async withinLimit<T>(kind: FunctionType, name: string, body: (deadline: Deadline) => Promise<T>): Promise<T> {
+    const deadline = new Deadline();
+    const ms = this.timeLimits[`${kind}Ms`];
+    if (!ms) return body(deadline);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        deadline.expired = new OnebaseError(`${name} didn't finish within the ${kind} time limit (${formatMs(ms)}).`);
+        reject(deadline.expired);
+      }, ms);
+    });
+    try {
+      return await Promise.race([body(deadline), expired]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   /** Runs an http.ts route handler. */
   async runHttpAction(
     handler: (ctx: any, request: Request) => Promise<Response> | Response,
@@ -1273,7 +1344,9 @@ export class Runtime {
     const name = `${request.method} ${new URL(request.url).pathname}`;
     const handle = (ref: unknown) => this.createHandle(ref, mount);
     return this.calls.track(name, "http", "http", () =>
-      currentFunction.run({ type: "action", name, handle }, async () => handler(this.actionCtx(identity, mount), request)),
+      this.withinLimit("action", name, (deadline) =>
+        currentFunction.run({ type: "action", name, handle }, async () => handler(this.actionCtx(identity, mount, deadline), request)),
+      ),
     );
   }
 
@@ -1283,12 +1356,15 @@ export class Runtime {
   async runQuery(ref: FunctionLike, args: unknown, opts: CallOptions = {}): Promise<{ value: unknown; readSet: ReadSet }> {
     const { name, fn, mount } = this.resolve(ref, "query", opts.allowInternal ?? false, this.callerOf(opts));
     return this.calls.track(name, "query", opts.source ?? "function", () =>
-      this.driver.read(async (tx) => {
-        const readSet: ReadSet = { ids: new Set(), ranges: [] };
-        const db = this.newDb(tx, { readSet });
-        const value = await this.invoke(name, fn, this.queryCtx(db, opts.identity ?? null, mount), args);
-        return { value, readSet };
-      }),
+      // The limit starts once the query has a snapshot: time spent waiting for one isn't its fault.
+      this.driver.read((tx) =>
+        this.withinLimit("query", name, async (deadline) => {
+          const readSet: ReadSet = { ids: new Set(), ranges: [] };
+          const db = this.newDb(deadline.exec(tx), { readSet });
+          const value = await this.invoke(name, fn, this.queryCtx(db, opts.identity ?? null, mount), args);
+          return { value, readSet };
+        }),
+      ),
     );
   }
 
@@ -1303,11 +1379,14 @@ export class Runtime {
   ): Promise<unknown> {
     const { name, fn, mount } = this.resolve(ref, "mutation", opts.allowInternal ?? false, this.callerOf(opts));
     return this.calls.track(name, "mutation", opts.source ?? "function", () =>
-      this.transact(async (state) => {
-        const value = await this.invoke(name, fn, this.mutationCtx(state, opts.identity ?? null, mount), args);
-        await opts.inTransaction?.(state.tx);
-        return value;
-      }, opts.beforeCommit),
+      this.transact(
+        async (state) => {
+          const value = await this.invoke(name, fn, this.mutationCtx(state, opts.identity ?? null, mount), args);
+          await opts.inTransaction?.(state.tx);
+          return value;
+        },
+        { beforeCommit: opts.beforeCommit, limit: name },
+      ),
     );
   }
 
@@ -1315,21 +1394,32 @@ export class Runtime {
    * Runs `body` in a write transaction with everything a mutation gets: commit broadcast,
    * post-commit hooks, scheduler wake-up and live-query invalidation.
    */
-  private async transact<T>(body: (state: TxState) => Promise<T>, beforeCommit?: () => void, scope = TableScope.app): Promise<T> {
-    const { value, writes, scheduled, afterCommit, revoked } = await this.mutations.run(() =>
-      // The driver may run this more than once if another instance conflicts; each attempt starts fresh.
-      this.driver.write(async (tx) => {
-        const state: TxState = { tx, db: undefined as any, writes: [], scheduled: false, afterCommit: [], revoked: [], hookCursors: new Map() };
-        state.db = this.newDb(tx, { writes: state.writes }, scope);
-        const value = await body(state);
-        // Nothing commits before every table hook has seen every write.
-        await this.flushHooks(state);
-        if (this.driver.shared && this.driver.publish && (state.writes.length || state.scheduled || state.revoked.length)) {
-          for (const message of this.broadcastMessages(state)) await this.driver.publish(tx, message);
-        }
-        beforeCommit?.();
-        return { value, writes: state.writes, scheduled: state.scheduled, afterCommit: state.afterCommit, revoked: state.revoked };
-      }),
+  private async transact<T>(
+    body: (state: TxState) => Promise<T>,
+    opts: {
+      beforeCommit?: () => void;
+      scope?: TableScope;
+      /** The function this runs, under the mutation time limit; none for the system's own writes. */
+      limit?: string;
+    } = {},
+  ): Promise<T> {
+    const { beforeCommit, scope = TableScope.app, limit } = opts;
+    // The driver may run this more than once if another instance conflicts; each attempt starts fresh.
+    const attempt = async (tx: Exec) => {
+      const state: TxState = { tx, db: undefined as any, writes: [], scheduled: false, afterCommit: [], revoked: [], hookCursors: new Map() };
+      state.db = this.newDb(tx, { writes: state.writes }, scope);
+      const value = await body(state);
+      // Nothing commits before every table hook has seen every write.
+      await this.flushHooks(state);
+      if (this.driver.shared && this.driver.publish && (state.writes.length || state.scheduled || state.revoked.length)) {
+        for (const message of this.broadcastMessages(state)) await this.driver.publish(tx, message);
+      }
+      beforeCommit?.();
+      return { value, writes: state.writes, scheduled: state.scheduled, afterCommit: state.afterCommit, revoked: state.revoked };
+    };
+    const { value, writes, scheduled, afterCommit, revoked } = await this.withWriter((tx) =>
+      // Each attempt gets the whole time limit, counted from when it has the write lock.
+      limit ? this.withinLimit("mutation", limit, (deadline) => attempt(deadline.exec(tx))) : attempt(tx),
     );
     if (revoked.length) this.notifyRevoked(revoked);
     for (const fn of afterCommit) await fn();
@@ -1346,8 +1436,7 @@ export class Runtime {
     return this.calls.track("dashboard edit", "mutation", "dashboard", () =>
       this.transact(
         (state) => body(state.db, { tx: state.tx, deleteFileAfterCommit: (id) => state.afterCommit.push(() => this.files.backend.remove(id)) }),
-        undefined,
-        TableScope.admin,
+        { scope: TableScope.admin },
       ),
     );
   }
@@ -1379,7 +1468,9 @@ export class Runtime {
 
   async runAction(ref: FunctionLike, args: unknown, opts: CallOptions = {}): Promise<unknown> {
     const { name, fn, mount } = this.resolve(ref, "action", opts.allowInternal ?? false, this.callerOf(opts));
-    return this.calls.track(name, "action", opts.source ?? "function", () => this.invoke(name, fn, this.actionCtx(opts.identity ?? null, mount), args));
+    return this.calls.track(name, "action", opts.source ?? "function", () =>
+      this.withinLimit("action", name, (deadline) => this.invoke(name, fn, this.actionCtx(opts.identity ?? null, mount, deadline), args)),
+    );
   }
 
   /** Runs any function by name, whatever its type. */
@@ -1412,7 +1503,7 @@ export class Runtime {
       });
       for (const { mount, hook } of hooks) {
         try {
-          while (!this.stopped && !(await this.transact((state) => this.backfillStep(state, mount, hook)))) {}
+          while (!this.stopped && !(await this.transact((state) => this.backfillStep(state, mount, hook), { limit: hook.onChange.name }))) {}
         } catch (err) {
           this.log.error(`Component "${mount.name}" couldn't catch up with table "${hook.table}": ${err instanceof Error ? err.message : String(err)}`);
         }

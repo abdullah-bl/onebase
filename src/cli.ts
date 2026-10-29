@@ -43,6 +43,7 @@ Usage:
   onebase backup   Take one SQLite snapshot to --backup now
   onebase backups  List snapshots in --backup
   onebase restore  Restore the newest snapshot (or --at <time>) into --data
+  onebase vacuum   Shrink the SQLite file to the data it holds (stop the server first)
 
 Options (each $NAME can also come from a .env file):
   --dir <path>      Functions directory (default: ./onebase, or $ONEBASE_DIR; a ported ./convex folder also works)
@@ -169,6 +170,18 @@ function duration(text: string): number {
   return Number(m[1]) * { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 }[m[2] as "s" | "m" | "h" | "d"];
 }
 
+/** A time limit from $name: a duration, or off (0). Unset: the default. */
+function timeLimit(name: string): number | undefined {
+  const value = process.env[name]?.trim();
+  if (!value) return undefined;
+  if (["0", "off", "none"].includes(value.toLowerCase())) return 0;
+  try {
+    return duration(value);
+  } catch {
+    throw new Error(`${name}=${value} isn't understood: use e.g. 10s, 2m or off.`);
+  }
+}
+
 /** Database, storage, backup and HTTP settings shared by `serve` and embedded binaries. */
 function serverOptions(opts: ReturnType<typeof options>) {
   const keep = Number(opts["backup-keep"]);
@@ -182,6 +195,11 @@ function serverOptions(opts: ReturnType<typeof options>) {
     trustProxy: opts["trust-proxy"],
     dashboard: !opts["no-dashboard"],
     deploys: !opts["no-deploy"],
+    timeLimits: {
+      queryMs: timeLimit("ONEBASE_QUERY_TIMEOUT"),
+      mutationMs: timeLimit("ONEBASE_MUTATION_TIMEOUT"),
+      actionMs: timeLimit("ONEBASE_ACTION_TIMEOUT"),
+    },
   };
 }
 
@@ -190,16 +208,46 @@ function requireBackupUrl(opts: ReturnType<typeof options>): string {
   return opts.backup;
 }
 
+/** The SQLite file --db (or --data) points at, or null when --db is a database URL. */
+function sqliteFile(opts: ReturnType<typeof options>): string | null {
+  const db = opts.db ?? join(opts.data, "db.sqlite");
+  return /^[a-z]+:\/\//.test(db) ? null : db.replace(/^file:/, "");
+}
+
+/** The existing SQLite file a command works on. */
+function requireSqliteFile(opts: ReturnType<typeof options>, command: string): string {
+  const dbPath = sqliteFile(opts);
+  if (!dbPath) throw new Error(`${command} works with a SQLite database file, not a database URL.`);
+  if (!existsSync(dbPath)) throw new Error(`No database at ${dbPath}.`);
+  return dbPath;
+}
+
 async function backupCommand(opts: ReturnType<typeof options>) {
   const url = requireBackupUrl(opts);
-  const dbPath = opts.db ?? join(opts.data, "db.sqlite");
-  if (/^[a-z]+:\/\//.test(dbPath)) throw new Error("backup works with a SQLite database file, not a database URL.");
-  if (!existsSync(dbPath)) throw new Error(`No database at ${dbPath}.`);
+  const dbPath = requireSqliteFile(opts, "backup");
   const driver = new SqliteDriver(dbPath);
   try {
     const blobs = opts.files ? undefined : new LocalBlobs(join(opts.data, "files"));
     const r = await backupNow(driver, url, Number(opts["backup-keep"]), blobs);
     console.log(`Uploaded ${r.key} (${(r.bytes / 1024).toFixed(1)} KB)${r.filesUploaded ? ` and ${r.filesUploaded} file(s)` : ""}.`);
+  } finally {
+    await driver.close();
+  }
+}
+
+async function vacuumCommand(opts: ReturnType<typeof options>) {
+  const dbPath = requireSqliteFile(opts, "vacuum");
+  const driver = new SqliteDriver(dbPath);
+  try {
+    const bytes = () => {
+      const space = driver.space();
+      return { total: space.pages * space.pageSize, free: space.free * space.pageSize };
+    };
+    const before = bytes();
+    const mb = (n: number) => `${(n / 1e6).toFixed(1)} MB`;
+    console.log(`Vacuuming ${dbPath}: ${mb(before.total)}, ${mb(before.free)} of it free…`);
+    await driver.vacuum();
+    console.log(`Done: ${mb(bytes().total)}. The server now gives space from deleted documents back by itself.`);
   } finally {
     await driver.close();
   }
@@ -363,7 +411,7 @@ export async function main(argv = process.argv.slice(2)) {
       return console.log(changed.length ? `Updated ${changed.length} file(s) in ${join(opts.dir, "_generated")}` : "Generated files are up to date.");
     }
     case "doctor": {
-      const findings = await doctor(opts.dir);
+      const findings = await doctor(opts.dir, { db: sqliteFile(opts) });
       printFindings(findings);
       if (findings.some((f) => f.level === "error")) process.exit(1);
       return;
@@ -386,6 +434,8 @@ export async function main(argv = process.argv.slice(2)) {
       return backupsCommand(opts);
     case "restore":
       return restoreCommand(opts);
+    case "vacuum":
+      return vacuumCommand(opts);
     case "version":
       return console.log(VERSION);
     default:

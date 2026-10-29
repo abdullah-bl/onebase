@@ -1,8 +1,10 @@
 // `onebase doctor`: catches the mistakes people (and LLMs) commonly make, with the fix.
 
+import { Database } from "bun:sqlite";
 import { existsSync, readFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { staleGeneratedFiles } from "./codegen";
+import { sqliteSpace, worthVacuuming } from "./engine/driver";
 import { listSourceFiles, loadProject, modulePathFor, type Project } from "./project";
 import { isRegisteredFunction } from "./server";
 import type { SearchIndexDef, VectorIndexDef } from "./schema";
@@ -266,9 +268,36 @@ function checkSources(dir: string, files: string[], findings: Finding[]) {
   }
 }
 
-export async function doctor(dirInput: string): Promise<Finding[]> {
+/** Free space deleted documents left in the SQLite file, which the file doesn't shrink by. */
+export function checkDatabase(path: string, findings: Finding[]) {
+  let db: Database;
+  try {
+    db = new Database(path, { readonly: true });
+  } catch {
+    return; // not there yet, or not readable: nothing to say about its size
+  }
+  try {
+    const space = sqliteSpace(db);
+    if (!worthVacuuming(space)) return;
+    const mb = (pages: number) => `${((pages * space.pageSize) / 1e6).toFixed(0)} MB`;
+    findings.push({
+      level: "warn",
+      where: relative(process.cwd(), path) || path,
+      message: `${mb(space.free)} (${Math.round((100 * space.free) / space.pages)}%) of this ${mb(space.pages)} database is free space left by deleted documents.`,
+      fix:
+        space.autoVacuum === "incremental"
+          ? "The server gives it back by itself, up to 256 MB every 5 minutes. onebase vacuum (with the server stopped) does it at once."
+          : "Run onebase vacuum with the server stopped. It needs that much free disk while it runs, and turns on reclaiming so the server gives space back by itself after that.",
+    });
+  } finally {
+    db.close();
+  }
+}
+
+export async function doctor(dirInput: string, opts: { db?: string | null } = {}): Promise<Finding[]> {
   const dir = resolve(dirInput);
   const findings: Finding[] = [];
+  if (opts.db) checkDatabase(opts.db, findings);
   const files = await listSourceFiles(dir).catch(() => []);
   checkSources(dir, files, findings);
   let project: Project;

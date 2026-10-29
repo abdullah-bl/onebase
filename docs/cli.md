@@ -61,6 +61,7 @@ Each flag can also be set with an environment variable, which can come from a [.
 | `TURSO_AUTH_TOKEN` / `LIBSQL_AUTH_TOKEN` | Token for `--db libsql://…` |
 | `ONEBASE_ADMIN_KEY` | Dashboard and deploy key (default: generated into `<data>/admin.key`) |
 | `ONEBASE_DEPLOY_URL`, `ONEBASE_DEPLOY_KEY` | `deploy`: the server, and its admin key. Keep them in `.env.local`. |
+| `ONEBASE_QUERY_TIMEOUT`, `ONEBASE_MUTATION_TIMEOUT`, `ONEBASE_ACTION_TIMEOUT` | How long a call may run (default `10s`, `10s`, `10m`; `off` for no limit). See [Time limits](./functions.md#time-limits). |
 
 ## doctor
 

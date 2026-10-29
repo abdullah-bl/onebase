@@ -102,6 +102,16 @@ Use `args: {}` for functions that take no arguments. `onebase doctor` warns abou
 
 Any other error appears as `Server Error` to clients in production; the full message is logged on the server. In `onebase dev` every message is shown.
 
+## Time limits
+
+A query or mutation may run for 10 seconds, and an action (including an HTTP action) for 10 minutes. A call that runs longer fails with `notes:list didn't finish within the query time limit (10s).` A mutation's writes are rolled back.
+
+JavaScript can't stop a function in the middle of an `await`, so the function itself keeps running until it next yields. Anything it then tries fails with the same error, so it can't read or write any more, call other functions, or schedule them. Code that never yields, such as `while (true) {}`, can't be stopped this way and blocks the whole server.
+
+The limit counts from when the call gets its database snapshot (a query) or the write lock (a mutation), not from when it was queued. A mutation called from a mutation shares its caller's limit; one called from an action gets its own.
+
+Change the limits with `ONEBASE_QUERY_TIMEOUT`, `ONEBASE_MUTATION_TIMEOUT` and `ONEBASE_ACTION_TIMEOUT`, e.g. `30s`, `2m`, or `off`. Keep mutations short: while one runs, every other write waits for it.
+
 ## The context object
 
 | | query | mutation | action |

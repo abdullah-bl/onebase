@@ -170,6 +170,18 @@ function duration(text: string): number {
   return Number(m[1]) * { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 }[m[2] as "s" | "m" | "h" | "d"];
 }
 
+/** A time limit from $name: a duration, or off (0). Unset: the default. */
+function timeLimit(name: string): number | undefined {
+  const value = process.env[name]?.trim();
+  if (!value) return undefined;
+  if (["0", "off", "none"].includes(value.toLowerCase())) return 0;
+  try {
+    return duration(value);
+  } catch {
+    throw new Error(`${name}=${value} isn't understood: use e.g. 10s, 2m or off.`);
+  }
+}
+
 /** Database, storage, backup and HTTP settings shared by `serve` and embedded binaries. */
 function serverOptions(opts: ReturnType<typeof options>) {
   const keep = Number(opts["backup-keep"]);
@@ -183,6 +195,11 @@ function serverOptions(opts: ReturnType<typeof options>) {
     trustProxy: opts["trust-proxy"],
     dashboard: !opts["no-dashboard"],
     deploys: !opts["no-deploy"],
+    timeLimits: {
+      queryMs: timeLimit("ONEBASE_QUERY_TIMEOUT"),
+      mutationMs: timeLimit("ONEBASE_MUTATION_TIMEOUT"),
+      actionMs: timeLimit("ONEBASE_ACTION_TIMEOUT"),
+    },
   };
 }
 

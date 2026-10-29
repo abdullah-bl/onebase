@@ -24,9 +24,20 @@ export interface BlobBackend {
  */
 const INLINE_TYPE = /^(image\/(png|jpeg|gif|webp|avif|bmp|x-icon|vnd\.microsoft\.icon)|video\/[\w.+-]+|audio\/[\w.+-]+|application\/pdf|text\/plain)(;|$)/i;
 
+/**
+ * The single type a browser will use for `contentType`, or null when it could read it as another
+ * one: browsers take the last entry of a comma list, so "text/plain;,text/html" is HTML to them.
+ */
+function singleType(contentType: string | null): string | null {
+  if (!contentType || /[,"\r\n]/.test(contentType)) return null;
+  const type = contentType.split(";", 1)[0]!.trim().toLowerCase();
+  return /^[\w!#$&^.+-]+\/[\w!#$&^.+-]+$/.test(type) ? type : null;
+}
+
 /** Headers that keep an uploaded file from being treated as a page on this origin. */
 function fileSafetyHeaders(contentType: string | null): Record<string, string> {
-  const inline = contentType !== null && INLINE_TYPE.test(contentType.trim());
+  const type = singleType(contentType);
+  const inline = type !== null && INLINE_TYPE.test(type);
   return {
     "X-Content-Type-Options": "nosniff",
     ...(inline ? {} : { "Content-Disposition": "attachment", "Content-Security-Policy": "sandbox; default-src 'none'" }),
@@ -58,7 +69,7 @@ export class LocalBlobs implements BlobBackend {
   serve(id: string, meta: FileMetadata) {
     return new Response(Bun.file(this.path(id)), {
       headers: {
-        "Content-Type": meta.contentType ?? "application/octet-stream",
+        "Content-Type": singleType(meta.contentType) ? meta.contentType! : "application/octet-stream",
         "Cache-Control": "public, max-age=31536000, immutable",
         ETag: `"${meta.sha256}"`,
         ...fileSafetyHeaders(meta.contentType),

@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, setSystemTime, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -114,6 +114,43 @@ describe("JWT auth providers", () => {
     );
     expect(id).toMatchObject({ subject: "attacker", issuer: rs.origin, tokenIdentifier: `${rs.origin}|attacker`, email: "a@b.c" });
     expect(id.sessionId).toBeUndefined();
+  });
+
+  test("an open connection is signed out once its token stops verifying", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "onebase-jwt-recheck-"));
+    const app = await startApp({
+      schema: null,
+      modules: { auth: { whoami: query({ args: {}, handler: async (ctx) => (await ctx.auth.getUserIdentity())?.subject ?? null }) } },
+      dataDir,
+      port: 0,
+      hostname: "127.0.0.1",
+      dev: false,
+      quiet: true,
+      sessionRecheckMs: 50,
+      auth: { providers: [{ domain: rs.origin, applicationID: "my-app" }] },
+    });
+    const ws = new WebSocket(`ws://127.0.0.1:${app.server.port}/api/sync`);
+    const messages: any[] = [];
+    ws.onmessage = (e) => messages.push(JSON.parse(e.data as string));
+    await new Promise((resolve) => (ws.onopen = resolve));
+    const call = async (requestId: number) => {
+      ws.send(JSON.stringify({ type: "call", requestId, kind: "query", path: "auth:whoami", args: {} }));
+      for (let i = 0; i < 50 && !messages.some((m) => m.requestId === requestId); i++) await Bun.sleep(10);
+      return messages.find((m) => m.requestId === requestId)?.value;
+    };
+    try {
+      ws.send(JSON.stringify({ type: "auth", token: await rs.sign({ iss: rs.origin, sub: "jwt-user", aud: "my-app", exp: now() + 30 }) }));
+      expect(await call(1)).toBe("jwt-user");
+      setSystemTime(new Date(Date.now() + 3600_000)); // well past exp and the leeway
+      await Bun.sleep(300);
+      expect(messages.find((m) => m.type === "auth" && m.ended)).toMatchObject({ ok: false, ended: true, error: expect.stringContaining("expired") });
+      expect(await call(2)).toBeNull();
+    } finally {
+      setSystemTime();
+      ws.close();
+      await app.close();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
   });
 
   test("providers and a custom authenticate() can be combined", async () => {
@@ -290,16 +327,24 @@ for (const [backendName, filesUrl] of FILE_BACKENDS) describe(`file storage (${b
       ["text/html", "<script>localStorage.getItem('ob-admin-key')</script>"],
       ["image/svg+xml", "<svg xmlns='http://www.w3.org/2000/svg' onload='alert(1)'/>"],
       ["application/x-unknown", "?"],
+      // Browsers use the last type of a comma list, so these are HTML despite their first type.
+      ["text/plain;,text/html", "<script>1</script>"],
+      ["image/png;x=y, text/html", "<script>1</script>"],
+      ["application/pdf;,text/html", "<script>1</script>"],
     ] as const) {
       const res = await upload(type, body);
       expect(res.headers.get("content-disposition")).toBe("attachment");
       expect(res.headers.get("content-security-policy")).toContain("sandbox");
       expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+      if (type.includes(",")) expect(res.headers.get("content-type")).toBe("application/octet-stream");
     }
     // Images, media and plain text still show inline.
     const png = await upload("image/png", "png");
     expect(png.headers.get("content-disposition")).toBeNull();
     expect(png.headers.get("x-content-type-options")).toBe("nosniff");
+    const text = await upload("text/plain; charset=utf-8", "hi");
+    expect(text.headers.get("content-disposition")).toBeNull();
+    expect(text.headers.get("content-type")).toBe("text/plain; charset=utf-8");
   });
 
   test("actions can store and read blobs", async () => {

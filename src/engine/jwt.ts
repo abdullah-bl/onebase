@@ -47,7 +47,7 @@ function b64urlJson<T>(s: string, what: string): T {
   try {
     return JSON.parse(decoder.decode(b64urlBytes(s)));
   } catch {
-    throw new OnebaseError(`Invalid auth token: the ${what} isn't valid base64url JSON.`);
+    throw new TokenRejected(`Invalid auth token: the ${what} isn't valid base64url JSON.`);
   }
 }
 
@@ -56,9 +56,17 @@ const trimSlash = (s: string) => s.replace(/\/+$/, "");
 /** Reads a token's claims without verifying it (used to pick a provider). */
 export function decodeJwt(token: string): { header: Header; claims: Claims; signed: string; signature: Uint8Array<ArrayBuffer> } {
   const parts = token.split(".");
-  if (parts.length !== 3) throw new OnebaseError("Invalid auth token: expected a JWT (three dot-separated parts).");
+  if (parts.length !== 3) throw new TokenRejected("Invalid auth token: expected a JWT (three dot-separated parts).");
   const [h, p, s] = parts as [string, string, string];
   return { header: b64urlJson<Header>(h, "header"), claims: b64urlJson<Claims>(p, "payload"), signed: `${h}.${p}`, signature: b64urlBytes(s) };
+}
+
+/**
+ * A token that will never verify as it is (expired, wrong signature, wrong audience...), as
+ * opposed to a key fetch that failed: open connections using it are signed out.
+ */
+export class TokenRejected extends OnebaseError {
+  readonly status = 401;
 }
 
 export class JwtVerifier {
@@ -124,41 +132,41 @@ export class JwtVerifier {
     const provider = this.providers.find((p) => this.issuerOf(p) === iss);
     if (!provider) {
       const known = this.providers.map((p) => this.issuerOf(p)).join(", ");
-      throw new OnebaseError(`Auth token issuer "${claims.iss}" isn't configured in auth.config.ts (configured: ${known}).`);
+      throw new TokenRejected(`Auth token issuer "${claims.iss}" isn't configured in auth.config.ts (configured: ${known}).`);
     }
     const alg = ALGORITHMS[header.alg];
-    if (!alg) throw new OnebaseError(`Auth token uses unsupported algorithm "${header.alg}". Supported: ${Object.keys(ALGORITHMS).join(", ")}.`);
+    if (!alg) throw new TokenRejected(`Auth token uses unsupported algorithm "${header.alg}". Supported: ${Object.keys(ALGORITHMS).join(", ")}.`);
     if (provider.type === "customJwt" && provider.algorithm && provider.algorithm !== header.alg) {
-      throw new OnebaseError(`Auth token algorithm ${header.alg} doesn't match the configured ${provider.algorithm}.`);
+      throw new TokenRejected(`Auth token algorithm ${header.alg} doesn't match the configured ${provider.algorithm}.`);
     }
 
     const pick = (keys: Jwk[]) =>
       keys.find((k) => (header.kid ? k.kid === header.kid : true) && (!k.alg || k.alg === header.alg));
     let jwk = pick(await this.keys(provider, false));
     if (!jwk) jwk = pick(await this.keys(provider, true)); // keys may have rotated
-    if (!jwk) throw new OnebaseError(`No signing key${header.kid ? ` with kid "${header.kid}"` : ""} found for ${iss}.`);
+    if (!jwk) throw new TokenRejected(`No signing key${header.kid ? ` with kid "${header.kid}"` : ""} found for ${iss}.`);
 
     const key = await crypto.subtle.importKey("jwk", jwk as any, alg.import as any, false, ["verify"]);
     const ok = await crypto.subtle.verify(alg.verify as any, key, signature, new TextEncoder().encode(signed));
-    if (!ok) throw new OnebaseError("Auth token signature is invalid.");
+    if (!ok) throw new TokenRejected("Auth token signature is invalid.");
 
     const now = Date.now() / 1000;
     if (typeof claims.exp === "number" && now > claims.exp + LEEWAY_SECONDS) {
-      throw new OnebaseError(`Auth token expired at ${new Date(claims.exp * 1000).toISOString()}. Fetch a fresh token on the client.`);
+      throw new TokenRejected(`Auth token expired at ${new Date(claims.exp * 1000).toISOString()}. Fetch a fresh token on the client.`);
     }
     if (typeof claims.nbf === "number" && now < claims.nbf - LEEWAY_SECONDS) {
-      throw new OnebaseError("Auth token is not valid yet (nbf is in the future).");
+      throw new TokenRejected("Auth token is not valid yet (nbf is in the future).");
     }
     if (provider.applicationID) {
       const aud = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
       if (!aud.includes(provider.applicationID)) {
-        throw new OnebaseError(
+        throw new TokenRejected(
           `Auth token audience ${JSON.stringify(claims.aud)} doesn't include applicationID "${provider.applicationID}". ` +
             `Check the JWT template / audience on your auth provider.`,
         );
       }
     }
-    if (typeof claims.sub !== "string") throw new OnebaseError("Auth token has no subject (sub claim).");
+    if (typeof claims.sub !== "string") throw new TokenRejected("Auth token has no subject (sub claim).");
     return identityFromClaims(claims as Claims & { sub: string });
   }
 }

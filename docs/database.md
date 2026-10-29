@@ -95,7 +95,7 @@ export const feed = query({
 });
 ```
 
-Pass `{ numItems: 20, cursor: null }` for the first page, then `cursor: continueCursor` for the next one. Cursors are stable when documents are inserted. In React, `usePaginatedQuery` handles this for you and keeps every loaded page live (see [Client](./client.md)).
+Pass `{ numItems: 20, cursor: null }` for the first page, then `cursor: continueCursor` for the next one. `numItems` must be a non-negative integer, and a page holds at most 8192 documents: ask for more and you get 8192 with `isDone: false`. Cursors are stable when documents are inserted. In React, `usePaginatedQuery` handles this for you and keeps every loaded page live (see [Client](./client.md)).
 
 ## Writing (mutations only)
 

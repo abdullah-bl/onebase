@@ -8,7 +8,7 @@ import { parseCron } from "../cron";
 import type { SchemaDefinition } from "../schema";
 import { isRegisteredFunction, type CronJob, type HttpAction, type HttpRouter, type RegisteredFunction, type UserIdentity } from "../server";
 import { ConvexError, describeValue, isPlainObject, validate, type AnyValidator } from "../values";
-import { buildCatalog, TableScope, tableMount, validatesTable, type Catalog } from "./catalog";
+import { buildCatalog, storedTable, TableScope, tableMount, validatesTable, type Catalog } from "./catalog";
 import { CronRunner } from "./crons";
 import { BACKFILL_BATCH, backfilled, coalesce, hookState, readProgress, writeProgress, type HookProgress, type ResolvedHook } from "./hooks";
 import { applySchema, DatabaseImpl, OnebaseError, readerView, writerView, type ReadSet, type VectorSearchQuery, type Write } from "./database";
@@ -165,6 +165,8 @@ type TxState = {
   hookCursors: Map<string, number>;
 };
 
+/** Scheduled jobs one instance runs at the same time. */
+const MAX_RUNNING_JOBS = 20;
 /** Commit broadcasts above this size only list the tables (Postgres NOTIFY caps payloads at 8000 bytes). */
 const MAX_BROADCAST = 7000;
 /** Ended sessions per broadcast message; more go in extra messages, so the cap above holds. */
@@ -208,6 +210,7 @@ export class Runtime {
   private readonly deploys = new SerialQueue();
   private commitListeners: ((event: CommitEvent) => Promise<void>)[] = [];
   private schedulerTimer: ReturnType<typeof setTimeout> | null = null;
+  private runningJobs = 0;
   private heartbeat: ReturnType<typeof setInterval> | null = null;
   private lastCreationTime = 0;
   private readonly warnedQueries = new Set<string>();
@@ -917,7 +920,9 @@ export class Runtime {
     const value = args ?? {};
     if (!isPlainObject(value)) throw new OnebaseError(`Arguments to "${name}" must be an object, got ${describeValue(args)}.`);
     if (fn.args) {
-      const errors = validate(fn.args, value, "args");
+      // A component's v.id("t") names its own table, stored as "<mount>.t".
+      const mount = this.componentFunctions.get(name)?.mount.name ?? null;
+      const errors = validate(fn.args, value, "args", { idTable: (table) => storedTable(mount, table) });
       if (errors.length) throw new OnebaseError(`Invalid arguments for "${name}":\n  - ${errors.join("\n  - ")}`);
     }
     return value;
@@ -1488,11 +1493,14 @@ export class Runtime {
   }
 
   private async runDueJobs() {
+    // Every slot is taken: a finishing job pokes the scheduler again.
+    const free = MAX_RUNNING_JOBS - this.runningJobs;
+    if (free <= 0) return;
     // Claim each job with a conditional update so that no two runs (or instances) take the same one.
     const due = await this.withWriter(async (tx) => {
       const jobs = (await tx.all(
-        "SELECT id, fn, args FROM _scheduled WHERE state = 'pending' AND run_at <= ? ORDER BY run_at LIMIT 20",
-        [Date.now()],
+        "SELECT id, fn, args FROM _scheduled WHERE state = 'pending' AND run_at <= ? ORDER BY run_at LIMIT ?",
+        [Date.now(), free],
       )) as { id: string; fn: string; args: string }[];
       const claimed = [];
       for (const job of jobs) {
@@ -1504,15 +1512,22 @@ export class Runtime {
       this.log.error(`Scheduler: ${err instanceof Error ? err.message : String(err)}`);
       return [];
     });
-    await Promise.all(due.map((job) => this.runJob(job)));
+    // Jobs run on their own, so a slow or stuck one never holds up the jobs due after it.
+    for (const job of due) {
+      this.runningJobs++;
+      void this.runJob(job).finally(() => {
+        this.runningJobs--;
+        this.pokeScheduler();
+      });
+    }
     this.pokeScheduler();
   }
 
   private async runJob(job: { id: string; fn: string; args: string }) {
     const setState = (tx: Exec, state: string, error: string | null = null) =>
       tx.run("UPDATE _scheduled SET state = ?, error = ? WHERE id = ?", [state, error, job.id]);
-    const args = JSON.parse(job.args);
     try {
+      const args = JSON.parse(job.args);
       const fn = this.functions.get(job.fn);
       if (fn?.type === "mutation") {
         // Exactly once: the job is marked done in the mutation's own transaction.

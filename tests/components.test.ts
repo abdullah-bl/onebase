@@ -36,6 +36,7 @@ const notes = defineComponent({
     whoAmI: c.query({ args: {}, handler: async (ctx) => (await ctx.auth.getUserIdentity())?.subject ?? null }),
     callsSecret: c.mutation({ args: {}, handler: (ctx) => ctx.runMutation(secret, {}) }),
     peek: c.query({ args: { id: v.string() }, handler: (ctx, { id }) => ctx.db.get(id as any) }),
+    byId: c.query({ args: { id: v.id("notes") }, handler: async (ctx, { id }) => (await ctx.db.get(id))?.text ?? null }),
     touch: c.mutation({ args: { id: v.string() }, handler: (ctx, { id }) => ctx.db.patch(id as any, { text: "x" }) }),
     readApp: c.query({ args: {}, handler: (ctx) => (ctx.db as any).query("messages").collect() }),
     badInsert: c.mutation({ args: {}, handler: (ctx) => ctx.db.insert("notes", { text: 5 } as any) }),
@@ -109,6 +110,7 @@ const modules = {
     badInsert: mutation({ args: {}, handler: (ctx: any) => ctx.components.a.badInsert() }),
     unknown: mutation({ args: {}, handler: (ctx: any) => ctx.components.nope.add({}) }),
     peek: query({ args: { id: v.string() }, handler: (ctx: any, { id }) => ctx.components.a.peek({ id }) }),
+    byId: query({ args: { mount: v.string(), id: v.string() }, handler: (ctx: any, { mount, id }) => ctx.components[mount].byId({ id }) }),
     touch: mutation({ args: { id: v.string() }, handler: (ctx: any, { id }) => ctx.components.a.touch({ id }) }),
     readApp: query({ args: {}, handler: (ctx: any) => ctx.components.a.readApp() }),
   },
@@ -155,6 +157,16 @@ for (const D of DRIVERS) describe(`${D.name}: components`, () => {
     expect(await read("peek", { id: messageId })).toBeNull();
     await expect(mutate("touch", { id: messageId })).rejects.toThrow("isn't in this component's tables");
     await expect(read("readApp")).rejects.toThrow(`Table "messages" isn't in component "a"'s schema. Its tables: notes.`);
+  });
+
+  test("a component's v.id() names its own table and refuses ids from anywhere else", async () => {
+    const aNote = (await mutate("addNote", { mount: "a", text: "one" })) as string;
+    const bNote = (await mutate("addNote", { mount: "b", text: "two" })) as string;
+    const messageId = (await mutate("send", { body: "hi" })) as string;
+    expect(await read("byId", { mount: "a", id: aNote })).toBe("a:one");
+    for (const id of [bNote, messageId, "x"]) {
+      await expect(read("byId", { mount: "a", id })).rejects.toThrow('args.id must be an id for table "notes"');
+    }
   });
 
   test("a failing component call rolls back only its own writes when the app catches it", async () => {

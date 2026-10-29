@@ -1,6 +1,8 @@
 // Validators: describe the shape of documents and function arguments.
 // The API mirrors `convex/values` so existing Convex knowledge applies.
 
+import { ID_PATTERN, isIdForTable } from "./ids";
+
 export type GenericId<T extends string> = string & { readonly __tableName: T };
 
 type Kind =
@@ -103,8 +105,14 @@ export function describeValidator(val: AnyValidator): string {
   }
 }
 
+/**
+ * How validate() checks ids. With idTable, which maps a v.id() table name to the table its ids
+ * are stored under, an id must belong to that table; without it any non-empty string passes.
+ */
+export type ValidateOptions = { idTable?: (table: string) => string };
+
 /** Returns a list of human-readable problems; empty means valid. */
-export function validate(val: AnyValidator, value: unknown, path = "value"): string[] {
+export function validate(val: AnyValidator, value: unknown, path = "value", opts: ValidateOptions = {}): string[] {
   if (value === undefined) {
     return val.isOptional ? [] : [`${path} is required (expected ${describeValidator(val)})`];
   }
@@ -120,21 +128,27 @@ export function validate(val: AnyValidator, value: unknown, path = "value"): str
       return typeof value === "boolean" ? [] : expected();
     case "null":
       return value === null ? [] : expected();
-    case "id":
-      return typeof value === "string" && value.length > 0 ? [] : expected();
+    case "id": {
+      if (typeof value !== "string" || value.length === 0) return expected();
+      if (!opts.idTable) return [];
+      // System tables (_scheduled, _storage) don't all tag their ids: only the shape is checked.
+      const table = val.tableName!;
+      const ok = table.startsWith("_") ? ID_PATTERN.test(value) : isIdForTable(value, opts.idTable(table));
+      return ok ? [] : [`${path} must be an id for table "${table}", got ${describeValue(value)}`];
+    }
     case "literal":
       return value === val.value ? [] : expected();
     case "array":
       if (!Array.isArray(value)) return expected();
-      return value.flatMap((item, i) => validate(val.element!, item, `${path}[${i}]`));
+      return value.flatMap((item, i) => validate(val.element!, item, `${path}[${i}]`, opts));
     case "record":
       if (!isPlainObject(value)) return expected();
-      return Object.entries(value).flatMap(([k, item]) => validate(val.values!, item, `${path}.${k}`));
+      return Object.entries(value).flatMap(([k, item]) => validate(val.values!, item, `${path}.${k}`, opts));
     case "object": {
       if (!isPlainObject(value)) return expected();
       const errors: string[] = [];
       for (const [k, fieldVal] of Object.entries(val.fields!)) {
-        errors.push(...validate(fieldVal, (value as any)[k], `${path}.${k}`));
+        errors.push(...validate(fieldVal, (value as any)[k], `${path}.${k}`, opts));
       }
       for (const k of Object.keys(value)) {
         if (!(k in val.fields!) && (value as any)[k] !== undefined) {
@@ -146,7 +160,7 @@ export function validate(val: AnyValidator, value: unknown, path = "value"): str
     }
     case "union": {
       for (const m of val.members!) {
-        if (validate(m, value, path).length === 0) return [];
+        if (validate(m, value, path, opts).length === 0) return [];
       }
       return expected();
     }

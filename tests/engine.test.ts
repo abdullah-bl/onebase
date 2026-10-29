@@ -3,9 +3,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Runtime } from "../src/engine/runtime";
+import { MAX_PAGE_SIZE } from "../src/engine/database";
 import { createDriver, SqliteDriver, type Driver } from "../src/engine/driver";
 import { SubscriptionManager, type QueryUpdate } from "../src/engine/sync";
-import { defineSchema, defineTable, internalMutation, mutation, paginationOptsValidator, query } from "../src/server";
+import { defineSchema, defineTable, internalAction, internalMutation, mutation, paginationOptsValidator, query } from "../src/server";
+
+let releaseStuck = () => {};
 import { ConvexError, v } from "../src/values";
 
 const schema = defineSchema({
@@ -47,6 +50,12 @@ const modules = {
       args: { channel: v.string(), author: v.string(), body: v.string() },
       handler: async (ctx, args) => ctx.db.insert("messages", args as any),
     }),
+    sendMany: mutation({
+      args: { count: v.number() },
+      handler: async (ctx, { count }) => {
+        for (let i = 0; i < count; i++) await ctx.db.insert("messages", { channel: "c", author: "a", body: String(i) } as any);
+      },
+    }),
     sendTwiceThenFail: mutation({
       args: { channel: v.string() },
       handler: async (ctx, { channel }) => {
@@ -70,6 +79,15 @@ const modules = {
       args: { channel: v.string() },
       handler: async (ctx, { channel }) => {
         await ctx.scheduler.runAfter(10, "messages:insertInternal", { channel });
+      },
+    }),
+    // Scheduled ahead of insertInternal; doesn't finish until the test lets it.
+    stuck: internalAction({ args: {}, handler: () => new Promise<void>((resolve) => (releaseStuck = resolve)) }),
+    stallThenInsert: mutation({
+      args: { channel: v.string() },
+      handler: async (ctx, { channel }) => {
+        await ctx.scheduler.runAfter(0, "messages:stuck", {});
+        await ctx.scheduler.runAfter(50, "messages:insertInternal", { channel });
       },
     }),
     insertInternal: internalMutation({
@@ -201,11 +219,37 @@ for (const D of DRIVERS) describe(D.name, () => {
       expect(pinned.page.map((d: any) => d.body)).toEqual(["3", "2", "1"]);
     });
 
+    test("clients can't ask paginate() for unbounded pages", async () => {
+      for (const numItems of [-2, 0.5]) {
+        expect((await runtime.runQuery("messages:page", { paginationOpts: { numItems, cursor: null } }).catch((e) => e)).message).toContain(
+          "numItems to be a non-negative integer",
+        );
+      }
+      await m("messages:sendMany", { count: MAX_PAGE_SIZE + 2 });
+      const big = await q("messages:page", { paginationOpts: { numItems: 1e9, cursor: null } });
+      expect(big.page.length).toBe(MAX_PAGE_SIZE);
+      expect(big.isDone).toBe(false);
+      const rest = await q("messages:page", { paginationOpts: { numItems: 1e9, cursor: big.continueCursor } });
+      expect(rest.page.map((d: any) => d.body)).toEqual(["1", "0"]);
+      expect(rest.isDone).toBe(true);
+      const first = await q("messages:page", { paginationOpts: { numItems: 1, cursor: null } });
+      expect((await runtime.runQuery("messages:page", { paginationOpts: { numItems: 1, cursor: first.continueCursor, endCursor: rest.continueCursor } }).catch((e) => e)).message).toContain(
+        `more than ${MAX_PAGE_SIZE} documents`,
+      );
+    }, 60_000);
+
     test("scheduler runs internal mutations", async () => {
       await m("messages:later", { channel: "c" });
       expect(await q("messages:count")).toBe(0);
       await Bun.sleep(150);
       expect((await q("messages:all"))[0]).toMatchObject({ author: "bot", body: "scheduled" });
+    });
+
+    test("a scheduled job that never finishes doesn't hold up the ones after it", async () => {
+      await m("messages:stallThenInsert", { channel: "c" });
+      await Bun.sleep(400);
+      expect((await q("messages:all")).map((d: any) => d.body)).toEqual(["scheduled"]);
+      releaseStuck();
     });
 
     test("data survives a restart", async () => {

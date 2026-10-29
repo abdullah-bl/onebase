@@ -140,8 +140,10 @@ A reset ends every other session of that user, and marks the email as verified (
 ```ts
 const { signingIn } = await signIn("password", { flow: "signUp", email, password });
 if (!signingIn) showCodeInput(); // then:
-await signIn("password", { flow: "email-verification", email, code });
+await signIn("password", { flow: "email-verification", email, code, password });
 ```
+
+Send the password again with the code. Anyone can sign an address up and get a code mailed to it, carrying the password they chose; asking for it again means only the person who chose the password can confirm it, so nobody else can pick the password the owner's confirmation sets. A wrong password leaves the code usable.
 
 Confirmed emails are stored in `users.emailVerificationTime`, which also lets an OAuth sign-in with the same verified email join that user.
 

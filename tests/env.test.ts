@@ -139,6 +139,25 @@ test("values bun read from .env.development.local don't outrank the production f
   expect([env.ONEBASE_ADMIN_KEY, env.ONEBASE_CORS]).toEqual(["prod-key", "https://app.example"]);
 });
 
+test("a NODE_ENV set in .env doesn't hide that bun read the development files", async () => {
+  for (const where of [".env", ".env.local"]) {
+    const cwd = project({
+      [where]: "NODE_ENV=production",
+      ".env.development": "ONEBASE_ADMIN_KEY=dev-key\nONEBASE_CORS=*",
+      ".env.production": "ONEBASE_ADMIN_KEY=prod-key\nONEBASE_CORS=https://app.example",
+    });
+    const env = await bunEnv(cwd);
+    expect(env.ONEBASE_ADMIN_KEY).toBe("dev-key"); // bun went by the real (unset) NODE_ENV
+    loadEnv({ mode: "production", cwd, env, bunAutoloaded: true });
+    expect([where, env.ONEBASE_ADMIN_KEY, env.ONEBASE_CORS]).toEqual([where, "prod-key", "https://app.example"]);
+  }
+  // A real NODE_ENV=production still lets the production files win over .env.local.
+  const cwd = project({ ".env.local": "A=local", ".env.production": "A=production" });
+  const env = await bunEnv(cwd, { NODE_ENV: "production" });
+  loadEnv({ mode: "production", cwd, env, bunAutoloaded: true });
+  expect(env.A).toBe("production");
+});
+
 test("names like toString and __proto__ are ordinary variables", () => {
   const env = parseEnv("A=x$toString\n__proto__=p\nB=${constructor:-fallback}\nC=$hasOwnProperty");
   expect(Object.entries(env)).toEqual([["A", "x"], ["__proto__", "p"], ["B", "fallback"], ["C", ""]]);

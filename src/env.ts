@@ -99,13 +99,22 @@ function readFiles(cwd: string, names: string[], lookup: (key: string) => string
   return { values: expand(raw, lookup), loaded };
 }
 
-/**
- * The files bun itself reads before onebase starts, lowest priority first (`bun run` reads the
- * development ones when NODE_ENV is unset).
- */
-function bunAutoloadFiles(env: Record<string, string | undefined>): string[] {
-  const mode = env.NODE_ENV === "production" || env.NODE_ENV === "test" ? env.NODE_ENV : "development";
+/** The files bun reads for `mode` before onebase starts, lowest priority first. */
+function bunFilesFor(mode: string): string[] {
   return [".env", `.env.${mode}`, ...(mode === "test" ? [] : [".env.local"]), `.env.${mode}.local`];
+}
+
+/**
+ * The file sets bun may have read (`bun run` reads the development ones when NODE_ENV is unset).
+ * Bun picks its mode from the real NODE_ENV before reading any file, so a NODE_ENV that one of the
+ * development files sets didn't choose them: then bun read those, whatever NODE_ENV says now.
+ */
+function bunAutoloadSets(env: Record<string, string | undefined>, cwd: string): string[][] {
+  const mode = env.NODE_ENV === "production" || env.NODE_ENV === "test" ? env.NODE_ENV : "development";
+  const development = bunFilesFor("development");
+  if (mode === "development") return [development];
+  const fromFiles = readFiles(cwd, development, () => undefined, false).values.NODE_ENV;
+  return fromFiles === env.NODE_ENV ? [development, bunFilesFor(mode)] : [bunFilesFor(mode)];
 }
 
 export type LoadEnvOptions = {
@@ -132,8 +141,10 @@ function readFile(cwd: string, name: string) {
  */
 export function withoutBunEnv(env: Record<string, string | undefined>, cwd = process.cwd()): Record<string, string | undefined> {
   const real = { ...env };
-  const { values } = readFiles(cwd, bunAutoloadFiles(env), (k) => (Object.hasOwn(env, k) ? env[k] : undefined), false);
-  for (const [key, value] of Object.entries(values)) if (env[key] === value) delete real[key];
+  for (const names of bunAutoloadSets(env, cwd)) {
+    const { values } = readFiles(cwd, names, (k) => (Object.hasOwn(env, k) ? env[k] : undefined), false);
+    for (const [key, value] of Object.entries(values)) if (env[key] === value) delete real[key];
+  }
   return real;
 }
 

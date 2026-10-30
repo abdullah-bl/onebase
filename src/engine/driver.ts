@@ -6,6 +6,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { mysqlDialect, newId, postgresDialect, sqliteDialect, vector32, vectorDistanceCos, type Dialect } from "./dialect";
 import { unguardedFetch } from "./guard";
+import { VectorCache, withVectorCache } from "./vectors";
 
 export type Row = Record<string, any>;
 
@@ -119,6 +120,14 @@ const WAL_SIZE_LIMIT = 64 << 20;
 /** A group commit closes after this many writes or this long, even while more are waiting. */
 const GROUP_MAX_WRITES = 512;
 const GROUP_MAX_MS = 20;
+/** How much memory vector indexes may use, unless ONEBASE_VECTOR_MEMORY_MB says otherwise (0: none, SQL ranks them). */
+const VECTOR_MEMORY_MB = 2048;
+
+/** A number from the environment, or null when it isn't set to one. */
+function envNumber(name: string): number | null {
+  const value = process.env[name];
+  return value && Number(value) >= 0 ? Number(value) : null;
+}
 
 /** The vector functions libSQL has built in, so vector indexes use the same SQL on both. */
 function addVectorFunctions(db: Database) {
@@ -152,7 +161,8 @@ export function worthVacuuming(space: SqliteSpace): boolean {
 }
 
 export class SqliteDriver implements Driver {
-  readonly dialect = sqliteDialect;
+  readonly dialect: Dialect;
+  readonly vectors: VectorCache | null;
   readonly kind = "sqlite";
   readonly shared = false;
   readonly pipelined = true;
@@ -174,6 +184,9 @@ export class SqliteDriver implements Driver {
   private writeCount = 0;
 
   constructor(readonly path: string) {
+    const vectorMb = envNumber("ONEBASE_VECTOR_MEMORY_MB") ?? VECTOR_MEMORY_MB;
+    this.vectors = vectorMb > 0 ? new VectorCache(vectorMb * 2 ** 20, envNumber("ONEBASE_VECTOR_WORKERS") ?? undefined) : null;
+    this.dialect = this.vectors ? withVectorCache(this.vectors) : sqliteDialect;
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     this.writer = new Database(path, { create: true, strict: true });
     // Only takes effect before the first table exists; `onebase vacuum` turns it on for older files.
@@ -248,6 +261,7 @@ export class SqliteDriver implements Driver {
    */
   async maintain(): Promise<void> {
     if (this.reader === this.writer) return;
+    await this.reads.run(async () => this.vectors?.evictIdle());
     for (let freed = 0; freed < VACUUM_MAX_BYTES; freed += VACUUM_STEP_BYTES) {
       const took = await this.writes.run(async () => {
         this.commitGroup();
@@ -444,6 +458,7 @@ export class SqliteDriver implements Driver {
     try {
       await this.optimize();
     } catch {}
+    await this.vectors?.close();
     if (this.reader !== this.writer) this.reader.close();
     this.writer.close();
   }

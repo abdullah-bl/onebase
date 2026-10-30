@@ -1219,9 +1219,10 @@ export class Runtime {
     const runQuery = deadline.guard((ref: FunctionLike, args?: unknown) => this.runQuery(ref, args, opts).then((r) => r.value));
     const runMutation = deadline.guard((ref: FunctionLike, args?: unknown) => this.runMutation(ref, args, opts));
     const runAction = deadline.guard((ref: FunctionLike, args?: unknown) => this.runAction(ref, args, opts));
-    const vectorSearch = deadline.guard((table: string, index: string, query: VectorSearchQuery) =>
-      this.driver.read((tx) => this.newDb(tx, {}, mount?.scope).vectorSearch(table, index, query)),
-    );
+    const vectorSearch = deadline.guard(async (table: string, index: string, query: VectorSearchQuery) => {
+      const { results } = await this.driver.read((tx) => this.newDb(tx, {}, mount?.scope).vectorSearch(table, index, query));
+      return results;
+    });
     const ctx: Record<string, unknown> = mount
       ? { ...this.componentBase(mount, id, null), scheduler: guardAll(this.schedulerFor(null, mount)), runQuery, runMutation, runAction, vectorSearch }
       : {

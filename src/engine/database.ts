@@ -1,7 +1,7 @@
 import type { SchemaDefinition, SearchIndexDef, VectorIndexDef } from "../schema";
 import type { PaginationOptions, PaginationResult } from "../server";
 import { describeValue, isPlainObject, validate, type AnyValidator } from "../values";
-import { cosineDistance, FIELD_PATH, isIdForTable, newId, systemKind, tableLiteral, type Dialect, type ValueKind } from "./dialect";
+import { cosineDistance, FIELD_PATH, isIdForTable, newId, systemKind, tableLiteral, type Dialect, type ValueKind, type VectorHit } from "./dialect";
 import type { Exec } from "./driver";
 import { indexIdent, TableScope, tableMount, validatesTable, type Catalog } from "./catalog";
 
@@ -729,9 +729,10 @@ export class DatabaseImpl {
 
   /**
    * The documents nearest to `query.vector` by cosine similarity, most similar first, as
-   * `{ _id, _score }` with `_score` from -1 to 1.
+   * `{ _id, _score }` with `_score` from -1 to 1. Wrapped, because `results` may finish after
+   * the transaction: ranking in memory doesn't need it, and other reads can carry on.
    */
-  async vectorSearch(table: unknown, indexName: unknown, query: VectorSearchQuery): Promise<{ _id: string; _score: number }[]> {
+  async vectorSearch(table: unknown, indexName: unknown, query: VectorSearchQuery): Promise<{ results: Promise<VectorHit[]> }> {
     const t = this.checkTable(table);
     const index = this.vectorIndex(t, indexName);
     const where = `vector index "${index.name}" on "${t}"`;
@@ -748,9 +749,7 @@ export class DatabaseImpl {
     }
 
     const d = this.dialect;
-    const sql = d.vectorSql(vectorIndexName(t, index.name), index);
-    const params: unknown[] = [d.encodeVector(vector)];
-    const conds = [`tbl = ${tableLiteral(t)}`, ...sql.where];
+    let match: VectorFilter | null = null;
     if (filter !== undefined) {
       if (typeof filter !== "function") throw new OnebaseError(`vectorSearch() filter must be a callback: filter: (q) => q.eq("field", value).`);
       const builder = {
@@ -767,18 +766,27 @@ export class DatabaseImpl {
       };
       const result = filter(builder);
       if (!isVectorFilter(result)) throw new OnebaseError(`vectorSearch() filter must return q.eq(...) or q.or(...).`);
+      match = result;
+    }
+    const ranked = await d.rankVectors?.(this.tx, vectorIndexName(t, index.name), index, vector as number[], limit as number, match);
+    if (ranked) return ranked;
+
+    const sql = d.vectorSql(vectorIndexName(t, index.name), index);
+    const params: unknown[] = [d.encodeVector(vector)];
+    const conds = [`tbl = ${tableLiteral(t)}`, ...sql.where];
+    if (match) {
       const compile = (f: VectorFilter): string =>
         f.op === "eq"
           ? condSql(d, { field: f.field, op: "eq", value: f.value }, params)
           : f.args.length
             ? `(${f.args.map(compile).join(" OR ")})`
             : d.boolLiteral(false);
-      conds.push(compile(result));
+      conds.push(compile(match));
     }
     if ("vector" in sql) {
       // No distance function in the database: rank every matching document here.
       const rows = await this.tx.all(`SELECT id, ${sql.vector} AS vec FROM ${sql.from} WHERE ${conds.join(" AND ")}`, params.slice(1));
-      return rows
+      const ranked = rows
         .map((row) => {
           const vec = typeof row.vec === "string" ? JSON.parse(row.vec) : row.vec;
           return { _id: row.id as string, distance: cosineDistance(vec, vector as number[]) };
@@ -786,6 +794,7 @@ export class DatabaseImpl {
         .sort((a, b) => a.distance - b.distance || (a._id < b._id ? -1 : 1))
         .slice(0, limit as number)
         .map(({ _id, distance }) => ({ _id, _score: 1 - distance }));
+      return { results: Promise.resolve(ranked) };
     }
     params.push(params[0]); // the distance again, for ORDER BY
     await d.vectorSetup?.(this.tx, limit as number);
@@ -793,7 +802,7 @@ export class DatabaseImpl {
       `SELECT id, ${sql.distance} AS distance FROM ${sql.from} WHERE ${conds.join(" AND ")} ORDER BY ${sql.distance}, id LIMIT ${limit as number}`,
       params,
     );
-    return rows.map((row) => ({ _id: row.id as string, _score: 1 - Number(row.distance) }));
+    return { results: Promise.resolve(rows.map((row) => ({ _id: row.id as string, _score: 1 - Number(row.distance) }))) };
   }
 
   /** Keeps the table's search indexes in step with a write (a no-op where the database indexes documents itself). */

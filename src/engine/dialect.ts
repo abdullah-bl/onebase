@@ -63,7 +63,15 @@ export interface Dialect {
   vectorSetup?(tx: Exec, limit: number): Promise<void>;
   /** Updates vector indexes after a document write (SQLite keeps them in separate tables). */
   syncVector?(tx: Exec, docId: string, entries: { name: string; vector: number[] | null }[]): Promise<void>;
+  /** Ranks a vector search without vectorSql(), or returns null to leave it to vectorSql(). `results` may finish after `tx` has ended. */
+  rankVectors?(tx: Exec, name: string, index: VectorIndexDef, vector: number[], limit: number, filter: VectorMatch | null): Promise<{ results: Promise<VectorHit[]> } | null>;
 }
+
+/** A vector search result: `_score` is the cosine similarity, from -1 to 1. */
+export type VectorHit = { _id: string; _score: number };
+
+/** A vector search filter: a field equal to a value, or any of several filters. */
+export type VectorMatch = { op: "eq"; field: string; value: unknown } | { op: "or"; args: VectorMatch[] };
 
 export function checkPath(path: string): string {
   if (!FIELD_PATH.test(path)) throw new Error(`Invalid field path "${path}": use names like "author" or "profile.name".`);
@@ -244,7 +252,7 @@ export function vector32(json: unknown): Uint8Array {
   return new Uint8Array(Float32Array.from(values).buffer);
 }
 
-const floats = (blob: Uint8Array) =>
+export const floats = (blob: Uint8Array) =>
   blob.byteOffset % 4 === 0 ? new Float32Array(blob.buffer, blob.byteOffset, blob.byteLength >> 2) : new Float32Array(blob.slice().buffer);
 
 /** Cosine distance (1 - cosine similarity) of two float32 vectors; 1 when either is all zeros, null when the sizes differ. */

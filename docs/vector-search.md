@@ -55,11 +55,21 @@ export const similarFoods = action({
 
 | Database | How | Scale |
 |---|---|---|
-| **SQLite** | A side table of float32 vectors per index, compared in a SQL function (`vector_distance_cos`) onebase adds to `bun:sqlite`. Every matching vector is compared, so results are exact. | Linear: about 30 ms per search over 10k vectors of 1536 dimensions, 130 ms over 50k. |
+| **SQLite** | A side table of float32 vectors per index, with a copy in memory that worker threads compare with WebAssembly SIMD. Every matching vector is compared, so results are exact, up to float32 rounding when scores nearly tie. | Linear: about 2 ms of work per search over 10k vectors of 1536 dimensions, and searches run side by side. See [Memory and threads](#memory-and-threads-on-sqlite). |
 | **Turso / libSQL** | The same side table, compared with libSQL's built-in `vector_distance_cos`. Exact, and the comparison runs in the database. | Linear, like SQLite. |
 | **Postgres** | An HNSW index from [pgvector](https://github.com/pgvector/pgvector) on the documents table, so writes need no extra work. onebase runs `CREATE EXTENSION IF NOT EXISTS vector`; the database user needs the right to do that, or create the extension yourself. With pgvector 0.8+, filtered searches keep scanning until the limit is filled. | Large tables. HNSW is approximate: results are very close but not guaranteed to be the exact nearest. Indexes over 2000 dimensions are searched without an index. |
 | **MySQL** | MySQL Community has no vector distance function, so onebase reads the matching documents' vectors and ranks them in the server. Exact. | Small tables only: every search reads every matching vector. |
 
 The SQLite side tables are stored in the same file as the documents, so [backups](./backups.md) include them, and vectors are stored the way libSQL stores `F32_BLOB` values.
+
+## Memory and threads on SQLite
+
+An index is loaded into memory by the first search that uses it, so indexes nobody searches cost nothing, and it's dropped again after 30 minutes without a search. Writes reach it in the same order they commit: a search sees every committed write and nothing that was rolled back.
+
+Vectors take `dimensions × 4` bytes each, about 60 MB for 10k vectors of 1536 dimensions, and room is added by doubling. All indexes together may use `ONEBASE_VECTOR_MEMORY_MB` (default `2048`). An index that doesn't fit is searched in SQL instead, which gives the same results much more slowly. Set it to `0` to always search in SQL.
+
+Searches of larger indexes (over about a million numbers: 700 vectors of 1536 dimensions) run on worker threads, so they don't hold up other requests or each other. The workers start with the first such search and stop when no index is left in memory. There are up to 8, one less than the CPU cores; `ONEBASE_VECTOR_WORKERS` sets how many, and `0` keeps searches on the main thread.
+
+Writes and searches don't wait for each other: a search compares the vectors as they were when it started, and sees every write committed before that.
 
 `onebase doctor` checks that `vectorField` and `filterFields` exist and that the vector field holds arrays of numbers.

@@ -167,6 +167,8 @@ export class SqliteDriver implements Driver {
   /** Writes done in the open transaction, answered when it commits. */
   private group: { resolve: () => void; reject: (err: unknown) => void }[] = [];
   private groupStarted = 0;
+  /** Set while the open group is waiting out a turn of the event loop before committing. */
+  private groupTurn: ReturnType<typeof setImmediate> | null = null;
   private optimizeTimer: ReturnType<typeof setInterval> | null = null;
   private maintainTimer: ReturnType<typeof setInterval> | null = null;
   private writeCount = 0;
@@ -327,8 +329,8 @@ export class SqliteDriver implements Driver {
 
   /**
    * Group commit: writes queued behind each other share one transaction, each in a savepoint so
-   * a failing one is undone alone. The group commits once no write is waiting (or it's grown
-   * big or old), and only then are its callers answered, so N writes cost one fsync.
+   * a failing one is undone alone. The group commits a turn after no write is waiting (or once
+   * it's grown big or old), and only then are its callers answered, so N writes cost one fsync.
    */
   write<T>(fn: (tx: Exec) => Promise<T>): Promise<T> {
     this.waitingWrites++;
@@ -365,13 +367,32 @@ export class SqliteDriver implements Driver {
   }
 
   private endGroupIfDone() {
-    if (this.waitingWrites === 0 || this.group.length >= GROUP_MAX_WRITES || performance.now() - this.groupStarted >= GROUP_MAX_MS) {
+    if (this.group.length >= GROUP_MAX_WRITES || performance.now() - this.groupStarted >= GROUP_MAX_MS) {
       this.commitGroup();
+    } else if (this.waitingWrites === 0) {
+      this.commitNextTurn();
     }
+  }
+
+  /**
+   * A request only becomes a queued write once its handler has run, and a write with nothing
+   * ahead of it runs before the next socket is even read. So nothing would ever be waiting: the
+   * group waits one turn of the event loop for the requests that have already arrived.
+   */
+  private commitNextTurn() {
+    this.groupTurn ??= setImmediate(() => {
+      this.groupTurn = null;
+      // Otherwise the last of those writes comes back here when it's done.
+      if (this.waitingWrites === 0) void this.writes.run(async () => this.commitGroup());
+    });
   }
 
   /** Commits the open group, if any, and answers its writes. Runs on the write queue. */
   private commitGroup() {
+    if (this.groupTurn) {
+      clearImmediate(this.groupTurn);
+      this.groupTurn = null;
+    }
     if (!this.writer.inTransaction) return;
     try {
       this.writer.run("COMMIT");

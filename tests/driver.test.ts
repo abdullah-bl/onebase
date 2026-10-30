@@ -225,6 +225,51 @@ describe("sqlite group commit", () => {
     }
   });
 
+  test("requests arriving together over HTTP share a commit", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "onebase-group-"));
+    const driver = new SqliteDriver(join(dir, "db.sqlite"));
+    // Each request reaches write() from its own socket callback, unlike calls made in one loop.
+    const server = Bun.serve({
+      port: 0,
+      fetch: async (req) => {
+        const { x } = await req.json();
+        await driver.write((tx) => tx.run("INSERT INTO t (x) VALUES (?)", [x]));
+        return new Response("ok");
+      },
+    });
+    try {
+      await driver.write((tx) => tx.run("CREATE TABLE t (x INTEGER)"));
+      let commits = 0;
+      const run = driver.writer.run.bind(driver.writer);
+      (driver.writer as any).run = (sql: string) => (sql === "COMMIT" && commits++, run(sql));
+
+      const n = 200;
+      await Promise.all(Array.from({ length: n }, (_, x) => fetch(server.url, { method: "POST", body: JSON.stringify({ x }) })));
+      expect(await driver.read((tx) => tx.get("SELECT COUNT(*) AS n FROM t"))).toEqual({ n });
+      expect(commits).toBeLessThan(n / 2);
+    } finally {
+      server.stop(true);
+      await driver.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a failed write alone doesn't leave a transaction open, even if closed right after", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "onebase-group-"));
+    try {
+      const driver = new SqliteDriver(join(dir, "db.sqlite"));
+      const fail = () => driver.write(async () => { throw new Error("no"); });
+      await expect(fail()).rejects.toThrow("no");
+      await Bun.sleep(0);
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(driver.writer.inTransaction).toBe(false);
+      await expect(fail()).rejects.toThrow("no");
+      await driver.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("an in-memory read between writes runs outside the group", async () => {
     const driver = new SqliteDriver(":memory:");
     await driver.write((tx) => tx.run("CREATE TABLE t (x INTEGER)"));

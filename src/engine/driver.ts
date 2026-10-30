@@ -6,6 +6,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { mysqlDialect, newId, postgresDialect, sqliteDialect, vector32, vectorDistanceCos, type Dialect } from "./dialect";
 import { unguardedFetch } from "./guard";
+import { VectorCache, withVectorCache } from "./vectors";
 
 export type Row = Record<string, any>;
 
@@ -119,6 +120,14 @@ const WAL_SIZE_LIMIT = 64 << 20;
 /** A group commit closes after this many writes or this long, even while more are waiting. */
 const GROUP_MAX_WRITES = 512;
 const GROUP_MAX_MS = 20;
+/** How much memory vector indexes may use, unless ONEBASE_VECTOR_MEMORY_MB says otherwise (0: none, SQL ranks them). */
+const VECTOR_MEMORY_MB = 2048;
+
+/** A number from the environment, or null when it isn't set to one. */
+function envNumber(name: string): number | null {
+  const value = process.env[name];
+  return value && Number(value) >= 0 ? Number(value) : null;
+}
 
 /** The vector functions libSQL has built in, so vector indexes use the same SQL on both. */
 function addVectorFunctions(db: Database) {
@@ -152,7 +161,8 @@ export function worthVacuuming(space: SqliteSpace): boolean {
 }
 
 export class SqliteDriver implements Driver {
-  readonly dialect = sqliteDialect;
+  readonly dialect: Dialect;
+  readonly vectors: VectorCache | null;
   readonly kind = "sqlite";
   readonly shared = false;
   readonly pipelined = true;
@@ -167,11 +177,16 @@ export class SqliteDriver implements Driver {
   /** Writes done in the open transaction, answered when it commits. */
   private group: { resolve: () => void; reject: (err: unknown) => void }[] = [];
   private groupStarted = 0;
+  /** Set while the open group is waiting out a turn of the event loop before committing. */
+  private groupTurn: ReturnType<typeof setImmediate> | null = null;
   private optimizeTimer: ReturnType<typeof setInterval> | null = null;
   private maintainTimer: ReturnType<typeof setInterval> | null = null;
   private writeCount = 0;
 
   constructor(readonly path: string) {
+    const vectorMb = envNumber("ONEBASE_VECTOR_MEMORY_MB") ?? VECTOR_MEMORY_MB;
+    this.vectors = vectorMb > 0 ? new VectorCache(vectorMb * 2 ** 20, envNumber("ONEBASE_VECTOR_WORKERS") ?? undefined) : null;
+    this.dialect = this.vectors ? withVectorCache(this.vectors) : sqliteDialect;
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     this.writer = new Database(path, { create: true, strict: true });
     // Only takes effect before the first table exists; `onebase vacuum` turns it on for older files.
@@ -246,6 +261,7 @@ export class SqliteDriver implements Driver {
    */
   async maintain(): Promise<void> {
     if (this.reader === this.writer) return;
+    await this.reads.run(async () => this.vectors?.evictIdle());
     for (let freed = 0; freed < VACUUM_MAX_BYTES; freed += VACUUM_STEP_BYTES) {
       const took = await this.writes.run(async () => {
         this.commitGroup();
@@ -327,8 +343,8 @@ export class SqliteDriver implements Driver {
 
   /**
    * Group commit: writes queued behind each other share one transaction, each in a savepoint so
-   * a failing one is undone alone. The group commits once no write is waiting (or it's grown
-   * big or old), and only then are its callers answered, so N writes cost one fsync.
+   * a failing one is undone alone. The group commits a turn after no write is waiting (or once
+   * it's grown big or old), and only then are its callers answered, so N writes cost one fsync.
    */
   write<T>(fn: (tx: Exec) => Promise<T>): Promise<T> {
     this.waitingWrites++;
@@ -365,13 +381,32 @@ export class SqliteDriver implements Driver {
   }
 
   private endGroupIfDone() {
-    if (this.waitingWrites === 0 || this.group.length >= GROUP_MAX_WRITES || performance.now() - this.groupStarted >= GROUP_MAX_MS) {
+    if (this.group.length >= GROUP_MAX_WRITES || performance.now() - this.groupStarted >= GROUP_MAX_MS) {
       this.commitGroup();
+    } else if (this.waitingWrites === 0) {
+      this.commitNextTurn();
     }
+  }
+
+  /**
+   * A request only becomes a queued write once its handler has run, and a write with nothing
+   * ahead of it runs before the next socket is even read. So nothing would ever be waiting: the
+   * group waits one turn of the event loop for the requests that have already arrived.
+   */
+  private commitNextTurn() {
+    this.groupTurn ??= setImmediate(() => {
+      this.groupTurn = null;
+      // Otherwise the last of those writes comes back here when it's done.
+      if (this.waitingWrites === 0) void this.writes.run(async () => this.commitGroup());
+    });
   }
 
   /** Commits the open group, if any, and answers its writes. Runs on the write queue. */
   private commitGroup() {
+    if (this.groupTurn) {
+      clearImmediate(this.groupTurn);
+      this.groupTurn = null;
+    }
     if (!this.writer.inTransaction) return;
     try {
       this.writer.run("COMMIT");
@@ -423,6 +458,7 @@ export class SqliteDriver implements Driver {
     try {
       await this.optimize();
     } catch {}
+    await this.vectors?.close();
     if (this.reader !== this.writer) this.reader.close();
     this.writer.close();
   }

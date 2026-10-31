@@ -236,8 +236,7 @@ export function createAdmin(opts: { runtime: Runtime; key: string; assets: Dashb
 
     deleteFile: ({ id }) =>
       runtime.adminWrite(async (_db, state) => {
-        await runtime.files.deleteMetadata(state.tx, id);
-        state.deleteFileAfterCommit(id);
+        await state.deleteFile(id);
         return null;
       }),
   };

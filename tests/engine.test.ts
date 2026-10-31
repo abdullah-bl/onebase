@@ -311,7 +311,7 @@ for (const D of DRIVERS) describe(D.name, () => {
     });
 
     test("a commit only checks subscriptions that could match it", async () => {
-      const subs = new SubscriptionManager(runtime);
+      const subs = new SubscriptionManager(runtime, { cacheBytes: 0 });
       let checks = 0;
       const affected = (subs as any).affected.bind(subs);
       (subs as any).affected = (...a: unknown[]) => (checks++, affected(...a));

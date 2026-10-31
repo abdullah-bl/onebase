@@ -17,7 +17,12 @@ export type ReadRange = {
   /** The slice of index order that was scanned: keys after `after`, up to and including `until`. */
   window?: { keys: string[]; order: "asc" | "desc"; after?: unknown[]; until?: unknown[] };
 };
-export type ReadSet = { ids: Set<string>; ranges: ReadRange[] };
+export type ReadSet = {
+  ids: Set<string>;
+  ranges: ReadRange[];
+  /** The query also read the clock or a random source, so its result can't be reused (see guard.ts). */
+  impure?: boolean;
+};
 export type Write = { table: string; id: string; before: Doc | null; after: Doc | null };
 
 export type DbOptions = {

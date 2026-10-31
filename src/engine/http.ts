@@ -117,8 +117,11 @@ export function serve(opts: ServeOptions): Server<SocketData> {
     return origin && origins.has(origin) ? { "Access-Control-Allow-Origin": origin, Vary: "Origin", ...CORS_BASE } : { Vary: "Origin" };
   };
 
+  const jsonText = (req: Request, text: string, status = 200, headers: Record<string, string> = {}) =>
+    new Response(text, { status, headers: { "Content-Type": "application/json", ...cors(req), ...headers } });
+
   const json = (req: Request, body: unknown, status = 200, headers: Record<string, string> = {}) =>
-    new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", ...cors(req), ...headers } });
+    jsonText(req, JSON.stringify(body), status, headers);
 
   const clientIp = (req: Request, server: Server<SocketData>) => {
     if (opts.trustProxy) {
@@ -282,12 +285,15 @@ export function serve(opts: ServeOptions): Server<SocketData> {
       if (limit) return send(ws, { type: "result", requestId: msg.requestId, ok: false, error: limit.message });
       try {
         const opts = { identity: ws.data.identity, source: "client" as const };
+        if (msg.kind === "query") {
+          const value = await subscriptions.query(msg.path, msg.args, opts.identity, opts.source);
+          if (ws.readyState === 1) ws.send(`{"type":"result","requestId":${JSON.stringify(msg.requestId)},"ok":true,"value":${value}}`);
+          return;
+        }
         const value =
-          msg.kind === "query"
-            ? (await runtime.runQuery(msg.path, msg.args, opts)).value
-            : msg.kind === "mutation"
-              ? await runtime.runMutation(msg.path, msg.args, { ...opts, beforeCommit: () => ws.data.committed.add(msg.requestId) })
-              : await runtime.runAction(msg.path, msg.args, opts);
+          msg.kind === "mutation"
+            ? await runtime.runMutation(msg.path, msg.args, { ...opts, beforeCommit: () => ws.data.committed.add(msg.requestId) })
+            : await runtime.runAction(msg.path, msg.args, opts);
         reply(ws, { type: "result", requestId: msg.requestId, ok: true, value } as any);
       } catch (err) {
         runtime.log.error(`${msg.path}: ${err instanceof Error ? err.message : String(err)}`);
@@ -307,14 +313,13 @@ export function serve(opts: ServeOptions): Server<SocketData> {
     try {
       const identity = await identityFromRequest(req);
       const opts = { identity, source: "http" as const };
+      if (kind === "query") return jsonText(req, `{"status":"success","value":${await subscriptions.query(body.path, body.args, identity, opts.source)}}`);
       const value =
-        kind === "query"
-          ? (await runtime.runQuery(body.path, body.args, opts)).value
-          : kind === "mutation"
-            ? await runtime.runMutation(body.path, body.args, opts)
-            : kind === "action"
-              ? await runtime.runAction(body.path, body.args, opts)
-              : await runtime.call(body.path, body.args, opts);
+        kind === "mutation"
+          ? await runtime.runMutation(body.path, body.args, opts)
+          : kind === "action"
+            ? await runtime.runAction(body.path, body.args, opts)
+            : await runtime.call(body.path, body.args, opts);
       return json(req, { status: "success", value });
     } catch (err) {
       runtime.log.error(`${body?.path}: ${err instanceof Error ? err.message : String(err)}`);

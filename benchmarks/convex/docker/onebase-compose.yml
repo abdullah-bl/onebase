@@ -1,0 +1,17 @@
+services:
+  onebase:
+    image: onebase:local
+    container_name: onebase-bench
+    restart: unless-stopped
+    ports:
+      - "8190:8090"
+    environment:
+      ONEBASE_URL: http://localhost:8090
+      ONEBASE_ADMIN_KEY: ${ONEBASE_ADMIN_KEY:?set ONEBASE_ADMIN_KEY}
+      # OFF / NORMAL (default, no fsync per commit) / FULL / EXTRA
+      ONEBASE_SYNCHRONOUS: ${ONEBASE_SYNCHRONOUS:-NORMAL}
+    volumes:
+      - onebase_data:/app/onebase_data
+
+volumes:
+  onebase_data:

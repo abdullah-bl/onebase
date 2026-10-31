@@ -1,0 +1,7 @@
+{
+  "name": "todos-onebase",
+  "private": true,
+  "dependencies": {
+    "onebase": "file:../../../.."
+  }
+}

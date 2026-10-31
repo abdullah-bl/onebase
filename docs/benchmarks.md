@@ -22,7 +22,7 @@ Convex won one test: it served a repeated scan about 5× faster, most likely fro
 | Load | Node 22 on the same machine, sending HTTP requests over loopback. Each worker waits for a reply before sending its next request |
 | Dates | October 29–31, 2026 |
 
-Both backends ran the same functions; only the imports differ (`convex/*` or `onebase/*`).
+Both backends ran the same functions, apart from the imports (`convex/*` or `onebase/*`) and the filter syntax in the scan test. The crash and correctness functions exist only on onebase.
 
 Each sustained test ran for 60 seconds. CPU and memory come from `docker stats`, sampled about every 2 seconds, where 100% is one core. `docker stats` reads lower than process RSS: a fresh onebase server on this machine showed about 46 MB RSS, against about 10 MiB in `docker stats`.
 
@@ -139,6 +139,6 @@ These ran on onebase only, once each, with default settings.
 - **A real network.** The load generator ran on the same machine and shared its CPU.
 - **Live queries at scale.** We counted open WebSockets, but didn't measure delivering updates to many subscribers on either side.
 - **Consistency.** We didn't compare the guarantees of Convex's optimistic concurrency with onebase's serial writes.
-- **Long-running functions on Convex.** Our CPU test loops until `Date.now()` advances. It failed on Convex at 500 ms, but Convex documents a clock that doesn't advance during a function, so the test itself is the likely cause. We have no valid comparison of how each backend handles this.
+- **Long-running functions on Convex.** Our CPU test looped until `Date.now()` advanced. It failed on Convex at 500 ms, but Convex documents a clock that doesn't advance during a function, so the test itself is the likely cause. We have no valid comparison of how each backend handles this.
 
-The test scripts aren't published yet, so you can't rerun these numbers directly. The tables above describe each test so you can write your own. `bun run bench` in this repository is a different benchmark: it measures onebase's engine in-process, with no HTTP and no Convex.
+The scripts are in [`benchmarks/convex`](https://github.com/abdullah-bl/onebase/tree/main/benchmarks/convex), with the commands to rerun these tests. A few numbers have no script: disk writes per request, and the vector search runs outside Docker. The CPU test has changed since these runs: it now does a fixed amount of computation instead of watching the clock, so it can run on Convex. Nobody has rerun it yet, so the comparison of long-running functions on Convex is still missing. `bun run bench` in this repository is a different benchmark: it measures onebase's engine in-process, with no HTTP and no Convex.

@@ -161,7 +161,7 @@ S3 credentials come from `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` / `S3_ENDPO
 
 Send `Authorization: Bearer <token>` for auth: a built-in session token, or a token checked by the providers or `authenticate()` in `onebase/auth.config.ts`. Built-in sign-in lives under `/api/auth/*` (see [docs/auth.md](docs/auth.md)).
 
-**Clients:** the JS/TS client (browser, React, Bun) ships with the package, with optimistic updates and offline support ([docs/client.md](docs/client.md)). A Swift package for iOS and macOS lives in [`clients/swift`](clients/swift) ([docs/swift.md](docs/swift.md)), and the [client protocol](docs/client-protocol.md) is the documented contract for any other platform.
+**Clients:** the JS/TS client (browser, React, Bun) ships with the package, with optimistic updates and offline support ([docs/client.md](docs/client.md)). A Swift package for iOS and macOS lives in [onebase-swift](https://github.com/abdullah-bl/onebase-swift) ([docs/swift.md](docs/swift.md)), and the [client protocol](docs/client-protocol.md) is the documented contract for any other platform.
 
 ## How it works
 

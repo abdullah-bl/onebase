@@ -98,3 +98,5 @@ onebase vacuum --data ./onebase_data
 ```
 
 `vacuum` rewrites the whole file, so it needs about as much free disk as the data takes up. Writes wait while it runs, so stop the server first. `onebase doctor` tells you when it's worth running.
+
+It also moves a database made by an older version to the current layout for documents, which makes scans and writes faster and the file smaller, especially with documents of about 1 KB or more. That first run copies every document, so it can need about three times the database's size in free disk. If it fails, the database stays as it was. Older databases keep working without it.

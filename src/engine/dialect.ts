@@ -174,7 +174,9 @@ export const sqliteDialect: Dialect = {
   parseDoc: (raw) => JSON.parse(raw as string),
   docPlaceholder: "?",
   ddl: [
-    "CREATE TABLE IF NOT EXISTS documents (id TEXT PRIMARY KEY, tbl TEXT NOT NULL, ct REAL NOT NULL, doc TEXT NOT NULL) WITHOUT ROWID",
+    // A rowid table, not WITHOUT ROWID: there, a document of about 1 KB spills onto its own page, and
+    // random ids scatter documents across the file, which makes scans several times slower.
+    "CREATE TABLE IF NOT EXISTS documents (id TEXT PRIMARY KEY, tbl TEXT NOT NULL, ct REAL NOT NULL, doc TEXT NOT NULL)",
     "CREATE INDEX IF NOT EXISTS documents_by_creation_time ON documents(tbl, ct, id)",
     "CREATE TABLE IF NOT EXISTS _indexes (name TEXT PRIMARY KEY, def TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS _scheduled (id TEXT PRIMARY KEY, fn TEXT NOT NULL, args TEXT NOT NULL, run_at REAL NOT NULL, state TEXT NOT NULL, error TEXT)",

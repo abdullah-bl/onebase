@@ -268,7 +268,7 @@ function checkSources(dir: string, files: string[], findings: Finding[]) {
   }
 }
 
-/** Free space deleted documents left in the SQLite file, which the file doesn't shrink by. */
+/** Free space deleted documents left in the SQLite file, which the file doesn't shrink by, and the older layout for documents. */
 export function checkDatabase(path: string, findings: Finding[]) {
   let db: Database;
   try {
@@ -277,6 +277,15 @@ export function checkDatabase(path: string, findings: Finding[]) {
     return; // not there yet, or not readable: nothing to say about its size
   }
   try {
+    const documents = db.query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'documents'").get() as { sql: string } | null;
+    if (documents && /WITHOUT\s+ROWID/i.test(documents.sql)) {
+      findings.push({
+        level: "warn",
+        where: relative(process.cwd(), path) || path,
+        message: "This database stores documents in the layout older versions used, which makes scans and writes slower and the file larger.",
+        fix: "Run onebase vacuum with the server stopped. It can need about three times the database's size in free disk while it runs.",
+      });
+    }
     const space = sqliteSpace(db);
     if (!worthVacuuming(space)) return;
     const mb = (pages: number) => `${((pages * space.pageSize) / 1e6).toFixed(0)} MB`;

@@ -124,7 +124,7 @@ const GROUP_MAX_MS = 20;
 const VECTOR_MEMORY_MB = 2048;
 
 /** A number from the environment, or null when it isn't set to one. */
-function envNumber(name: string): number | null {
+export function envNumber(name: string): number | null {
   const value = process.env[name];
   return value && Number(value) >= 0 ? Number(value) : null;
 }

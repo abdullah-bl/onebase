@@ -7,7 +7,7 @@ description: How onebase compared with self-hosted Convex on one machine, how we
 
 In our tests on one machine, onebase used far less memory than self-hosted Convex and was faster at writes and vector search. It lost no acknowledged writes when the process was killed.
 
-Convex won one test: it served a repeated scan about 5× faster, most likely from its query cache. onebase also doesn't isolate long-running functions, hasn't been tested through a power cut, and hasn't been compared with a tuned Convex. Read these numbers as one machine's results, not as a general ranking.
+Convex won one test: it served a repeated scan about 5× faster, most likely from its query cache. onebase has since added its own cache for repeated reads, [measured separately](#repeated-reads) and not yet compared with Convex. onebase also doesn't isolate long-running functions, hasn't been tested through a power cut, and hasn't been compared with a tuned Convex. Read these numbers as one machine's results, not as a general ranking.
 
 ## Test setup
 
@@ -49,6 +49,8 @@ Each sustained test ran for 60 seconds. CPU and memory come from `docker stats`,
 
 No request failed on either side.
 
+These results predate onebase's [cache for repeated reads](./functions.md#repeated-reads).
+
 ### Writes and durability
 
 | 1 KB writes | One at a time | 100 concurrent | Median latency at 100 |
@@ -74,6 +76,23 @@ No request failed on either side.
 | Inserting the documents | 221–225/s (held back by Convex's write limit) | 1,415–1,528/s |
 
 We only checked that each stored vector finds itself as the top hit (score 1.0 on both). We didn't compare recall.
+
+### Repeated reads
+
+These compare onebase with its cache and the commit before it, on SQLite. Convex wasn't part of this run. It also ran outside Docker on October 31, 2026, with four Bun processes generating the load instead of Node, so don't compare these numbers with the tables above. Each cell is the median of three 10-second rounds with 100 workers, except the last two rows, which are one 15-second round each.
+
+| What the workers do | Before | With the cache |
+|---|---|---|
+| Repeat a scan of 2,000 documents, unindexed, matching nothing | 1,702/s | **114,323/s** |
+| Repeat a read returning all 2,000 documents | 596/s | **8,841/s** |
+| The scan, while a tenth of the workers write to the same table without changing its result | 1,674 scans/s, 158 writes/s | **71,843 scans/s, 5,969 writes/s** |
+| The read returning everything, while a tenth of the workers write to that table, invalidating it each time | 590 reads/s, 57 writes/s | **6,859 reads/s, 518 writes/s** |
+| Read 20,000 different small results, more than fit in the cache | 30,110/s, 132 MiB | **48,746/s**, 221 MiB |
+| Read 20,000 different 4 KB results, far more than fit in the cache | **28,737/s**, 135 MiB | 27,540/s, 277 MiB |
+
+The memory figures are process RSS at the end of the round. The limit (64 MB by default) counts cached results and an estimate of their bookkeeping, so the process grew by more than that: 89 MiB and 142 MiB in the last two rows. When most reads can't be reused, as in the last row, the cache costs memory and gains nothing. Set `ONEBASE_QUERY_CACHE_MB=0` for such an app.
+
+1 KB writes didn't measurably slow down, with the cache empty or holding thousands of results: 13,581–14,515/s against 13,734–14,376/s before when empty, and 13,840–14,522/s against 14,044–14,576/s when full (three rounds each).
 
 ### Default limits
 
@@ -102,7 +121,8 @@ These ran on onebase only, once each, with default settings.
 - **Long-running functions block the server.** Functions share one thread, so CPU-bound code stalls every other request, as the last row above shows. [Time limits](./functions.md#time-limits) can't interrupt code that never yields.
 - **Power loss is untested.** `kill -9` only tests a process crash. With the default `synchronous=NORMAL`, a power cut or OS crash can lose the most recent commits. Set `ONEBASE_SYNCHRONOUS=FULL` if you can't accept that, and expect the slower numbers above.
 - **It writes more to disk.** An earlier version wrote 20.6 KB per 1 KB write, against Convex's 7.8 KB, and 545 KB per 512 KB write, against 8 KB. Convex seems to merge an insert and delete in one transaction, which flatters it here. We haven't repeated this since the write path changed.
-- **Repeated reads aren't cached.** The scan test reran the query for every HTTP request, while Convex most likely answered from its cache. We didn't confirm the cache was the cause.
+- **Scans slow down as the database grows, even with other tables.** One scan of a 2,000-document table took 0.49 ms alone and 18.6 ms after adding 20,000 documents of 4 KB to a different table, in a single in-process run. We haven't found out why. The scan numbers here come from small databases, so they may flatter a large one. Use an index, or let the [cache](./functions.md#repeated-reads) absorb repeats.
+- **The cache doesn't cover several instances.** Repeated reads are cached on SQLite only, so Postgres, MySQL and Turso run every read.
 - **Vector search checks every vector.** Time grows with the size of the index. We tested up to 10,000 vectors, where it took 3, 4 and 5 ms at 1,000, 5,000 and 10,000. Convex may win on latency at larger sizes.
 - **Vector search can drop off sharply.** An index over the memory budget (2,048 MB by default, or roughly 335,000 × 1536 vectors, untested) falls back to scanning in SQL. That managed about 6 searches/s at 10,000 vectors.
 - **Vector search slows during writes.** In a run outside Docker, it managed 1,836 searches/s with 1 writer and 794 with 8. We don't have the same numbers for Convex.
@@ -113,6 +133,7 @@ These ran on onebase only, once each, with default settings.
 - **Tuned Convex.** Convex ran with its defaults, including 16 concurrent functions per kind and a 4 MiB/s write limit, and these may cap its write numbers. We didn't try raising them, or running on Postgres.
 - **Convex Cloud.** Only the self-hosted backend was tested.
 - **Fair memory numbers for Convex.** Its memory grows with stored write history. The volume had been through several rounds: idle memory was 2.4 GiB here, against 177 MiB on a younger volume.
+- **The cache against Convex.** The Convex comparison above was run before the cache existed, and we didn't confirm that Convex's scan result came from its own cache.
 - **Repeatability.** Each sustained result is mostly a single run. Convex's write results varied by about 25% between rounds, so ignore smaller differences.
 - **Other hardware.** Nothing was measured on x86-64. With 121 GiB of RAM, reads came from the page cache and never touched the disk. A smaller machine will behave differently.
 - **A real network.** The load generator ran on the same machine and shared its CPU.

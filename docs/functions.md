@@ -31,6 +31,14 @@ export const byAuthor = query({
 
 A subscribed query re-runs only when a write could change its result. Identical subscriptions (same function, arguments and user) share a single execution.
 
+### Repeated reads
+
+One-off reads (`client.query()` and `POST /api/query`) reuse an earlier result when the function, arguments and user are the same and no write since could have changed it. They never return data older than a write that has already been acknowledged, and identical reads arriving together share one run. Results are dropped when a write could affect them or when new code is deployed, and the least recently used go first once they reach `ONEBASE_QUERY_CACHE_MB` (default 64). Set it to `0` to run every read. That limit counts results and an estimate of their bookkeeping, not all the memory they cost: in [our tests](./benchmarks.md#repeated-reads) the process grew by 89–142 MiB at the default.
+
+This applies on SQLite only. With Postgres, MySQL or Turso, other instances learn about commits a moment later, so every read runs. `POST /api/run` and `ctx.runQuery` always run the query too.
+
+A query that reads the clock or a random source (`Date.now()`, `new Date()`, `Math.random()`, `performance.now()`, `crypto.randomUUID()` or `crypto.getRandomValues()`) runs for every read, so its one-off results stay as fresh as before. onebase can't see other things a query might depend on, such as a file, an environment variable or a module-level variable. A result based on those stays until a write or deploy drops it, which is also how a subscribed query behaves.
+
 ## Mutations
 
 Mutations write data in a transaction: either all of their writes happen, or none do.

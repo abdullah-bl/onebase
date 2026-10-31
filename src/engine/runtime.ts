@@ -1049,21 +1049,29 @@ export class Runtime {
     return `${this.siteUrl}/api/storage/${id}`;
   }
 
-  private storageReader(tx: Exec) {
-    return {
-      getUrl: async (id: string) => ((await this.files.metadata(tx, id)) ? this.fileUrl(id) : null),
-      getMetadata: (id: string) => this.files.metadata(tx, id),
+  private storageReader(tx: Exec, readSet?: ReadSet) {
+    const metadata = (id: string) => {
+      readSet?.ids.add(id);
+      return this.files.metadata(tx, id);
     };
+    return {
+      getUrl: async (id: string) => ((await metadata(id)) ? this.fileUrl(id) : null),
+      getMetadata: metadata,
+    };
+  }
+
+  /** Deletes a file's metadata as a write, so queries that read the file see it go; the bytes go once it commits. */
+  private async removeFile(state: TxState, id: string) {
+    await this.files.deleteMetadata(state.tx, id);
+    state.writes.push({ table: "_storage", id, before: null, after: null });
+    state.afterCommit.push(() => this.files.backend.remove(id));
   }
 
   private storageWriter(state: TxState) {
     return {
       ...this.storageReader(state.tx),
       generateUploadUrl: async () => `${this.siteUrl}/api/storage/upload?token=${await this.files.createUploadToken(state.tx)}`,
-      delete: async (id: string) => {
-        await this.files.deleteMetadata(state.tx, id);
-        state.afterCommit.push(() => this.files.backend.remove(id));
-      },
+      delete: (id: string) => this.removeFile(state, id),
     };
   }
 
@@ -1073,10 +1081,7 @@ export class Runtime {
       getUrl: async (id: string) => ((await read((tx) => this.files.metadata(tx, id))) ? this.fileUrl(id) : null),
       getMetadata: (id: string) => read((tx) => this.files.metadata(tx, id)),
       generateUploadUrl: async () => `${this.siteUrl}/api/storage/upload?token=${await this.withWriter((tx) => this.files.createUploadToken(tx))}`,
-      delete: async (id: string) => {
-        await this.withWriter((tx) => this.files.deleteMetadata(tx, id));
-        await this.files.backend.remove(id);
-      },
+      delete: (id: string) => this.transact((state) => this.removeFile(state, id)),
       /** Saves a Blob (e.g. from fetch) and returns its storage id. */
       store: async (blob: Blob) => {
         const meta = await this.files.write(blob.stream(), blob.type);
@@ -1135,11 +1140,11 @@ export class Runtime {
     const runQuery = async (ref: FunctionLike, args?: unknown) => {
       const { name, fn, mount: target } = this.resolve(ref, "query", true, mount);
       if (state && target && target !== mount) await this.flushHooks(state, target);
-      return this.invoke(name, fn, this.queryCtx(db, id, target, state), args);
+      return this.invoke(name, fn, this.queryCtx(db, id, target, state), args, db.readSet);
     };
     const scoped = readerView(db.withScope(mount?.scope ?? TableScope.app));
     if (mount) return { db: scoped, ...this.componentBase(mount, id, db.tx), runQuery };
-    return { db: scoped, auth: this.authFor(id), storage: this.storageReader(db.tx), runQuery, components: this.componentsProxy("query", { runQuery }) };
+    return { db: scoped, auth: this.authFor(id), storage: this.storageReader(db.tx, db.readSet), runQuery, components: this.componentsProxy("query", { runQuery }) };
   }
 
   private mutationCtx(state: TxState, identity: UserIdentity | null, mount: MountRuntime | null = null): any {
@@ -1305,11 +1310,11 @@ export class Runtime {
     );
   }
 
-  private async invoke(name: string, fn: RegisteredFunction, ctx: unknown, args: unknown) {
+  private async invoke(name: string, fn: RegisteredFunction, ctx: unknown, args: unknown, reads?: ReadSet) {
     const checked = this.checkArgs(name, fn, args);
     const caller = this.componentFunctions.get(name)?.mount ?? null;
     const handle = (ref: unknown) => this.createHandle(ref, caller);
-    const result = await currentFunction.run({ type: fn.type, name, handle }, () => fn.handler(ctx, checked));
+    const result = await currentFunction.run({ type: fn.type, name, handle, reads }, () => fn.handler(ctx, checked));
     return this.checkReturn(name, fn, result);
   }
 
@@ -1362,7 +1367,7 @@ export class Runtime {
         this.withinLimit("query", name, async (deadline) => {
           const readSet: ReadSet = { ids: new Set(), ranges: [] };
           const db = this.newDb(deadline.exec(tx), { readSet });
-          const value = await this.invoke(name, fn, this.queryCtx(db, opts.identity ?? null, mount), args);
+          const value = await this.invoke(name, fn, this.queryCtx(db, opts.identity ?? null, mount), args, readSet);
           return { value, readSet };
         }),
       ),
@@ -1433,10 +1438,10 @@ export class Runtime {
    * Dashboard edits: a schema-validated write that live queries see like any mutation.
    * `db` can read and write any table (components' too), including ones no longer in schema.ts.
    */
-  adminWrite<T>(body: (db: DatabaseImpl, state: { tx: Exec; deleteFileAfterCommit(id: string): void }) => Promise<T>): Promise<T> {
+  adminWrite<T>(body: (db: DatabaseImpl, state: { tx: Exec; deleteFile(id: string): Promise<void> }) => Promise<T>): Promise<T> {
     return this.calls.track("dashboard edit", "mutation", "dashboard", () =>
       this.transact(
-        (state) => body(state.db, { tx: state.tx, deleteFileAfterCommit: (id) => state.afterCommit.push(() => this.files.backend.remove(id)) }),
+        (state) => body(state.db, { tx: state.tx, deleteFile: (id) => this.removeFile(state, id) }),
         { scope: TableScope.admin },
       ),
     );

@@ -62,6 +62,11 @@ export class CallLog {
     }
   }
 
+  /** A call answered without running the function: a cached query result. */
+  record(name: string, type: CallRecord["type"], source: CallSource) {
+    this.add({ id: this.nextId++, at: Date.now(), name, type, source, ms: 0, ok: true, lines: [] });
+  }
+
   private add(record: CallRecord) {
     this.totals.calls++;
     if (!record.ok) this.totals.errors++;

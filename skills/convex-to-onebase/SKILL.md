@@ -59,7 +59,31 @@ Work in this order, and run the checks at each step before moving on.
 - **Don't invent APIs.** If unsure whether onebase supports something, check the docs in `node_modules/onebase/docs/` (components: `components.md`, `components-authoring.md`; built-ins: `rate-limiter.md`, `aggregate.md`, `sharded-counter.md`, `work-queue.md`; general: `convex.md`, `llm-guide.md`) or the `onebase` source.
 - **Ids crossing into a component are strings.** A component can't read the app's tables, and the app can't read a component's. Ids that come back from a component, such as an aggregate's `item.id` or a work queue `context`, are typed as `string`: cast them where you use them (`item.id as Id<"scores">`).
 - **Keep the ordering logic.** A `sortKey` that negates its value (`-d.points`) still works as is; there's no need to turn it into `order: "desc"`.
-- **Don't copy data.** Convex data doesn't move automatically. Say so, and point to `convex export` plus a mutation that inserts it. Components rebuild their own data: an aggregate backfills from its table, and rate limits and counters start fresh.
+- **Don't copy data unasked.** Convex data doesn't move automatically. Say so, and plan it using "Moving the data" below. Components rebuild their own data: an aggregate backfills from its table, and rate limits and counters start fresh.
+
+## Moving the data
+
+Only do this if the user asks. There's no import tool, so it's a script: `npx convex export --path backup.zip`, then a mutation that inserts batches. Tell the user about these before they commit to it:
+
+- **Every id changes.** `db.insert` rejects `_id`, so references between documents must be remapped. Insert referenced tables first, and keep a map from each old id to its new one. Storing the old id in a field such as `legacyId` also helps, and saved links or ids held by other systems will break without it.
+- **`_creationTime` changes.** `db.insert` rejects that too. Insert in the original order so `.order()` stays right, and copy the old time into its own field if the app shows it or filters on it.
+- **Batches must be small.** A mutation may run for 10 seconds by default, and every other write waits for it.
+- **Files are re-stored.** Upload each one again with `ctx.storage.store` from an action, then update the documents that point at them with the new storage ids.
+- **Scheduled functions and cron state don't come across.** Finish or re-create what's pending.
+- **Signed-in users may need to sign in again, or reset their passwords.** Read `docs/auth.md` and try it on a test account before promising otherwise.
+- **There's no way back built in.** Rehearse on a copy, and keep Convex running until the new setup has proven itself. Writes made during the switch need a freeze or a final catch-up.
+
+## Be straight about what changes
+
+Same code doesn't mean same behavior. Say this before the migration, and check the app against it in the inventory. The numbers come from one arm64 machine against self-hosted Convex with default settings (`docs/benchmarks.md`). Don't promise them for the user's app.
+
+- **Faster in our tests:** writes, vector search and memory use.
+- **Long CPU-bound functions now block the server.** All functions share one thread, with no isolates: a 3-second CPU-bound function delayed a ping by 3 seconds. Look for heavy parsing, image work and big loops, especially in `"use node"` actions, which ran apart from other work on Convex. Move that work to a worker or a separate service.
+- **Convex's limits are gone, and so is their protection.** There are no document, write-count or scan limits to catch a runaway function. Time limits can't interrupt code that never yields.
+- **Repeat reads may get slower.** Convex was about 5× faster on a repeated identical scan, most likely from its query cache. onebase runs the query for each HTTP request. Check the app's heaviest reads.
+- **Durability is now the user's decision.** The default `synchronous=NORMAL` survives a process crash, but a power cut or OS crash can lose the latest commits, and power loss hasn't been tested. `ONEBASE_SYNCHRONOUS=FULL` closes that risk at the cost of write speed.
+- **Operations move to the user.** On Convex Cloud, backups, upgrades and uptime were handled for them. With SQLite on one server there's no failover, and backups stay off until they set `--backup`.
+- **Not compared:** tuned Convex, Convex Cloud, x86-64, and live queries with many subscribers. Say so if the app depends on any of them.
 
 ## Stop and ask
 

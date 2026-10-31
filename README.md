@@ -37,6 +37,46 @@ onebase deploy       # push your code to a running server, no restart
 
 **Website and docs:** https://abdullah-bl.github.io/onebase/ (source in [docs/](docs/)). The [LLM guide](docs/llm-guide.md) is a one-page summary of the API to give an AI assistant.
 
+## Compared to Convex
+
+In our tests on one machine, onebase used far less memory than self-hosted Convex and was faster at writes and vector search. It lost none of 32,606 acknowledged writes when the process was killed with `kill -9`.
+
+| 60 seconds of load | Convex | onebase |
+|---|---|---|
+| 1 KB writes, 100 workers | 971/s | **10,665/s** (4,389/s with `synchronous=FULL`) |
+| 512 KB writes, 50 workers | 805/s | **1,383/s** |
+| Vector search, 10,000 × 1536 dimensions, 50 workers | 1,575/s | **2,099/s** |
+| Repeated scan of 2,000 documents, 100 workers | **12,936/s** | 2,467/s |
+| Memory during 1 KB writes | 3,035 MiB | **39 MiB** |
+
+**What to keep in mind:**
+
+- **Long-running functions block the server.** Functions share one thread with no isolates, so a 3-second CPU-bound function delayed a ping by 3 seconds.
+- **Power loss is untested.** `kill -9` only tests a process crash. With the default `synchronous=NORMAL`, a power cut can lose the most recent commits.
+- **Convex wasn't tuned.** It ran with default settings and limits, on a volume with history that inflates its memory use. We didn't test Convex Cloud.
+- **Convex won on repeated scans,** most likely from its query cache. onebase runs the query for each HTTP request.
+- **The test was narrow.** It's mostly single runs on one machine, with the load generator on the same machine. Nothing was measured on x86-64.
+
+**How we tested:** an NVIDIA DGX Spark (arm64, 20 cores, 121 GiB RAM, NVMe) running both backends in Docker with no resource limits, driven over loopback HTTP by a Node load generator. [Benchmarks](docs/benchmarks.md) has the full setup, all the results, and what we haven't tested.
+
+## Skills for AI agents
+
+[`skills/`](skills) has step-by-step instructions for coding agents such as Claude Code. Each one includes the checks to run and the limits to tell the user about.
+
+| Skill | Use it to |
+|---|---|
+| [`setup-onebase-app`](skills/setup-onebase-app/SKILL.md) | Go from an empty folder to a checked, running app, with a list of what to settle before production |
+| [`build-onebase-component`](skills/build-onebase-component/SKILL.md) | Write, mount and test your own component, including table hooks |
+| [`convex-to-onebase`](skills/convex-to-onebase/SKILL.md) | Move a Convex project over: code, `@convex-dev/*` components, and what moving the data involves |
+
+To install one into a project for Claude Code:
+
+```bash
+mkdir -p .claude/skills && cp -r node_modules/onebase/skills/setup-onebase-app .claude/skills/
+```
+
+Other agents can be pointed at the `SKILL.md` file. An agent can still get things wrong, so review its work and run your own tests.
+
 ## Deploying
 
 **1. Push with `onebase deploy`** (like `npx convex deploy`): run `onebase serve` on the server once, then ship each change from your machine:
@@ -121,7 +161,7 @@ S3 credentials come from `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` / `S3_ENDPO
 
 Send `Authorization: Bearer <token>` for auth: a built-in session token, or a token checked by the providers or `authenticate()` in `onebase/auth.config.ts`. Built-in sign-in lives under `/api/auth/*` (see [docs/auth.md](docs/auth.md)).
 
-**Clients:** the JS/TS client (browser, React, Bun) ships with the package, with optimistic updates and offline support ([docs/client.md](docs/client.md)). A Swift package for iOS and macOS lives in [`clients/swift`](clients/swift) ([docs/swift.md](docs/swift.md)), and the [client protocol](docs/client-protocol.md) is the documented contract for any other platform.
+**Clients:** the JS/TS client (browser, React, Bun) ships with the package, with optimistic updates and offline support ([docs/client.md](docs/client.md)). A Swift package for iOS and macOS lives in [onebase-swift](https://github.com/abdullah-bl/onebase-swift) ([docs/swift.md](docs/swift.md)), and the [client protocol](docs/client-protocol.md) is the documented contract for any other platform.
 
 ## How it works
 

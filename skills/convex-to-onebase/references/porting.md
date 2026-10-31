@@ -59,4 +59,4 @@ export default defineComponents({ presence: presence({ ... }) });
 
 ## 5. Check it
 
-Run `npx onebase codegen && npx onebase doctor && npx tsc --noEmit`. If the package had tests (`src/component/*.test.ts`, usually with `convex-test`), port the important cases to plain `bun test` against a `Runtime` (see onebase's own `tests/components.test.ts` for the setup), or at least run each function once from the dashboard.
+Run `npx onebase codegen && npx onebase doctor && npx tsc --noEmit`. If the package had tests (`src/component/*.test.ts`, usually with `convex-test`), port the important cases to `bun test` against a real server (the build-onebase-component skill has the setup, under "Testing"), or at least run each function once from the dashboard. A project can't import onebase's internal `Runtime`, so `convex-test`-style tests don't carry over directly.

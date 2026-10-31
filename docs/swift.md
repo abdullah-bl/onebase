@@ -6,13 +6,10 @@ description: Use onebase from iOS and macOS apps, with offline support and optim
 # Swift client
 
 `OnebaseClient` is the onebase SDK for Swift apps (iOS 15+ / macOS 12+, no package
-dependencies): one WebSocket carries live queries, calls and the auth token. It lives in
-[`clients/swift`](https://github.com/abdullah-bl/onebase/tree/main/clients/swift) in the
-repository.
+dependencies): one WebSocket carries live queries, calls and the auth token. It lives in its own
+repository, [onebase-swift](https://github.com/abdullah-bl/onebase-swift).
 
-Add it by URL — released versions are published to
-[onebase-swift](https://github.com/abdullah-bl/onebase-swift), because SwiftPM needs the package
-at the root of a repository:
+Add it by URL:
 
 ```swift
 // Package.swift
@@ -22,8 +19,7 @@ dependencies: [
 // target: .product(name: "OnebaseClient", package: "onebase-swift")
 ```
 
-Working from a clone of onebase, or before the first release? Use the folder directly:
-`.package(path: "../onebase/clients/swift")`, with `package: "swift"` in the product.
+Working from a clone? Use the folder directly: `.package(path: "../onebase-swift")`.
 
 ## Connect and use
 

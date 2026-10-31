@@ -22,7 +22,7 @@ Convex won one test: it served a repeated scan about 5× faster, most likely fro
 | Load | Node 22 on the same machine, sending HTTP requests over loopback. Each worker waits for a reply before sending its next request |
 | Dates | October 29–31, 2026 |
 
-Both backends ran the same functions; only the imports differ (`convex/*` or `onebase/*`).
+Both backends ran the same functions, apart from the imports (`convex/*` or `onebase/*`) and the filter syntax in the scan test. The crash and correctness functions exist only on onebase.
 
 Each sustained test ran for 60 seconds. CPU and memory come from `docker stats`, sampled about every 2 seconds, where 100% is one core. `docker stats` reads lower than process RSS: a fresh onebase server on this machine showed about 46 MB RSS, against about 10 MiB in `docker stats`.
 

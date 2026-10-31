@@ -1,0 +1,8 @@
+{
+  "name": "todos-convex",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "convex": "latest"
+  }
+}

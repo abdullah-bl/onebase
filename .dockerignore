@@ -4,6 +4,7 @@
 node_modules
 dist
 onebase_data
+benchmarks
 example
 site
 tests

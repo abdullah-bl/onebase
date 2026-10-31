@@ -292,15 +292,37 @@ export class SqliteDriver implements Driver {
 
   /**
    * Rewrites the whole file without free pages (`onebase vacuum`), turning on incremental vacuum
-   * for a database created before onebase did that. Writes wait until it's done.
+   * and moving documents to a rowid table for a database created before onebase did those. Writes
+   * wait until it's done.
    */
   async vacuum(): Promise<void> {
     await this.writes.run(async () => {
       this.commitGroup();
+      this.rebuildDocuments();
       this.writer.run("PRAGMA auto_vacuum = INCREMENTAL");
       this.writer.run("VACUUM");
       this.writer.run("PRAGMA wal_checkpoint(TRUNCATE)");
     });
+  }
+
+  /** Whether documents is still the WITHOUT ROWID table older versions made. */
+  get oldDocumentsLayout(): boolean {
+    const row = this.writer.query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'documents'").get() as { sql: string } | null;
+    return /WITHOUT\s+ROWID/i.test(row?.sql ?? "");
+  }
+
+  /** Moves documents to a rowid table, in creation order, keeping its indexes. All or nothing. */
+  private rebuildDocuments() {
+    if (!this.oldDocumentsLayout) return;
+    this.writer.transaction(() => {
+      const indexes = this.writer.query("SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'documents' AND sql IS NOT NULL").all() as { sql: string }[];
+      this.writer.run("CREATE TABLE _documents_rebuild (id TEXT PRIMARY KEY, tbl TEXT NOT NULL, ct REAL NOT NULL, doc TEXT NOT NULL)");
+      this.writer.run("INSERT INTO _documents_rebuild (id, tbl, ct, doc) SELECT id, tbl, ct, doc FROM documents ORDER BY tbl, ct, id");
+      this.writer.run("DROP TABLE documents");
+      this.writer.run("ALTER TABLE _documents_rebuild RENAME TO documents");
+      for (const { sql } of indexes) this.writer.run(sql);
+    })();
+    this.writer.run("PRAGMA optimize = 0x10002");
   }
 
   private statistics(): string {

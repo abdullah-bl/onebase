@@ -47,7 +47,9 @@ onebase uses Convex's programming model and most of its API. If you know Convex,
 4. Run `onebase dev` to regenerate `_generated/`.
 5. In the frontend, import from `onebase/react` instead of `convex/react`.
 
-Data doesn't migrate automatically. Export it from Convex as JSON and insert it with a mutation.
+Data doesn't migrate automatically. Export it from Convex as JSON and insert it with a mutation. `db.insert` sets `_id` and `_creationTime` itself, so ids change: insert referenced tables first and remap the references, and keep the old values in fields of their own if anything depends on them.
+
+Same code doesn't mean same behavior. Functions now share one thread with no isolates, so a long CPU-bound function delays every other request. [Benchmarks](./benchmarks.md) has what we measured, and what we didn't.
 
 ## Components
 
@@ -70,4 +72,4 @@ onebase ships a skill that walks an agent such as Claude Code through the whole 
 mkdir -p .claude/skills && cp -r node_modules/onebase/skills/convex-to-onebase .claude/skills/
 ```
 
-Then ask: "migrate this project from Convex to onebase". Other agents can be pointed at `node_modules/onebase/skills/convex-to-onebase/SKILL.md`, which links to the rest.
+Then ask: "migrate this project from Convex to onebase". Other agents can be pointed at `node_modules/onebase/skills/convex-to-onebase/SKILL.md`, which links to the rest. The skill also tells the agent to explain what changes in behavior and what moving the data involves. Review its work as you would any large change, and rehearse on a copy of your data.

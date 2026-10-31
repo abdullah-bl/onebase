@@ -58,6 +58,8 @@ onebase follows [Convex](https://convex.dev)'s programming model and API, and ma
 
 ## When to use something else
 
-onebase is a young project. Use Convex if you want a managed service and a team supporting it. Use onebase if you want to own the whole stack, run it on a small VPS or your own hardware, or need full Node.js in every function.
+onebase is a young project. Use Convex if you want a managed service and a team supporting it, or if long CPU-bound functions must not affect other requests. Use onebase if you want to own the whole stack, run it on a small VPS or your own hardware, or need full Node.js in every function.
+
+[Benchmarks](./benchmarks.md) has how the two compared on one machine, and what we haven't tested.
 
 Next: [Quick start](./getting-started.md).

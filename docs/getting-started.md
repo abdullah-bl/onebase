@@ -136,4 +136,4 @@ onebase doctor
 
 - [Schema](./schema.md) and [Functions](./functions.md) cover the core API.
 - [Deployment](./deployment.md) shows how to run it in production.
-- Using an AI assistant? Give it the [LLM guide](./llm-guide.md).
+- Using an AI assistant? Give it the [LLM guide](./llm-guide.md). If you installed onebase in your project, the `node_modules/onebase/skills/` folder also has step-by-step skills for setting up an app, building a component and migrating from Convex. For Claude Code, copy the one you want: `mkdir -p .claude/skills && cp -r node_modules/onebase/skills/setup-onebase-app .claude/skills/`.

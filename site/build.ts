@@ -16,7 +16,7 @@ const NAV: { title: string; pages: string[] }[] = [
   { title: "Guides", pages: ["schema", "functions", "database", "search", "vector-search", "client", "client-protocol", "swift", "scheduling", "file-storage", "auth", "http-actions"] },
   { title: "Components", pages: ["components", "rate-limiter", "aggregate", "sharded-counter", "work-queue", "components-authoring"] },
   { title: "Operations", pages: ["deployment", "dashboard", "databases", "backups", "cli"] },
-  { title: "Reference", pages: ["convex", "how-it-works", "llm-guide"] },
+  { title: "Reference", pages: ["convex", "benchmarks", "how-it-works", "llm-guide"] },
 ];
 
 type Page = { slug: string; title: string; description: string; markdown: string; html: string; toc: { id: string; text: string; level: number }[] };

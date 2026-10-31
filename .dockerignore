@@ -9,5 +9,4 @@ example
 site
 tests
 docs
-clients
 .env*

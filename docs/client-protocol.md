@@ -6,7 +6,7 @@ description: The /api/sync WebSocket and HTTP API contract that every onebase cl
 # Client protocol
 
 One documented wire contract, one SDK per platform. The JS client (`onebase/browser`) and the
-Swift client (`clients/swift` in the repository) both speak it; this page is everything a new
+[Swift client](https://github.com/abdullah-bl/onebase-swift) both speak it; this page is everything a new
 client needs — an Android one, say — to work with any onebase server.
 
 ## WebSocket: `/api/sync`

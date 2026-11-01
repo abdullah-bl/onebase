@@ -201,10 +201,11 @@ for (const D of DRIVERS) describe(`${D.name}: agent`, () => {
     const long = await thread({ userId: "a" });
     const other = await thread({ userId: "b" });
     await runtime.adminWrite(async (db) => {
-      for (let order = 0; order < 1_100; order++) await db.insert("bot.messages", { threadId: long.threadId, order, role: "user", text: "hi" });
+      // Past one 500-document batch in both messages and deltas, so each path has to continue.
+      for (let order = 0; order < 520; order++) await db.insert("bot.messages", { threadId: long.threadId, order, role: "user", text: "hi" });
       await db.insert("bot.messages", { threadId: other.threadId, order: 0, role: "user", text: "stay" });
       const stream = await db.insert("bot.streams", { threadId: long.threadId, state: "streaming", ordinal: 0, createdAt: Date.now() });
-      for (let ordinal = 0; ordinal < 600; ordinal++) await db.insert("bot.deltas", { streamId: stream, ordinal, text: "x" });
+      for (let ordinal = 0; ordinal < 520; ordinal++) await db.insert("bot.deltas", { streamId: stream, ordinal, text: "x" });
     });
     expect(await runtime.runMutation("admin:deleteThread", { threadId: long.threadId })).toBe(true);
     expect(await q("admin:thread", { threadId: long.threadId })).toBeNull();
@@ -213,9 +214,9 @@ for (const D of DRIVERS) describe(`${D.name}: agent`, () => {
       await runtime.adminWrite(async (db) => void (n = (await db.query(table).collect()).length));
       return n;
     };
-    await until(async () => (await count("bot.messages")) === 1 && (await count("bot.streams")) === 0 && (await count("bot.deltas")) === 0);
+    await until(async () => (await count("bot.messages")) === 1 && (await count("bot.streams")) === 0 && (await count("bot.deltas")) === 0, 25_000);
     expect((await messages(other.threadId)).map((m) => m.text)).toEqual(["stay"]);
-  });
+  }, 30_000); // a thousand inserts take a while on a networked database
 
   test("threads are listed per user and deleting one removes its messages", async () => {
     await runtime.runMutation("admin:init", {});

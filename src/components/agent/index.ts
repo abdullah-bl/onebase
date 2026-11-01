@@ -78,7 +78,7 @@ export function agent<const E extends keyof AgentApi = never>(opts: Config & Mou
       lastMessageAt: v.number(),
     })
       .index("by_status", ["status", "lastMessageAt"])
-      .index("by_user", ["userId", "lastMessageAt"]),
+      .index("by_user", ["userId", "status", "lastMessageAt"]),
     messages: defineTable({
       threadId: v.string(),
       order: v.number(),
@@ -185,9 +185,10 @@ export function agent<const E extends keyof AgentApi = never>(opts: Config & Mou
   const listThreads = query({
     args: { userId: v.optional(v.string()), status: v.optional(v.union(v.literal("active"), v.literal("archived"))), paginationOpts: paginationOptsValidator },
     handler: async (ctx, { userId, status: state, paginationOpts }) => {
+      const status = state ?? "active";
       const page = userId
-        ? await ctx.db.query("threads").withIndex("by_user", (q: any) => q.eq("userId", userId)).paginate(paginationOpts)
-        : await ctx.db.query("threads").withIndex("by_status", (q: any) => q.eq("status", state ?? "active")).paginate(paginationOpts);
+        ? await ctx.db.query("threads").withIndex("by_user", (q: any) => q.eq("userId", userId).eq("status", status)).paginate(paginationOpts)
+        : await ctx.db.query("threads").withIndex("by_status", (q: any) => q.eq("status", status)).paginate(paginationOpts);
       return { ...page, page: page.page.map(threadView) };
     },
   });
@@ -278,7 +279,9 @@ export function agent<const E extends keyof AgentApi = never>(opts: Config & Mou
     args: { threadId: v.string(), limit: v.number() },
     handler: async (ctx, { threadId, limit }): Promise<ChatMessage[]> => {
       const rows = await ctx.db.query("messages").withIndex("by_thread_order", (q: any) => q.eq("threadId", threadId)).order("desc").take(limit);
-      return rows.reverse().map((m: any) => ({ role: m.role, text: m.text ?? null, name: m.name, toolCalls: m.toolCalls, toolResults: m.toolResults }));
+      // A window that opens on tool results has lost the call they answer, and model APIs can reject that.
+      const first = rows.reverse().findIndex((m: any) => m.role !== "tool");
+      return rows.slice(first === -1 ? rows.length : first).map((m: any) => ({ role: m.role, text: m.text ?? null, name: m.name, toolCalls: m.toolCalls, toolResults: m.toolResults }));
     },
   });
 

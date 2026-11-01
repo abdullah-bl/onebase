@@ -19,7 +19,7 @@ export default defineComponents({
 });
 ```
 
-`heartbeatInterval` is how long a session stays counted online after its last heartbeat (default 10s); `heartbeatTimer` adds grace before the scheduled check gives up on it (default 5s). `expose` lets browser clients heartbeat and read rooms directly — anyone can call exposed functions, so only do this if the data is public to your signed-in users. Mount with `auth: true` too if you want the component to see the caller's identity.
+`heartbeatInterval` is how long a session stays counted online after its last heartbeat (default 10s); `heartbeatTimer` adds grace before the scheduled check gives up on it (default 5s); `offlineRetentionMs` is how long an offline session stays in `list` before it's forgotten (default 1 hour). `expose` lets browser clients heartbeat and read rooms directly — anyone can call exposed functions, so only do this if the data is public to your signed-in users. Mount with `auth: true` too if you want the component to see the caller's identity.
 
 ## Use it
 
@@ -29,16 +29,16 @@ api.components.here.heartbeat({ room: "lobby", user: userId, sessionId });
 
 // live:
 useQuery(api.components.here.list, { room: "lobby" });
-// [{ user, sessionId, online, lastActive, disconnectedAt }]
+// [{ id, user, online, lastActive, disconnectedAt }]
 ```
 
-`sessionId` identifies one browser tab or device: the same user in two tabs is two sessions. On page unload (or sign-out), call `disconnect` for an immediate goodbye rather than waiting out the window. When a client just stops heartbeating, the component's scheduled checks take the session offline on their own — a check that finds the session still fresh re-schedules itself until it isn't.
+`sessionId` identifies one browser tab or device: the same user in two tabs is two sessions. Make it random and keep it on that client, because whoever holds it can heartbeat or disconnect the session; `list` returns a separate `id` instead, for React keys and the like. On page unload (or sign-out), call `disconnect` for an immediate goodbye rather than waiting out the window. When a client just stops heartbeating, the component's scheduled checks take the session offline on their own — a check that finds the session still fresh re-schedules itself until it isn't.
 
 ## Functions
 
 | | |
 |---|---|
-| `heartbeat({ room, user, sessionId, interval? })` | Mutation. Records the heartbeat and schedules the offline check. `interval` overrides the mount's, per session. |
+| `heartbeat({ room, user, sessionId, interval? })` | Mutation. Records the heartbeat and schedules the offline check. `interval` overrides the mount's, per session, up to 5 minutes. |
 | `list({ room })` | Live query. The room's sessions, online first, then most recently active. |
 | `disconnect({ sessionId })` | Mutation. Marks one session offline right away. |
 

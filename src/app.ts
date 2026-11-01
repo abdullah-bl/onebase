@@ -17,7 +17,7 @@ import { createAdmin, loadAdminKey } from "./engine/admin";
 import { serveAsset } from "./engine/deployments";
 import { importBundle } from "./deploy";
 
-export const VERSION = "0.1.0";
+export const VERSION = "0.2.0";
 
 export type AppOptions = {
   /** Serve the dashboard at /_admin (default true). */

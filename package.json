@@ -1,6 +1,6 @@
 {
   "name": "onebase",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A lightweight, Convex-style reactive backend on Bun + SQLite that ships as a single binary.",
   "license": "MIT",
   "repository": {

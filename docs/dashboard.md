@@ -5,16 +5,16 @@ description: Browse and edit data, run functions, and watch logs, jobs and files
 
 # Dashboard
 
-Every onebase server includes a dashboard at **`/_admin`**. It's built into the binary (about 60 KB) and updates live.
+Every onebase server includes a dashboard at **`/_admin`**. It's built into the binary (about 100 KB) and updates live. Press **⌘K** (Ctrl+K) anywhere to jump to a page, table or function.
 
 | Page | What you can do |
 |---|---|
-| **Overview** | Live connections and subscriptions, calls and errors, memory, a calls-per-second chart, table sizes, recent errors, and the database/files setup |
-| **Data** | Browse any table, filter (`{"author": "ali"}`) or look up an id, and add, edit or delete documents |
-| **Functions** | Run any function, internal ones included, with JSON arguments (prefilled from its validator), optionally as a signed-in user |
-| **Logs** | The last 1,000 calls, live: duration, source, errors and each call's `console.log` output |
-| **Scheduler** | Pending, failed and finished jobs (run now, cancel) and every cron with its next and last run |
-| **Files** | Uploaded files with previews; delete them |
+| **Overview** | What needs attention (failed jobs and crons, failing or slow functions, overdue jobs, tables outside the schema), calls and p95 latency over the last minute, 15 minutes or hour, per-function health, what runs next, table sizes, and the setup, with a rollback button when a deployment is live |
+| **Data** | Browse any table, filter (`{"author": "ali"}`) or look up an id, add and edit documents, delete or export a selection |
+| **Functions** | Run any function, internal ones included, with JSON arguments (prefilled from its validator), optionally as a signed-in user. Also shows its numbers for the last hour and its latest calls |
+| **Logs** | The last 1,000 calls, live: duration, source, errors and each call's `console.log` output. Filter by function, type, source or text |
+| **Scheduler** | Pending, failed and finished jobs (run now, cancel, retry) and every cron with its next and last run (run now) |
+| **Files** | Uploaded files with previews; upload, copy an id, delete |
 
 ## Signing in
 
@@ -34,7 +34,7 @@ In production the startup output says where the key is:
   dashboard  http://localhost:8090/_admin (admin key: onebase_data/admin.key)
 ```
 
-The browser keeps the key in local storage until you sign out (⎋ at the bottom of the sidebar). Every API call is checked against it with a constant-time comparison.
+The browser keeps the key in local storage until you sign out (the button at the bottom of the sidebar). Every API call is checked against it with a constant-time comparison.
 
 ## Editing data
 
@@ -61,6 +61,19 @@ Tables that have documents but are no longer in `schema.ts` still show up, marke
 The runtime records every call: from clients, HTTP, subscription re-runs, the scheduler, crons and the dashboard. For each one it keeps the duration, the result or error, and any `console.*` output from inside the function, even when calls overlap. Records are kept in memory (the last 1,000), so they cost nothing on disk and reset on restart.
 
 Calls still go to the server's stdout as usual, so your log collector keeps working.
+
+## Metrics
+
+The Overview's numbers come from fixed-size counters, not from the 1,000 records, so they stay accurate on a busy server. They cover the last hour, live in memory, reset on restart, and are per instance.
+
+- **Latency:** percentiles are read from a histogram, so they're accurate to within about 20%. Cached query answers count as calls but not toward latency; the **Cached** column shows their share.
+- **Function rows:** they roll over in 10-minute steps, so "last hour" means the last 50 to 60 minutes.
+
+## Retrying jobs
+
+**Retry** puts a failed job back in the queue, due now. Mutations that failed were rolled back, so running them again is safe. An action may have done part of its work before it failed, and that part happens again.
+
+**Run now** on a cron runs its function once with its arguments. The schedule doesn't change, and neither does the "last run" shown for it.
 
 ## Turning it off
 

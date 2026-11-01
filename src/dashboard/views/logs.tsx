@@ -1,16 +1,18 @@
 /** @jsxImportSource preact */
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { call, on, type CallRecord } from "../api";
-import { Badge, Empty, clockTime, duration, errorText } from "../ui";
+import { Badge, Empty, Icon, clockTime, duration, errorText, rowLink } from "../ui";
 
 const SOURCES = ["client", "http", "subscription", "scheduler", "cron", "function", "dashboard", "auth"];
 
-export function LogsView() {
+/** Routes: logs, logs/errors, logs/all/<function>, logs/errors/<function>. */
+export function LogsView({ scope, fn, go }: { scope?: string; fn?: string; go: (route: string) => void }) {
+  const errorsOnly = scope === "errors";
   const [records, setRecords] = useState<CallRecord[]>([]);
   const [paused, setPaused] = useState(false);
-  const [errorsOnly, setErrorsOnly] = useState(false);
   const [hideSubs, setHideSubs] = useState(false);
   const [type, setType] = useState("");
+  const [source, setSource] = useState("");
   const [search, setSearch] = useState("");
   const [open, setOpen] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -37,11 +39,21 @@ export function LogsView() {
   const shown = useMemo(() => {
     const q = search.trim().toLowerCase();
     return records
-      .filter((r) => (!errorsOnly || !r.ok) && (!hideSubs || r.source !== "subscription") && (!type || r.type === type))
+      .filter((r) => (!errorsOnly || !r.ok) && (!fn || r.name === fn) && (!hideSubs || r.source !== "subscription") && (!type || r.type === type) && (!source || r.source === source))
       .filter((r) => !q || r.name.toLowerCase().includes(q) || r.error?.toLowerCase().includes(q) || r.lines.some((l) => l.text.toLowerCase().includes(q)))
       .slice(-500)
       .reverse();
-  }, [records, errorsOnly, hideSubs, type, search]);
+  }, [records, errorsOnly, fn, hideSubs, type, source, search]);
+
+  const route = (errors: boolean, name?: string) => `logs${errors || name ? `/${errors ? "errors" : "all"}` : ""}${name ? `/${encodeURIComponent(name)}` : ""}`;
+  const narrowed = errorsOnly || fn || hideSubs || type || source || search.trim();
+  const clear = () => {
+    setSearch("");
+    setType("");
+    setSource("");
+    setHideSubs(false);
+    go("logs");
+  };
 
   return (
     <div class="page wide">
@@ -59,16 +71,32 @@ export function LogsView() {
             <option value="action">Actions</option>
             <option value="http">HTTP</option>
           </select>
-          <label class="check"><input type="checkbox" checked={errorsOnly} onChange={(e) => setErrorsOnly((e.target as HTMLInputElement).checked)} /> Errors</label>
+          <select value={source} onChange={(e) => setSource((e.target as HTMLSelectElement).value)} aria-label="Called from">
+            <option value="">All sources</option>
+            {SOURCES.map((s) => <option value={s}>{s}</option>)}
+          </select>
+          <label class="check"><input type="checkbox" checked={errorsOnly} onChange={(e) => go(route((e.target as HTMLInputElement).checked, fn))} /> Errors</label>
           <label class="check"><input type="checkbox" checked={hideSubs} onChange={(e) => setHideSubs((e.target as HTMLInputElement).checked)} /> Hide re-runs</label>
           <button class={`btn ${paused ? "primary" : ""}`} onClick={() => setPaused(!paused)}>
             {paused ? `Resume${buffer.current.length ? ` (${buffer.current.length})` : ""}` : "Pause"}
           </button>
         </div>
       </header>
+      {fn && (
+        <p class="filter-chip">
+          <span>Only <code>{fn}</code></span>
+          <button class="icon tiny" aria-label="Show all functions" title="Show all functions" onClick={() => go(route(errorsOnly))}><Icon name="close" size={13} /></button>
+        </p>
+      )}
       {error && <p class="error-box">{error}</p>}
       {shown.length === 0 ? (
-        <Empty title="No calls yet">Calls show up here as clients use your functions.</Empty>
+        narrowed ? (
+          <Empty title="No matching calls">
+            <button class="btn small" onClick={clear}>Clear filters</button>
+          </Empty>
+        ) : (
+          <Empty title="No calls yet">Calls show up here as clients use your functions.</Empty>
+        )
       ) : (
         <div class="grid-wrap">
           <table class="tbl logs">
@@ -85,7 +113,7 @@ export function LogsView() {
             <tbody>
               {shown.map((r) => (
                 <>
-                  <tr key={r.id} class={`clickable ${r.ok ? "" : "row-err"}`} onClick={() => setOpen(open === r.id ? null : r.id)}>
+                  <tr key={r.id} class={`clickable ${r.ok ? "" : "row-err"}`} aria-expanded={open === r.id} {...rowLink(() => setOpen(open === r.id ? null : r.id))}>
                     <td class="mono nowrap muted">{clockTime(r.at)}</td>
                     <td><code>{r.name}</code>{r.lines.length > 0 && <span class="lines-count" title="console output">{r.lines.length}</span>}</td>
                     <td><Badge kind={r.type} /></td>
@@ -106,6 +134,10 @@ export function LogsView() {
                         ) : (
                           <p class="muted">No console output.</p>
                         )}
+                        <p class="detail-links">
+                          {r.name !== fn && <button class="link" onClick={() => go(route(errorsOnly, r.name))}>Only this function</button>}
+                          {r.type !== "http" && r.name.includes(":") && <button class="link" onClick={() => go(`functions/${encodeURIComponent(r.name)}`)}>Open function</button>}
+                        </p>
                       </td>
                     </tr>
                   )}

@@ -66,13 +66,31 @@ for (const D of DRIVERS) describe(`${D.name}: presence`, () => {
   test("the scheduled check marks a quiet session offline", async () => {
     await runtime.runMutation("admin:heartbeat", { room: "lobby", user: "ada", sessionId: "s1" });
     // 20s of silence: past the 10s window (plus 500ms grace).
+    let at = 0;
     await runtime.adminWrite(async (db) => {
       const row = await db.query("here.presence").withIndex("by_session", (q: any) => q.eq("sessionId", "s1")).unique();
+      at = row!.checkAt as number;
       await db.patch(row!._id, { lastActive: Date.now() - 20_000 });
     });
-    await runtime.runMutation("components/here:checkSession", { sessionId: "s1", interval: 10_000 }, { allowInternal: true, source: "dashboard" });
+    // A check that isn't the live one leaves the session alone.
+    await runtime.runMutation("components/here:checkSession", { sessionId: "s1", at: at - 1 }, { allowInternal: true, source: "dashboard" });
+    expect((await list("lobby"))[0]!.online).toBe(true);
+    await runtime.runMutation("components/here:checkSession", { sessionId: "s1", at }, { allowInternal: true, source: "dashboard" });
     expect((await list("lobby"))[0]!.online).toBe(false);
   });
+
+  test("a session keeps one check however many heartbeats it sends", async () => {
+    const pendingJobs = async () => (await runtime.adminRead((_db, tx) => tx.all("SELECT id FROM _scheduled WHERE state = 'pending'"))).length;
+    // Past the 1.5s window, so checks fire and re-arm while the heartbeats keep coming.
+    for (const end = Date.now() + 4_000; Date.now() < end; await Bun.sleep(100)) {
+      await runtime.runMutation("admin:heartbeat", { room: "lobby", user: "ada", sessionId: "s1", interval: 1000 });
+    }
+    expect((await list("lobby"))[0]!.online).toBe(true);
+    expect(await pendingJobs()).toBe(1);
+    // It still goes offline once they stop.
+    await until(async () => (await list("lobby"))[0]!.online === false);
+    expect(await pendingJobs()).toBe(0);
+  }, 15_000);
 
   test("a fresh session survives its check and goes offline once heartbeats stop", async () => {
     await runtime.runMutation("admin:heartbeat", { room: "lobby", user: "ada", sessionId: "s1", interval: 1000 });

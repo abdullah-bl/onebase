@@ -28,6 +28,10 @@ const schema = defineSchema({
     online: v.boolean(),
     lastActive: v.number(),
     disconnectedAt: v.optional(v.number()),
+    /** The heartbeat interval this session last asked for. */
+    interval: v.number(),
+    /** When the session's one live check is due; a check due at any other time does nothing. */
+    checkAt: v.optional(v.number()),
   })
     .index("by_room", ["room", "online", "lastActive"])
     .index("by_session", ["sessionId"]),
@@ -38,33 +42,48 @@ const { query, mutation, internalMutation } = componentServer<DataModelFromSchem
 const intervalFor = (config: Config, override?: number) => Math.max(1_000, override ?? config.heartbeatInterval ?? 10_000);
 const staleAfter = (config: Config, interval: number) => interval + (config.heartbeatTimer ?? 5_000);
 
-/** Records a heartbeat and schedules the check that marks the session offline if it goes quiet. */
+/** Makes this the session's one live check, due `delayMs` from now. */
+async function scheduleCheck(ctx: { db: any; scheduler: any }, id: unknown, sessionId: string, delayMs: number) {
+  const at = Date.now() + delayMs;
+  await ctx.scheduler.runAfter(delayMs, checkSession, { sessionId, at });
+  await ctx.db.patch(id, { checkAt: at });
+}
+
+/** Records a heartbeat, making sure a check is due to mark the session offline if it goes quiet. */
 const heartbeat = mutation({
   args: { room: v.string(), user: v.string(), sessionId: v.string(), interval: v.optional(v.number()) },
   handler: async (ctx, args) => {
     const now = Date.now();
-    const row = await ctx.db.query("presence").withIndex("by_session", (q: any) => q.eq("sessionId", args.sessionId)).unique();
-    if (row) await ctx.db.patch(row._id, { room: args.room, user: args.user, online: true, lastActive: now, disconnectedAt: undefined });
-    else await ctx.db.insert("presence", { room: args.room, user: args.user, sessionId: args.sessionId, online: true, lastActive: now });
     const interval = intervalFor(ctx.config, args.interval);
-    await ctx.scheduler.runAfter(staleAfter(ctx.config, interval), checkSession, { sessionId: args.sessionId, interval });
+    const window = staleAfter(ctx.config, interval);
+    const row = await ctx.db.query("presence").withIndex("by_session", (q: any) => q.eq("sessionId", args.sessionId)).unique();
+    const id = row?._id ?? (await ctx.db.insert("presence", { room: args.room, user: args.user, sessionId: args.sessionId, online: true, lastActive: now, interval }));
+    if (row) await ctx.db.patch(row._id, { room: args.room, user: args.user, online: true, lastActive: now, disconnectedAt: undefined, interval });
+    // A live check re-arms itself, so it covers this heartbeat too. Schedule a new one only if
+    // there's none, the last one is overdue, or a shorter interval needs an earlier one.
+    const due = row?.checkAt;
+    if (due === undefined || due <= now || due > now + window) await scheduleCheck(ctx, id, args.sessionId, window);
     return null;
   },
 });
 
 /** Marks the session offline if it hasn't heartbeat within its window; otherwise checks again when it would go stale. */
 const checkSession = internalMutation({
-  args: { sessionId: v.string(), interval: v.number() },
-  handler: async (ctx, { sessionId, interval }) => {
+  args: { sessionId: v.string(), at: v.number() },
+  handler: async (ctx, { sessionId, at }) => {
     const row = await ctx.db.query("presence").withIndex("by_session", (q: any) => q.eq("sessionId", sessionId)).unique();
-    if (!row || !row.online) return null;
-    const window = staleAfter(ctx.config, interval);
-    const quietFor = Date.now() - row.lastActive;
-    if (quietFor > window) {
-      await ctx.db.patch(row._id, { online: false, disconnectedAt: Date.now() });
+    if (!row || row.checkAt !== at) return null; // a newer check took over
+    if (!row.online) {
+      await ctx.db.patch(row._id, { checkAt: undefined });
       return null;
     }
-    await ctx.scheduler.runAfter(window - quietFor, checkSession, { sessionId, interval });
+    const window = staleAfter(ctx.config, row.interval);
+    const quietFor = Date.now() - row.lastActive;
+    if (quietFor > window) {
+      await ctx.db.patch(row._id, { online: false, disconnectedAt: Date.now(), checkAt: undefined });
+      return null;
+    }
+    await scheduleCheck(ctx, row._id, sessionId, window - quietFor);
     return null;
   },
 });

@@ -142,6 +142,7 @@ Renaming a mount is like removing one and adding another: the new name starts wi
 | [Sharded counter](./sharded-counter.md) | `onebase/components/sharded-counter` | Counters that many writers can bump at once |
 | [Work queue](./work-queue.md) | `onebase/components/work-queue` | Background actions and mutations with limited parallelism, retries and completion callbacks |
 | [Migrations](./migrations.md) | `onebase/components/migrations` | Batched data migrations with progress tracking that keep going across restarts |
+| [Workflow](./workflow.md) | `onebase/components/workflow` | Durable multi-step workflows: journaled steps, sleeps, out-of-band actions, retries |
 
 To write your own, see [Writing components](./components-authoring.md).
 

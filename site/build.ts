@@ -14,7 +14,7 @@ const VERSION = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")).ver
 const NAV: { title: string; pages: string[] }[] = [
   { title: "Getting started", pages: ["index", "getting-started"] },
   { title: "Guides", pages: ["schema", "functions", "database", "search", "vector-search", "client", "client-protocol", "swift", "scheduling", "file-storage", "auth", "http-actions"] },
-  { title: "Components", pages: ["components", "rate-limiter", "aggregate", "sharded-counter", "work-queue", "migrations", "workflow", "rag", "agent", "components-authoring"] },
+  { title: "Components", pages: ["components", "rate-limiter", "aggregate", "sharded-counter", "work-queue", "migrations", "workflow", "rag", "agent", "presence", "action-cache", "components-authoring"] },
   { title: "Operations", pages: ["deployment", "dashboard", "databases", "backups", "cli"] },
   { title: "Reference", pages: ["convex", "benchmarks", "how-it-works", "llm-guide"] },
 ];

@@ -1251,10 +1251,12 @@ export class Runtime {
   }
 
   /**
-   * Function references in a component call's arguments (`{ fn: internal.emails.send }`) become
-   * signed handles, so the component can call them back or schedule them.
+   * Function references in a component call's arguments (`{ fn: internal.emails.send }`, however
+   * deeply nested) become signed handles, so the component can call them back or schedule them.
    */
-  private referencesToHandles(args: unknown): unknown {
+  private referencesToHandles(args: unknown, depth = 0): unknown {
+    if (depth > 8 || (typeof args !== "object" && !Array.isArray(args))) return args;
+    if (Array.isArray(args)) return args.map((value) => this.referencesToHandles(value, depth + 1));
     if (!isPlainObject(args)) return args;
     const out: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(args)) {
@@ -1262,7 +1264,7 @@ export class Runtime {
       try {
         path = typeof value === "object" && value !== null ? (value as any)[functionPathSymbol] : undefined;
       } catch {}
-      out[key] = typeof path === "string" ? this.createHandle(value, null) : value;
+      out[key] = typeof path === "string" ? this.createHandle(value, null) : this.referencesToHandles(value, depth + 1);
     }
     return out;
   }

@@ -41,7 +41,7 @@ The binary ends up in `dist/onebase`.
 
 ## Run the example
 
-The repository includes a chat app with channels, likes, image uploads, self-destructing messages and a cleanup cron.
+The repository includes several self-contained apps under [`examples/`](../examples). The chat app has channels, likes, image uploads, self-destructing messages and a cleanup cron; the others demo auth, components, vector search, background jobs and offline clients.
 
 ```bash
 bun run example

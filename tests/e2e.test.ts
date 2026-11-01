@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { startApp } from "../src/app";
 import { OnebaseClient, OnebaseHttpClient, ConvexError } from "../src/client/index";
 import { loadProject } from "../src/project";
-import { api } from "../example/onebase/_generated/api";
+import { api } from "../examples/chat/onebase/_generated/api";
 
 let app: Awaited<ReturnType<typeof startApp>>;
 let dataDir: string;
@@ -13,7 +13,7 @@ let url: string;
 
 beforeAll(async () => {
   dataDir = mkdtempSync(join(tmpdir(), "onebase-e2e-"));
-  const project = await loadProject(join(import.meta.dir, "../example/onebase"));
+  const project = await loadProject(join(import.meta.dir, "../examples/chat/onebase"));
   const { schema, modules, http, crons, authConfig, components } = project;
   app = await startApp({ schema, modules, http, crons, auth: authConfig, components, dataDir, port: 0, hostname: "127.0.0.1", dev: false, quiet: true });
   url = `http://127.0.0.1:${app.server.port}`;

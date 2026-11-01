@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>onebase notes</title>
+    <style>
+      :root { color-scheme: light dark; --bg: #fafafa; --fg: #1a1a1a; --muted: #777; --line: #e3e3e3; --accent: #3b5bdb; --card: #fff; --danger: #e03131; }
+      @media (prefers-color-scheme: dark) { :root { --bg: #141414; --fg: #eee; --muted: #999; --line: #2c2c2c; --accent: #748ffc; --card: #1d1d1d; } }
+      * { box-sizing: border-box; }
+      body { margin: 0; font: 15px/1.45 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+      main { max-width: 560px; margin: 0 auto; padding: 16px; }
+      header { display: flex; gap: 8px; align-items: center; justify-content: space-between; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+      h1 { font-size: 17px; margin: 0; }
+      button { font: inherit; cursor: pointer; }
+      #who { font-size: 13px; color: var(--muted); }
+      #who button { border: 0; background: none; color: var(--accent); padding: 0; margin-left: 6px; }
+      #auth { display: flex; flex-direction: column; gap: 10px; margin-top: 48px; }
+      #auth input { padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--fg); font: inherit; }
+      #auth button { padding: 8px 14px; border: 0; border-radius: 8px; background: var(--accent); color: #fff; }
+      #auth .switch { border: 0; background: none; color: var(--accent); align-self: center; }
+      #bar { display: flex; gap: 8px; padding: 12px 0; }
+      #search { flex: 1; min-width: 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--fg); font: inherit; }
+      ul { list-style: none; margin: 0; padding: 0; }
+      li { padding: 10px 12px; margin: 8px 0; background: var(--card); border: 1px solid var(--line); border-radius: 8px; }
+      li.pinned { border-color: var(--accent); }
+      li .title { font-weight: 600; }
+      li .body { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 2px; }
+      li .row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+      li .actions { display: flex; gap: 10px; margin-top: 6px; }
+      li .actions button { border: 0; background: none; color: var(--muted); padding: 0; font-size: 13px; }
+      li .actions button:hover { color: var(--fg); }
+      #more { display: block; margin: 12px auto; border: 1px solid var(--line); background: var(--card); color: var(--fg); border-radius: 999px; padding: 4px 16px; }
+      form#add { display: flex; flex-direction: column; gap: 8px; padding: 12px 0; border-top: 1px solid var(--line); margin-top: 12px; }
+      form#add input, form#add textarea { padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--fg); font: inherit; }
+      form#add textarea { min-height: 64px; resize: vertical; }
+      form#add button { align-self: flex-end; padding: 8px 14px; border: 0; border-radius: 8px; background: var(--accent); color: #fff; }
+      #error { color: var(--danger); font-size: 13px; min-height: 1.2em; }
+      .hint { color: var(--muted); font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>onebase notes</h1>
+        <span id="who"></span>
+      </header>
+      <div id="auth" hidden>
+        <h2 id="authTitle">Sign in</h2>
+        <form id="authForm">
+          <input id="email" type="email" placeholder="you@example.com" required />
+          <input id="password" type="password" placeholder="Password (8+ characters)" minlength="8" required />
+          <button id="authSubmit">Sign in</button>
+          <button type="button" id="authSwitch" class="switch">Need an account? Sign up</button>
+        </form>
+        <p class="hint">Accounts are stored in this onebase app's own database — no external service.</p>
+      </div>
+      <div id="app" hidden>
+        <div id="bar">
+          <input id="search" type="search" placeholder="Search your notes…" autocomplete="off" />
+        </div>
+        <div id="error"></div>
+        <ul id="notes"></ul>
+        <button id="more" hidden>Load more</button>
+        <form id="add">
+          <input id="title" placeholder="Title" autocomplete="off" />
+          <textarea id="body" placeholder="Write a note…" required></textarea>
+          <button>Add note</button>
+        </form>
+      </div>
+    </main>
+    <script type="module">
+      import { OnebaseClient, anyApi as api } from "/_onebase/client.js";
+
+      const client = new OnebaseClient(undefined, { offline: true });
+      const $ = (id) => document.getElementById(id);
+      const error = (msg) => ($("error").textContent = msg ?? "");
+
+      let flow = "signIn";
+      let stopNotes = () => {};
+      let pageSize = 5;
+      let searching = false;
+
+      function setFlow(next) {
+        flow = next;
+        $("authTitle").textContent = flow === "signIn" ? "Sign in" : "Sign up";
+        $("authSubmit").textContent = flow === "signIn" ? "Sign in" : "Sign up";
+        $("authSwitch").textContent = flow === "signIn" ? "Need an account? Sign up" : "Have an account? Sign in";
+      }
+      setFlow(flow);
+      $("authSwitch").onclick = () => setFlow(flow === "signIn" ? "signUp" : "signIn");
+
+      $("authForm").onsubmit = async (e) => {
+        e.preventDefault();
+        error();
+        try {
+          await client.signIn("password", { flow, email: $("email").value, password: $("password").value });
+          if (flow === "signUp") {
+            // A new account signs in right away; the app re-renders via onAuthChange.
+            $("password").value = "";
+          }
+        } catch (err) {
+          error(err.message);
+        }
+      };
+
+      async function signOut() {
+        stopNotes();
+        await client.signOut();
+      }
+
+      // Every note starts unpinned; pinning is an edit with one field.
+      function renderAuth() {
+        const auth = client.authState;
+        const signedIn = !auth.isLoading && auth.isAuthenticated;
+        $("auth").hidden = signedIn;
+        $("app").hidden = !signedIn;
+        if (signedIn) subscribe();
+      }
+      client.onAuthChange(renderAuth);
+      renderAuth();
+
+      client.onAuthChange(async () => {
+        if (client.authState.isAuthenticated) {
+          const me = await client.query(api.notes.me, {});
+          $("who").innerHTML = "";
+          $("who").append(me?.name || me?.email || "signed in");
+          const out = document.createElement("button");
+          out.textContent = "Sign out";
+          out.onclick = signOut;
+          $("who").append(out);
+        } else {
+          $("who").textContent = "";
+        }
+      });
+
+      function subscribe() {
+        if (!client.authState.isAuthenticated) return;
+        const text = $("search").value.trim();
+        searching = text.length > 0;
+        error();
+        stopNotes();
+        stopNotes = searching
+          ? client.onUpdate(api.notes.search, { text }, render, (e) => error(e.message))
+          : client.onUpdate(
+              api.notes.page,
+              { paginationOpts: { numItems: pageSize, cursor: null } },
+              render,
+              (e) => error(e.message),
+            );
+      }
+      let searchTimer;
+      $("search").oninput = () => {
+        clearTimeout(searchTimer);
+        searchTimer = setTimeout(subscribe, 150);
+      };
+
+      function render(result) {
+        const notes = searching ? result : result.page;
+        $("more").hidden = searching || result.isDone;
+        $("notes").replaceChildren(...notes.map((n) => noteEl(n)));
+      }
+
+      function noteEl(note) {
+        const li = document.createElement("li");
+        if (note.pinned) li.className = "pinned";
+        const title = Object.assign(document.createElement("div"), { className: "title", textContent: note.title });
+        const body = Object.assign(document.createElement("div"), { className: "body", textContent: note.body });
+        const actions = document.createElement("div");
+        actions.className = "actions";
+        const pin = document.createElement("button");
+        pin.textContent = note.pinned ? "Unpin" : "Pin";
+        pin.onclick = () => client.mutation(api.notes.edit, { id: note._id, pinned: !note.pinned });
+        const del = document.createElement("button");
+        del.textContent = "Delete";
+        del.onclick = () => client.mutation(api.notes.remove, { id: note._id });
+        actions.append(pin, del);
+        li.append(title, body, actions);
+        return li;
+      }
+
+      // The page query is live: growing numItems re-runs it with more results.
+      $("more").onclick = () => {
+        pageSize += 5;
+        subscribe();
+      };
+
+      $("add").onsubmit = async (e) => {
+        e.preventDefault();
+        error();
+        try {
+          await client.mutation(api.notes.add, { title: $("title").value, body: $("body").value });
+          $("title").value = "";
+          $("body").value = "";
+        } catch (err) {
+          error(err.message);
+        }
+      };
+    </script>
+  </body>
+</html>

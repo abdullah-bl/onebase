@@ -5,7 +5,7 @@ node_modules
 dist
 onebase_data
 benchmarks
-example
+examples
 site
 tests
 docs

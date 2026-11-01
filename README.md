@@ -16,7 +16,7 @@ A lightweight, Convex-style reactive backend: TypeScript functions, a typed docu
 
 ```bash
 bun install
-bun run example        # runs example/ (a chat app) in dev mode on http://localhost:8090
+bun run example        # runs examples/chat (a chat app) in dev mode on http://localhost:8090
 ```
 
 In your own project:
@@ -36,6 +36,19 @@ onebase deploy       # push your code to a running server, no restart
 ```
 
 **Website and docs:** https://abdullah-bl.github.io/onebase/ (source in [docs/](docs/)). The [LLM guide](docs/llm-guide.md) is a one-page summary of the API to give an AI assistant.
+
+## Examples
+
+Each folder in [`examples/`](examples) is a self-contained app: `cd examples/<name> && bun ../../src/cli.ts dev`, then open the printed URL. `bun run example` starts the chat app.
+
+| Example | What it shows |
+|---|---|
+| [`chat`](examples/chat) | The full stack in one app: schema with indexes, live queries, optimistic likes, full-text search, pagination, image uploads, self-destructing messages, cron, rate limiter, aggregate component and an HTTP webhook |
+| [`notes-auth`](examples/notes-auth) | Built-in password sign-in, per-user data, protected queries, user-scoped search and pagination |
+| [`counters`](examples/counters) | Components driving a live poll: aggregate ranks votes, sharded counter totals them, rate limiter caps voting |
+| [`vector-search`](examples/vector-search) | `vectorIndex` and `ctx.vectorSearch` for "find similar notes", with locally computed embeddings and filtered search |
+| [`jobs`](examples/jobs) | Background work: the work-queue component with retries and completion callbacks, the scheduler, cron jobs and HTTP routes |
+| [`offline-todo`](examples/offline-todo) | The client's offline mode: cached results, optimistic updates, mutations queued while disconnected and replayed on reconnect |
 
 ## Compared to Convex
 

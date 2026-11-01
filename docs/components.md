@@ -145,6 +145,8 @@ Renaming a mount is like removing one and adding another: the new name starts wi
 | [Workflow](./workflow.md) | `onebase/components/workflow` | Durable multi-step workflows: journaled steps, sleeps, out-of-band actions, retries |
 | [RAG](./rag.md) | `onebase/components/rag` | Chunked, embedded documents searched by vector, text or both |
 | [Agent](./agent.md) | `onebase/components/agent` | AI agents with threads, tool calling, usage and streams, over any provider |
+| [Presence](./presence.md) | `onebase/components/presence` | Who's online per room, with heartbeats and live lists |
+| [Action cache](./action-cache.md) | `onebase/components/action-cache` | A TTL cache for expensive actions, with deduped concurrent runs |
 
 To write your own, see [Writing components](./components-authoring.md).
 

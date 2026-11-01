@@ -243,8 +243,23 @@ describe("sqlite group commit", () => {
       const run = driver.writer.run.bind(driver.writer);
       (driver.writer as any).run = (sql: string) => (sql === "COMMIT" && commits++, run(sql));
 
+      // Written from this thread with no await between them, so all have arrived when the event
+      // loop next looks. fetch() sends from its own thread, and its requests can land further
+      // apart than a commit takes, leaving nothing for a group to wait for however well it works.
       const n = 200;
-      await Promise.all(Array.from({ length: n }, (_, x) => fetch(server.url, { method: "POST", body: JSON.stringify({ x }) })));
+      const answers: Promise<string>[] = [];
+      const sockets = [];
+      for (let x = 0; x < n; x++) { // one at a time: the listen backlog can be smaller than n
+        const { promise, resolve } = Promise.withResolvers<string>();
+        answers.push(promise);
+        sockets.push(await Bun.connect({ hostname: "127.0.0.1", port: server.port!, socket: { data: (_, data) => resolve(data.toString()) } }));
+      }
+      sockets.forEach((socket, x) => {
+        const body = JSON.stringify({ x });
+        socket.write(`POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: ${body.length}\r\n\r\n${body}`);
+      });
+      for (const answer of await Promise.all(answers)) expect(answer).toStartWith("HTTP/1.1 200");
+      for (const socket of sockets) socket.end();
       expect(await driver.read((tx) => tx.get("SELECT COUNT(*) AS n FROM t"))).toEqual({ n });
       expect(commits).toBeLessThan(n / 2);
     } finally {

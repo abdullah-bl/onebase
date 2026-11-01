@@ -1,7 +1,7 @@
 /** @jsxImportSource preact */
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { call, on } from "../api";
-import { Empty, ago, errorText, fullTime, preview, sample, toast, typeText } from "../ui";
+import { Empty, Icon, ago, errorText, fullTime, preview, sample, throttle, toast, typeText } from "../ui";
 
 type Table = {
   name: string;
@@ -82,7 +82,7 @@ function Editor({
           <h3>{isNew ? `New ${table.name} document` : <code>{doc._id}</code>}</h3>
           {!isNew && <p class="muted" title={fullTime(doc._creationTime)}>created {ago(doc._creationTime)}</p>}
         </div>
-        <button class="icon" onClick={onClose} aria-label="Close">✕</button>
+        <button class="icon" onClick={onClose} aria-label="Close"><Icon name="close" /></button>
       </div>
       {table.validator && <p class="hint"><code>{typeText(table.validator)}</code></p>}
       <textarea
@@ -130,6 +130,7 @@ export function DataView({ table: selected, go }: { table?: string; go: (route: 
   const [error, setError] = useState<string | null>(null);
   const [editing, setEditing] = useState<Doc | "new" | null>(null);
   const [flash, setFlash] = useState(false);
+  const [picked, setPicked] = useState<Set<string>>(new Set());
   const loaded = useRef(PAGE);
 
   const table = tables?.find((t) => t.name === selected) ?? null;
@@ -163,6 +164,7 @@ export function DataView({ table: selected, go }: { table?: string; go: (route: 
   useEffect(() => {
     loaded.current = PAGE;
     setRows([]);
+    setPicked(new Set());
     setEditing(null);
     void load();
   }, [selected, order, filter]);
@@ -170,18 +172,24 @@ export function DataView({ table: selected, go }: { table?: string; go: (route: 
   // Refresh when this table changes, whoever changed it.
   const loadRef = useRef(load);
   loadRef.current = load;
-  useEffect(
-    () =>
-      on("commit", ({ tables: changed }) => {
-        void loadTables();
-        if (selected && changed.includes(selected)) {
-          void loadRef.current();
-          setFlash(true);
-          setTimeout(() => setFlash(false), 700);
-        }
-      }),
-    [selected],
-  );
+  useEffect(() => {
+    // On a busy server this keeps one open tab from running a scan per commit.
+    const refreshTables = throttle(() => void loadTables(), 5000);
+    const refreshRows = throttle(() => {
+      void loadRef.current();
+      setFlash(true);
+      setTimeout(() => setFlash(false), 700);
+    }, 500);
+    const off = on("commit", ({ tables: changed }) => {
+      refreshTables();
+      if (selected && changed.includes(selected)) refreshRows();
+    });
+    return () => {
+      off();
+      refreshTables.cancel();
+      refreshRows.cancel();
+    };
+  }, [selected]);
 
   useEffect(() => {
     if (!selected && tables?.length) go(`data/${tables[0]!.name}`);
@@ -192,6 +200,49 @@ export function DataView({ table: selected, go }: { table?: string; go: (route: 
     for (const r of rows.slice(0, 50)) for (const k of Object.keys(r)) if (!k.startsWith("_")) keys.add(k);
     return [...keys].slice(0, 10);
   }, [rows, table]);
+
+  // Ids that have left the table (or the loaded rows) don't count as selected.
+  const pickedRows = rows.filter((r) => picked.has(r._id));
+  const allPicked = rows.length > 0 && pickedRows.length === rows.length;
+
+  const togglePick = (id: string) => {
+    const next = new Set(picked);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    setPicked(next);
+  };
+
+  const removePicked = async () => {
+    const ids = pickedRows.map((r) => r._id);
+    if (!confirm(`Delete ${ids.length.toLocaleString()} ${ids.length === 1 ? "document" : "documents"}? This can't be undone.`)) return;
+    try {
+      await call("delete", { ids });
+      toast(ids.length === 1 ? "Deleted" : `Deleted ${ids.length.toLocaleString()} documents`);
+      setPicked(new Set());
+      void load();
+      void loadTables();
+    } catch (e) {
+      setError(errorText(e));
+    }
+  };
+
+  /** Saves what's selected, or everything loaded, as a JSON file. */
+  const exportRows = () => {
+    const docs = pickedRows.length ? pickedRows : rows;
+    const url = URL.createObjectURL(new Blob([JSON.stringify(docs, null, 2)], { type: "application/json" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${selected}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const clearFilter = () => {
+    setFilterText("");
+    setFilter(null);
+    setError(null);
+    if (!filter) void loadRef.current();
+  };
 
   const clearTable = async (t: Table) => {
     if (!confirm(`Delete all ${t.count.toLocaleString()} documents in ${t.name}? This can't be undone.`)) return;
@@ -223,7 +274,7 @@ export function DataView({ table: selected, go }: { table?: string; go: (route: 
     <div class="data-layout">
       <nav class="table-list" aria-label="Tables">
         <p class="list-title">Tables</p>
-        {tables === null && <p class="muted pad">Loading…</p>}
+        {tables === null && <div class="skeleton" style="height:120px" />}
         {tables?.length === 0 && <p class="muted pad">No tables yet.</p>}
         {groupByComponent(tables ?? []).map(([component, list]) => (
           <>
@@ -266,9 +317,16 @@ export function DataView({ table: selected, go }: { table?: string; go: (route: 
                     spellcheck={false}
                   />
                 </form>
+                {filterText && <button class="btn" onClick={clearFilter}>Clear</button>}
                 <button class="btn" onClick={() => setOrder(order === "desc" ? "asc" : "desc")} title="Order by creation time">
                   {order === "desc" ? "Newest first" : "Oldest first"}
                 </button>
+                <button class="btn" disabled={!rows.length} onClick={exportRows} title="Saves the selected documents, or every loaded one, as JSON">
+                  <Icon name="download" size={14} /> Export{pickedRows.length ? ` ${pickedRows.length.toLocaleString()}` : ""}
+                </button>
+                {pickedRows.length > 0 && (
+                  <button class="btn danger" onClick={() => void removePicked()}>Delete {pickedRows.length.toLocaleString()}</button>
+                )}
                 {table.inSchema && <button class="btn primary" onClick={() => setEditing("new")}>Add document</button>}
                 {!table.inSchema && table.count > 0 && (
                   <button class="btn danger" onClick={() => void clearTable(table)}>
@@ -279,12 +337,17 @@ export function DataView({ table: selected, go }: { table?: string; go: (route: 
             </header>
             {error && <p class="error-box">{error}</p>}
             {rows.length === 0 && !error ? (
-              <Empty title={filter || filterText ? "No matching documents" : "No documents"} />
+              <Empty title={filter || filterText ? "No matching documents" : "No documents"}>
+                {filter || filterText ? <button class="btn small" onClick={clearFilter}>Clear filter</button> : table.inSchema ? "Add one above, or write one from a function." : null}
+              </Empty>
             ) : (
               <div class="grid-wrap">
                 <table class="tbl grid">
                   <thead>
                     <tr>
+                      <th class="pick">
+                        <input type="checkbox" aria-label="Select all loaded documents" checked={allPicked} onChange={() => setPicked(allPicked ? new Set() : new Set(rows.map((r) => r._id)))} />
+                      </th>
                       <th>_id</th>
                       {columns.map((c) => <th>{c}</th>)}
                       <th>_creationTime</th>
@@ -293,6 +356,9 @@ export function DataView({ table: selected, go }: { table?: string; go: (route: 
                   <tbody>
                     {rows.map((r) => (
                       <tr key={r._id} class={`clickable ${editing !== "new" && editing?._id === r._id ? "selected" : ""}`} onClick={() => setEditing(r)}>
+                        <td class="pick" onClick={(e) => e.stopPropagation()}>
+                          <input type="checkbox" aria-label={`Select ${r._id}`} checked={picked.has(r._id)} onChange={() => togglePick(r._id)} />
+                        </td>
                         <td><code class="id">{r._id}</code></td>
                         {columns.map((c) => (
                           <td class={typeof r[c] === "string" ? "" : "mono"}>{r[c] === undefined ? <span class="muted">–</span> : preview(r[c])}</td>

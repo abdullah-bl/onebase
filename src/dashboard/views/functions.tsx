@@ -1,10 +1,60 @@
 /** @jsxImportSource preact */
 import { useEffect, useMemo, useState } from "preact/hooks";
-import { call } from "../api";
-import { Badge, Empty, JsonView, duration, errorText, sample, typeText } from "../ui";
+import { call, on, type CallRecord } from "../api";
+import { Badge, Empty, Icon, JsonView, ago, compact, duration, errorText, percent, sample, typeText, useLive } from "../ui";
 
 type Fn = { name: string; type: "query" | "mutation" | "action"; visibility: "public" | "internal"; args: any; returns: any };
 type Result = { ok: boolean; value?: unknown; error?: string; ms: number; at: number };
+
+const RECENT = 8;
+
+/** How this function has been doing: last hour's numbers and its latest calls. */
+function FunctionHealth({ name, go }: { name: string; go: (route: string) => void }) {
+  const { metrics } = useLive();
+  const [calls, setCalls] = useState<CallRecord[]>([]);
+  const m = metrics?.functions.find((f) => f.name === name);
+
+  useEffect(() => {
+    setCalls([]);
+    call<CallRecord[]>("calls", { limit: 1000 })
+      .then((list) => setCalls(list.filter((r) => r.name === name).slice(-RECENT)))
+      .catch(() => {});
+    return on("call", (r) => {
+      if (r.name === name) setCalls((list) => [...list.slice(-(RECENT - 1)), r]);
+    });
+  }, [name]);
+
+  return (
+    <section class="fn-health">
+      <div class="section-head">
+        <h2 class="section-title">Last hour</h2>
+        <button class="link" onClick={() => go(`logs/all/${encodeURIComponent(name)}`)}>All calls <Icon name="arrow" size={13} /></button>
+      </div>
+      {!m ? (
+        <p class="muted hint">Not called in the last hour.</p>
+      ) : (
+        <div class="figures small">
+          <div class="figure"><span>Calls</span><b>{compact(m.calls)}</b></div>
+          <div class="figure"><span>Errors</span><b class={m.errors ? "err" : ""}>{percent(m.errors, m.calls)}</b></div>
+          <div class="figure"><span>Cached</span><b>{percent(m.cached, m.calls)}</b></div>
+          <div class="figure"><span>p50</span><b>{m.p50 === null ? "–" : duration(m.p50)}</b></div>
+          <div class="figure"><span>p95</span><b>{m.p95 === null ? "–" : duration(m.p95)}</b></div>
+        </div>
+      )}
+      {calls.length > 0 && (
+        <ul class="rows compact">
+          {[...calls].reverse().map((r) => (
+            <li key={r.id} class="row-line">
+              <span class="row-when">{ago(r.at)}</span>
+              <span class={r.ok ? "muted" : "err"}>{r.ok ? "ok" : r.error}</span>
+              <span class="muted nowrap">{r.source} · {duration(r.ms)}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
 
 export function FunctionsView({ name: selected, go }: { name?: string; go: (route: string) => void }) {
   const [fns, setFns] = useState<Fn[] | null>(null);
@@ -76,7 +126,7 @@ export function FunctionsView({ name: selected, go }: { name?: string; go: (rout
             {list.map((f) => (
               <a href={`#/functions/${encodeURIComponent(f.name)}`} aria-current={f.name === selected ? "page" : undefined}>
                 <span>{f.name.split(":")[1]}</span>
-                <small class={`t-${f.type}`}>{f.type[0]!.toUpperCase()}</small>
+                <small title={f.type}>{f.type[0]!.toUpperCase()}</small>
               </a>
             ))}
           </div>
@@ -128,12 +178,14 @@ export function FunctionsView({ name: selected, go }: { name?: string; go: (rout
             {result && (
               <div class={`result ${result.ok ? "ok" : "fail"}`}>
                 <div class="result-head">
-                  <span>{result.ok ? "✓ Success" : "✗ Error"}</span>
+                  <span class="result-state"><Icon name={result.ok ? "check" : "critical"} size={14} /> {result.ok ? "Success" : "Error"}</span>
                   <span class="muted">{duration(result.ms)}</span>
                 </div>
                 {result.ok ? <JsonView value={result.value} /> : <pre class="json err">{result.error}</pre>}
               </div>
             )}
+
+            <FunctionHealth name={fn.name} go={go} />
           </div>
         )}
       </section>

@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startApp } from "../src/app";
+import { CallLog } from "../src/engine/calllog";
 import { SubscriptionManager } from "../src/engine/sync";
 import { cronJobs, defineSchema, defineTable, internalMutation, mutation, query } from "../src/server";
 import { v } from "../src/values";
@@ -10,6 +11,8 @@ import { v } from "../src/values";
 const schema = defineSchema({
   notes: defineTable({ text: v.string(), done: v.boolean() }),
 });
+
+let flakyWorks = false;
 
 const modules = {
   notes: {
@@ -24,6 +27,14 @@ const modules = {
     whoami: query({ args: {}, handler: async (ctx) => (await ctx.auth.getUserIdentity())?.subject ?? null }),
     secret: internalMutation({ args: {}, handler: async () => "internal ok" }),
     later: mutation({ args: {}, handler: (ctx) => ctx.scheduler.runAfter(60_000, "notes:secret", {}) }),
+    flaky: internalMutation({
+      args: {},
+      handler: async () => {
+        if (!flakyWorks) throw new Error("flaky failed");
+        return "fine";
+      },
+    }),
+    flakyLater: mutation({ args: {}, handler: (ctx) => ctx.scheduler.runAfter(0, "notes:flaky", {}) }),
   },
 };
 
@@ -153,6 +164,55 @@ describe("dashboard admin API", () => {
     expect(cron.nextRun).toBeGreaterThan(Date.now());
   });
 
+  test("reports failed jobs and retries them", async () => {
+    const until = async (check: () => Promise<boolean>) => {
+      for (let i = 0; i < 100 && !(await check()); i++) await Bun.sleep(10);
+    };
+    const failedCount = async () => (await ok("scheduler")).jobs.failed ?? 0;
+
+    await app.runtime.runMutation("notes:flakyLater", {});
+    await app.runtime.runMutation("notes:flakyLater", {});
+    await until(async () => (await failedCount()) === 2);
+    const summary = await ok("scheduler");
+    expect(summary.jobs.failed).toBe(2);
+    expect(summary.lastFailed).toMatchObject({ fn: "notes:flaky", error: "flaky failed" });
+    expect(summary.crons[0]).toMatchObject({ name: "nightly" });
+
+    const [first, second] = await ok("jobs", { state: "failed" });
+    expect(await ok("retryJob", { id: first.id })).toEqual({ retried: 1 });
+    await until(async () => (await failedCount()) === 2 && !(await ok("jobs", { state: "pending" })).some((j: any) => j.id === first.id));
+    expect(await ok("retryJob", { id: "not-a-job" })).toEqual({ retried: 0 });
+
+    flakyWorks = true;
+    expect(await ok("retryFailedJobs")).toEqual({ retried: 2 });
+    await until(async () => (await ok("jobs", { state: "done" })).length >= 2);
+    expect((await ok("jobs", { state: "done" })).map((j: any) => j.id)).toEqual(expect.arrayContaining([first.id, second.id]));
+    expect(await failedCount()).toBe(0);
+  });
+
+  test("reports traffic and per-function latency", async () => {
+    await app.runtime.runMutation("notes:add", { text: "measured" }, { source: "client" });
+    await ok("run", { name: "notes:add", args: { text: 5 } });
+    const metrics = await ok("metrics");
+    expect(metrics.seconds).toHaveLength(60);
+    expect(metrics.minutes).toHaveLength(60);
+    expect(metrics.ranges["1m"].calls).toBeGreaterThanOrEqual(2);
+    const add = metrics.functions.find((f: any) => f.name === "notes:add");
+    expect(add).toMatchObject({ type: "mutation" });
+    expect(add.errors).toBeGreaterThanOrEqual(1);
+    expect(add.lastError).toContain("args.text must be v.string()");
+    expect(add.p95).toBeGreaterThan(0);
+  });
+
+  test("uploads a file with a token from the dashboard", async () => {
+    const token = await ok("uploadToken");
+    const res = await fetch(`${base}/api/storage/upload?token=${token}`, { method: "POST", headers: { "Content-Type": "text/plain" }, body: "from the dashboard" });
+    const { storageId } = (await res.json()) as { storageId: string };
+    expect((await ok("files")).map((f: any) => f.id)).toContain(storageId);
+    await ok("deleteFile", { id: storageId });
+    expect((await fetch(`${base}/api/storage/upload?token=${token}`, { method: "POST", body: "again" })).ok).toBe(false);
+  });
+
   test("lists and deletes files", async () => {
     const id = await app.runtime.actionCtx(null).storage.store(new Blob(["hello"], { type: "text/plain" }));
     const files = await ok("files");
@@ -173,4 +233,122 @@ test("the dashboard can be turned off", async () => {
     await app.close();
     rmSync(dataDir, { recursive: true, force: true });
   }
+});
+
+describe("call metrics", () => {
+  const run = (log: CallLog, name: string, ms = 0, fail = false) =>
+    log
+      .track(name, "query", "client", async () => {
+        if (ms) await Bun.sleep(ms);
+        if (fail) throw new Error("no");
+      })
+      .catch(() => {});
+
+  test("adds up calls and errors per function", async () => {
+    const log = new CallLog();
+    await run(log, "a:one");
+    await run(log, "a:one", 0, true);
+    await run(log, "a:two");
+    const m = log.metrics();
+    expect(m.ranges["15m"]).toMatchObject({ calls: 3, errors: 1 });
+    expect(m.functions.find((f) => f.name === "a:one")).toMatchObject({ calls: 2, errors: 1, lastError: "no" });
+    expect(m.seconds.reduce((sum, p) => sum + p.ok + p.err, 0)).toBe(3);
+  });
+
+  test("cached answers count as calls but not as latency", () => {
+    const log = new CallLog();
+    log.record("a:cached", "query", "client");
+    const [f] = log.metrics().functions;
+    expect(f).toMatchObject({ calls: 1, cached: 1, p50: null, p95: null });
+    expect(log.metrics().minutes.at(-1)).toMatchObject({ ok: 1, p95: null });
+  });
+
+  test("percentiles land near the real duration", async () => {
+    const log = new CallLog();
+    await run(log, "a:slow", 40);
+    const [f] = log.metrics().functions;
+    expect(f!.p95!).toBeGreaterThanOrEqual(30);
+    expect(f!.p95!).toBeLessThan(100);
+  });
+
+  test("forgets what's older than the window", async () => {
+    const log = new CallLog();
+    await run(log, "a:one", 0, true);
+    const later = log.metrics(Date.now() + 2 * 3_600_000);
+    expect(later.functions).toEqual([]);
+    expect(later.ranges["1h"].calls).toBe(0);
+    expect(later.minutes.every((p) => p.ok + p.err === 0)).toBe(true);
+  });
+
+  test("keeps a bounded number of names, however many paths clients invent", async () => {
+    const log = new CallLog();
+    for (let i = 0; i < 600; i++) log.record(`GET /x/${i}`, "http", "http");
+    const names = log.metrics().functions;
+    expect(names).toHaveLength(501);
+    expect(names.find((f) => f.name === "(other)")).toMatchObject({ calls: 100 });
+    expect(log.metrics().ranges["1h"].calls).toBe(600);
+  });
+});
+
+describe("recent calls", () => {
+  const filled = (max: number, calls: number) => {
+    const log = new CallLog(max);
+    for (let i = 1; i <= calls; i++) log.record(`c${i}`, "query", "client");
+    return log;
+  };
+  const names = (log: CallLog, limit?: number) => log.recent(limit).map((c) => c.name);
+
+  test("returns everything oldest first until the log is full", () => {
+    expect(names(filled(5, 0))).toEqual([]);
+    expect(names(filled(5, 3))).toEqual(["c1", "c2", "c3"]);
+    expect(names(filled(5, 3), 2)).toEqual(["c2", "c3"]);
+    expect(names(filled(5, 3), 4)).toEqual(["c1", "c2", "c3"]);
+    expect(names(filled(5, 5))).toEqual(["c1", "c2", "c3", "c4", "c5"]);
+  });
+
+  test("keeps the newest records in order after wrapping around", () => {
+    // After 7 calls in 5 slots the newest two sit at the start of the array.
+    const log = filled(5, 7);
+    expect(names(log)).toEqual(["c3", "c4", "c5", "c6", "c7"]);
+    expect(names(log, 2)).toEqual(["c6", "c7"]); // Stops before the seam.
+    expect(names(log, 3)).toEqual(["c5", "c6", "c7"]); // Crosses it.
+    expect(names(log, 9)).toEqual(["c3", "c4", "c5", "c6", "c7"]);
+  });
+
+  test("agrees with slicing a plain array at every position", () => {
+    for (let calls = 0; calls <= 12; calls++) {
+      const all = Array.from({ length: calls }, (_, i) => `c${i + 1}`);
+      const log = filled(5, calls);
+      for (let limit = 1; limit <= 7; limit++) expect(names(log, limit)).toEqual(all.slice(-5).slice(-limit));
+    }
+  });
+
+  test("handles limits that aren't positive whole numbers", () => {
+    const log = filled(5, 7);
+    expect(names(log, 0)).toEqual([]);
+    expect(names(log, -2)).toEqual([]);
+    expect(names(log, 2.5)).toEqual(["c6", "c7"]);
+    expect(names(log, Infinity)).toEqual(["c3", "c4", "c5", "c6", "c7"]);
+  });
+
+  test("a log that keeps nothing still counts and notifies", () => {
+    const log = new CallLog(0);
+    const heard: string[] = [];
+    log.listen((c) => heard.push(c.name));
+    log.record("c1", "query", "client");
+    expect(log.recent()).toEqual([]);
+    expect(log.totals.calls).toBe(1);
+    expect(heard).toEqual(["c1"]);
+  });
+
+  test("evicting old records leaves totals, listeners and metrics counting every call", () => {
+    const log = new CallLog(2);
+    const heard: number[] = [];
+    log.listen((c) => heard.push(c.id));
+    for (let i = 0; i < 5; i++) log.record("a:one", "query", "client");
+    expect(log.recent().map((c) => c.id)).toEqual([4, 5]);
+    expect(heard).toEqual([1, 2, 3, 4, 5]);
+    expect(log.totals.calls).toBe(5);
+    expect(log.metrics().ranges["1h"].calls).toBe(5);
+  });
 });

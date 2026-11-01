@@ -58,13 +58,40 @@ export type CallRecord = {
 };
 export type Stats = { connections: number; subscriptions: number; totals: { calls: number; errors: number }; memory: number; uptimeMs: number };
 
+export type CallSummary = { calls: number; errors: number; p50: number | null; p95: number | null };
+export type CallPoint = { at: number; ok: number; err: number; p95: number | null };
+export type FunctionMetrics = CallSummary & {
+  name: string;
+  type: CallRecord["type"];
+  cached: number;
+  maxMs: number;
+  lastAt: number;
+  lastError: string | null;
+  lastErrorAt: number | null;
+};
+export type Metrics = {
+  seconds: CallPoint[];
+  minutes: CallPoint[];
+  ranges: { "1m": CallSummary; "15m": CallSummary; "1h": CallSummary };
+  functions: FunctionMetrics[];
+};
+export type Cron = { name: string; fn: string; args: unknown; schedule: string; nextRun: number | null; lastRun: number | null; lastError: string | null };
+export type SchedulerSummary = {
+  jobs: Record<string, number>;
+  overdue: { count: number; oldest: number | null };
+  upcoming: { id: string; fn: string; runAt: number }[];
+  lastFailed: { fn: string; runAt: number; error: string | null } | null;
+  crons: Cron[];
+};
+
 type Listeners = {
   call: Set<(r: CallRecord) => void>;
   commit: Set<(e: { tables: string[] }) => void>;
   stats: Set<(s: Stats) => void>;
   status: Set<(connected: boolean) => void>;
+  live: Set<() => void>;
 };
-const listeners: Listeners = { call: new Set(), commit: new Set(), stats: new Set(), status: new Set() };
+const listeners: Listeners = { call: new Set(), commit: new Set(), stats: new Set(), status: new Set(), live: new Set() };
 let started = false;
 export let connected = false;
 
@@ -78,10 +105,52 @@ function setConnected(value: boolean) {
   for (const fn of listeners.status) fn(value);
 }
 
+// The numbers several pages share, refreshed once per stats event instead of once per page.
+export const live: { stats: Stats | null; metrics: Metrics | null; scheduler: SchedulerSummary | null } = { stats: null, metrics: null, scheduler: null };
+const SCHEDULER_EVERY = 5; // stats events, so about every 15 seconds: this one reads the database
+let beats = 0;
+
+const publish = () => {
+  for (const fn of listeners.live) fn();
+};
+
+export function refreshMetrics() {
+  return call<Metrics>("metrics")
+    .then((m) => {
+      live.metrics = m;
+      publish();
+    })
+    .catch(() => {});
+}
+
+export function refreshScheduler() {
+  return call<SchedulerSummary>("scheduler")
+    .then((s) => {
+      live.scheduler = s;
+      publish();
+    })
+    .catch(() => {});
+}
+
+function heartbeat() {
+  if (document.hidden) return;
+  void refreshMetrics();
+  if (beats++ % SCHEDULER_EVERY === 0) void refreshScheduler();
+}
+
 /** Reads the server-sent event stream (with the key in a header) and reconnects when it drops. */
 export function startEvents() {
   if (started) return;
   started = true;
+  on("stats", (s) => {
+    live.stats = s;
+    publish();
+    heartbeat();
+  });
+  document.addEventListener("visibilitychange", () => {
+    beats = 0; // catch up on everything when the tab comes back
+    heartbeat();
+  });
   let delay = 500;
   const loop = async () => {
     for (;;) {

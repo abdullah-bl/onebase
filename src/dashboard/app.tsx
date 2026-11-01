@@ -4,7 +4,8 @@
 import { render } from "preact";
 import { useEffect, useState } from "preact/hooks";
 import { AuthError, call, connected, getKey, on, setKey, startEvents } from "./api";
-import { Toasts, errorText } from "./ui";
+import { Palette } from "./palette";
+import { Icon, Toasts, errorText, useLive } from "./ui";
 import { DataView } from "./views/data";
 import { FilesView } from "./views/files";
 import { FunctionsView } from "./views/functions";
@@ -13,13 +14,42 @@ import { OverviewView } from "./views/overview";
 import { SchedulerView } from "./views/scheduler";
 
 const NAV = [
-  { id: "overview", label: "Overview", icon: "M4 13h6V4H4v9zm0 7h6v-5H4v5zm10 0h6v-9h-6v9zm0-16v5h6V4h-6z" },
-  { id: "data", label: "Data", icon: "M12 3c4.4 0 8 1.3 8 3s-3.6 3-8 3-8-1.3-8-3 3.6-3 8-3zm-8 6c0 1.7 3.6 3 8 3s8-1.3 8-3v4c0 1.7-3.6 3-8 3s-8-1.3-8-3V9zm0 7c0 1.7 3.6 3 8 3s8-1.3 8-3v2c0 1.7-3.6 3-8 3s-8-1.3-8-3v-2z" },
-  { id: "functions", label: "Functions", icon: "M8 6 2 12l6 6 1.4-1.4L4.8 12l4.6-4.6L8 6zm8 0-1.4 1.4 4.6 4.6-4.6 4.6L16 18l6-6-6-6z" },
-  { id: "logs", label: "Logs", icon: "M4 5h16v2H4V5zm0 6h16v2H4v-2zm0 6h10v2H4v-2z" },
-  { id: "scheduler", label: "Scheduler", icon: "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm1 10.6 3.2 3.2-1.4 1.4-3.8-3.8V6h2v6.6z" },
-  { id: "files", label: "Files", icon: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6zm-1 7V3.5L18.5 9H13z" },
+  { id: "overview", label: "Overview" },
+  { id: "data", label: "Data" },
+  { id: "functions", label: "Functions" },
+  { id: "logs", label: "Logs" },
+  { id: "scheduler", label: "Scheduler" },
+  { id: "files", label: "Files" },
 ];
+
+/** The sidebar's problem counts. Its own component, so a refresh doesn't re-render the open page. */
+function NavCount({ page }: { page: string }) {
+  const { metrics, scheduler } = useLive();
+  let count = 0;
+  let label = "";
+  if (page === "logs") {
+    count = metrics?.ranges["1h"].errors ?? 0;
+    label = "errors in the last hour";
+  } else if (page === "scheduler") {
+    count = (scheduler?.jobs.failed ?? 0) + (scheduler?.crons.filter((c) => c.lastError).length ?? 0);
+    label = "failed jobs and crons";
+  }
+  if (!count) return null;
+  return <em class="nav-count" title={`${count.toLocaleString()} ${label}`}>{count > 99 ? "99+" : count}</em>;
+}
+
+function toggleTheme() {
+  const dark = (document.documentElement.dataset.theme ?? (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")) === "dark";
+  document.documentElement.dataset.theme = dark ? "light" : "dark";
+  try {
+    localStorage.setItem("ob-theme", dark ? "light" : "dark");
+  } catch {}
+}
+
+function signOut() {
+  setKey(null);
+  location.reload();
+}
 
 function useRoute(): [string[], (r: string) => void] {
   const parse = () => (location.hash.replace(/^#\/?/, "") || "overview").split("/").map(decodeURIComponent);
@@ -76,6 +106,7 @@ function App() {
   const [authed, setAuthed] = useState<boolean | null>(getKey() ? null : false);
   const [live, setLive] = useState(connected);
   const [route, go] = useRoute();
+  const [palette, setPalette] = useState(false);
 
   useEffect(() => {
     if (authed !== null) return;
@@ -93,53 +124,67 @@ function App() {
     return on("status", setLive);
   }, [authed]);
 
+  useEffect(() => {
+    if (!authed) return;
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setPalette((open) => !open);
+      }
+    };
+    addEventListener("keydown", onKey);
+    return () => removeEventListener("keydown", onKey);
+  }, [authed]);
+
   if (authed === null) return null;
   if (!authed) return <Login onDone={() => setAuthed(true)} />;
 
   const [page, ...rest] = route;
-  const toggleTheme = () => {
-    const dark = (document.documentElement.dataset.theme ?? (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")) === "dark";
-    document.documentElement.dataset.theme = dark ? "light" : "dark";
-    try {
-      localStorage.setItem("ob-theme", dark ? "light" : "dark");
-    } catch {}
-  };
 
   return (
     <div class="shell">
       <aside class="side">
         <a class="brand" href="#/overview"><Logo /><span>onebase</span></a>
+        <button class="side-search" onClick={() => setPalette(true)} aria-label="Go to a page, table or function">
+          <Icon name="search" size={15} />
+          <span>Go to…</span>
+          <kbd>⌘K</kbd>
+        </button>
         <nav>
           {NAV.map((n) => (
-            <a href={`#/${n.id}`} aria-current={page === n.id ? "page" : undefined}>
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d={n.icon} fill="currentColor" /></svg>
+            <a href={`#/${n.id}`} aria-current={page === n.id ? "page" : undefined} aria-label={n.label}>
+              <Icon name={n.id} size={17} />
               <span>{n.label}</span>
+              <NavCount page={n.id} />
             </a>
           ))}
         </nav>
         <div class="side-foot">
           <span class={`live ${live ? "on" : ""}`}>{live ? "Live" : "Reconnecting…"}</span>
-          <button class="icon" onClick={toggleTheme} aria-label="Toggle dark mode" title="Toggle dark mode">◐</button>
-          <button
-            class="icon"
-            title="Sign out"
-            aria-label="Sign out"
-            onClick={() => {
-              setKey(null);
-              location.reload();
-            }}
-          >⎋</button>
+          <button class="icon" onClick={toggleTheme} aria-label="Toggle dark mode" title="Toggle dark mode"><Icon name="theme" /></button>
+          <button class="icon" onClick={signOut} aria-label="Sign out" title="Sign out"><Icon name="signout" /></button>
         </div>
       </aside>
       <main class="main">
         {page === "overview" && <OverviewView go={go} />}
         {page === "data" && <DataView table={rest[0]} go={go} />}
         {page === "functions" && <FunctionsView name={rest[0]} go={go} />}
-        {page === "logs" && <LogsView />}
-        {page === "scheduler" && <SchedulerView />}
+        {page === "logs" && <LogsView scope={rest[0]} fn={rest[1]} go={go} />}
+        {page === "scheduler" && <SchedulerView state={rest[0]} go={go} />}
         {page === "files" && <FilesView />}
         {!NAV.some((n) => n.id === page) && <OverviewView go={go} />}
       </main>
+      {palette && (
+        <Palette
+          pages={NAV}
+          go={go}
+          onClose={() => setPalette(false)}
+          actions={[
+            { label: "Toggle dark mode", icon: "theme", run: toggleTheme },
+            { label: "Sign out", icon: "signout", run: signOut },
+          ]}
+        />
+      )}
       <Toasts />
     </div>
   );

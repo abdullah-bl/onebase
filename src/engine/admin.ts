@@ -45,8 +45,13 @@ const HTML = (version: string) => `<!doctype html>
 
 type Handler = (body: any) => Promise<unknown> | unknown;
 
+/** A pending job this late means the scheduler isn't keeping up (or nothing is running it). */
+const OVERDUE_MS = 60_000;
+
 export function createAdmin(opts: { runtime: Runtime; key: string; assets: DashboardAssets; version: string }) {
   const { runtime } = opts;
+  // Assets are cached for an hour: their URL has to change whenever they do, even within one release.
+  const assetsVersion = Bun.hash(opts.assets.js + opts.assets.css).toString(36);
   const keyDigest = digest(opts.key);
   const authorized = (req: Request) => {
     const header = req.headers.get("Authorization") ?? "";
@@ -81,6 +86,24 @@ export function createAdmin(opts: { runtime: Runtime; key: string; assets: Dashb
       };
     });
   };
+
+  const crons = () =>
+    runtime.adminRead(async (_db, tx) => {
+      const rows = new Map((await tx.all("SELECT name, next_run, last_run, last_error FROM _crons")).map((r) => [r.name as string, r]));
+      return runtime.cronJobs.map((job) => {
+        const row = rows.get(job.name);
+        const s = job.schedule;
+        return {
+          name: job.name,
+          fn: job.fn,
+          args: job.args,
+          schedule: s.type === "cron" ? s.expression : `every ${humanMs(s.ms)}`,
+          nextRun: row ? Number(row.next_run) : null,
+          lastRun: row?.last_run ? Number(row.last_run) : null,
+          lastError: row?.last_error ?? null,
+        };
+      });
+    });
 
   const api: Record<string, Handler> = {
     overview: async () => {
@@ -179,6 +202,8 @@ export function createAdmin(opts: { runtime: Runtime; key: string; assets: Dashb
 
     calls: ({ limit = 500 }) => runtime.calls.recent(Math.min(Number(limit) || 500, 1000)),
 
+    metrics: () => runtime.calls.metrics(),
+
     jobs: ({ state }) =>
       runtime.adminRead(async (_db, tx) => {
         const rows = state
@@ -198,23 +223,39 @@ export function createAdmin(opts: { runtime: Runtime; key: string; assets: Dashb
       return null;
     },
 
-    crons: () =>
-      runtime.adminRead(async (_db, tx) => {
-        const rows = new Map((await tx.all("SELECT name, next_run, last_run, last_error FROM _crons")).map((r) => [r.name as string, r]));
-        return runtime.cronJobs.map((job) => {
-          const row = rows.get(job.name);
-          const s = job.schedule;
-          return {
-            name: job.name,
-            fn: job.fn,
-            args: job.args,
-            schedule: s.type === "cron" ? s.expression : `every ${humanMs(s.ms)}`,
-            nextRun: row ? Number(row.next_run) : null,
-            lastRun: row?.last_run ? Number(row.last_run) : null,
-            lastError: row?.last_error ?? null,
-          };
-        });
-      }),
+    /** Puts a failed job back in the queue, due now. */
+    retryJob: async ({ id }) => {
+      const { changes } = await runtime.withWriter((tx) => tx.run("UPDATE _scheduled SET state = 'pending', error = NULL, run_at = ? WHERE id = ? AND state = 'failed'", [Date.now(), id]));
+      runtime.pokeScheduler();
+      return { retried: changes };
+    },
+
+    retryFailedJobs: async () => {
+      const { changes } = await runtime.withWriter((tx) => tx.run("UPDATE _scheduled SET state = 'pending', error = NULL, run_at = ? WHERE state = 'failed'", [Date.now()]));
+      runtime.pokeScheduler();
+      return { retried: changes };
+    },
+
+    crons,
+
+    /** What the scheduler needs someone to look at, plus what runs next. */
+    scheduler: async () => {
+      const now = Date.now();
+      const summary = await runtime.adminRead(async (_db, tx) => {
+        const states = await tx.all("SELECT state, COUNT(*) AS n FROM _scheduled GROUP BY state");
+        const overdue = await tx.get("SELECT COUNT(*) AS n, MIN(run_at) AS oldest FROM _scheduled WHERE state = 'pending' AND run_at < ?", [now - OVERDUE_MS]);
+        const upcoming = await tx.all("SELECT id, fn, run_at FROM _scheduled WHERE state = 'pending' ORDER BY run_at LIMIT 6");
+        const failed = await tx.all("SELECT fn, run_at, error FROM _scheduled WHERE state = 'failed' ORDER BY run_at DESC LIMIT 1");
+        return { states, overdue, upcoming, failed };
+      });
+      return {
+        jobs: Object.fromEntries(summary.states.map((j) => [j.state, Number(j.n)])),
+        overdue: { count: Number(summary.overdue?.n ?? 0), oldest: summary.overdue?.oldest ? Number(summary.overdue.oldest) : null },
+        upcoming: summary.upcoming.map((j) => ({ id: j.id, fn: j.fn, runAt: Number(j.run_at) })),
+        lastFailed: summary.failed[0] ? { fn: summary.failed[0].fn, runAt: Number(summary.failed[0].run_at), error: summary.failed[0].error } : null,
+        crons: await crons(),
+      };
+    },
 
     files: ({ before = null, limit = 60 }) =>
       runtime.adminRead(async (_db, tx) => {
@@ -233,6 +274,9 @@ export function createAdmin(opts: { runtime: Runtime; key: string; assets: Dashb
     },
 
     rollback: () => runtime.rollback(),
+
+    /** A one-time token for POST /api/storage/upload, so the dashboard can upload like a client does. */
+    uploadToken: () => runtime.withWriter((tx) => runtime.files.createUploadToken(tx)),
 
     deleteFile: ({ id }) =>
       runtime.adminWrite(async (_db, state) => {
@@ -299,7 +343,7 @@ export function createAdmin(opts: { runtime: Runtime; key: string; assets: Dashb
 
   return async (req: Request, url: URL): Promise<Response> => {
     const path = url.pathname;
-    if (path === "/_admin" || path === "/_admin/") return new Response(HTML(opts.version), { headers: { "Content-Type": "text/html; charset=utf-8" } });
+    if (path === "/_admin" || path === "/_admin/") return new Response(HTML(assetsVersion), { headers: { "Content-Type": "text/html; charset=utf-8" } });
     if (path === "/_admin/app.js") return new Response(opts.assets.js, { headers: { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "public, max-age=3600" } });
     if (path === "/_admin/app.css") return new Response(opts.assets.css, { headers: { "Content-Type": "text/css; charset=utf-8", "Cache-Control": "public, max-age=3600" } });
     if (!path.startsWith("/_admin/api/")) return new Response("Not found", { status: 404 });

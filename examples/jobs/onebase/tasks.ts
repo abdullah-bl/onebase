@@ -67,7 +67,8 @@ export const enqueueLater = mutation({
   args: { title: v.string(), delayMs: v.number() },
   handler: async (ctx, { title, delayMs }) => {
     const taskId = await ctx.db.insert("tasks", { title, state: "scheduled" });
-    await ctx.scheduler.runAt(Date.now() + delayMs, internal.tasks.start, { taskId });
+    const job = await ctx.scheduler.runAt(Date.now() + delayMs, internal.tasks.start, { taskId });
+    await ctx.db.patch(taskId, { job });
     return taskId;
   },
 });
@@ -94,8 +95,14 @@ export const cancel = mutation({
   args: { id: v.id("tasks") },
   handler: async (ctx, { id }) => {
     const task = await ctx.db.get(id);
-    if (!task?.itemId) return;
-    await ctx.components.queue.cancel({ id: task.itemId });
+    if (!task) return;
+    if (task.state === "scheduled") {
+      // Not released yet, so the queue doesn't know about it: stop the scheduler instead.
+      if (task.job) await ctx.scheduler.cancel(task.job);
+      await ctx.db.patch(id, { state: "canceled", error: "canceled" });
+      return;
+    }
+    if (task.itemId) await ctx.components.queue.cancel({ id: task.itemId });
   },
 });
 

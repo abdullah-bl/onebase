@@ -12,5 +12,7 @@ export default defineSchema({
     error: v.optional(v.string()),
     // The queue item's id, so the console can show attempts and retry timing.
     itemId: v.optional(v.string()),
+    // The scheduled start of a delayed task, so it can be canceled.
+    job: v.optional(v.string()),
   }).index("by_state", ["state"]),
 });

@@ -23,7 +23,7 @@ curl -X POST localhost:8090/jobs -d '{"title":"from curl"}'   # enqueue one
 - **`workQueue`** — `enqueueAction` with `retry: { maxAttempts: 3 }` and an `onComplete` mutation; `maxParallelism: 2` paces the work; `list({ state })` and `status({ id })` drive the console, live like any query; `cancel({ id })` stops pending items.
 - **`onCompleteArgs`** — types the `context` the callback receives, with `result.kind` telling success, failure (after the last retry) and cancellation apart.
 - **The action/mutation split** — the worker is an internal action (timers, network, anything Node offers, no database); it writes through `ctx.runMutation`.
-- **`ctx.scheduler.runAt`** — delayed jobs; jobs and schedules survive restarts.
+- **`ctx.scheduler.runAt`** — delayed jobs, canceled with `ctx.scheduler.cancel`; jobs and schedules survive restarts.
 - **Cron jobs** — `crons.interval` in `onebase/crons.ts` prunes finished tasks every 5 minutes (the work queue also runs its own internal sweep cron).
 - **HTTP routes** — `onebase/http.ts` exposes `GET`/`POST /jobs` via `httpRouter` + `httpAction` + `ctx.runQuery`/`ctx.runMutation`, so scripts can enqueue without the WebSocket client.
 

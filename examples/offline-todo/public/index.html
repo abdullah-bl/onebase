@@ -46,7 +46,7 @@
       </form>
       <p class="hint">
         This client was created with <code>offline: true</code>. Stop the server (Ctrl+C) and keep using the page:
-        mutations are queued, and cached results survive a reload. Start the server again and the queue replays in order.
+        edits show right away and are queued. Start the server again and the queue replays in order.
       </p>
     </main>
     <script type="module">
@@ -80,11 +80,25 @@
       });
       setInterval(renderStatus, 500);
 
-      // Toggling shows the change immediately, even with the server down.
+      // Every edit shows immediately, even with the server down. The server's
+      // result replaces these changes, and they roll back if the mutation fails.
+      const lists = (store) => [store.getQuery(api.todos.list, {}) ?? [], store.getQuery(api.todos.done, {}) ?? []];
+      const setLists = (store, open, done) => {
+        store.setQuery(api.todos.list, {}, open);
+        store.setQuery(api.todos.done, {}, done);
+      };
       function toggleNow(store, { id }) {
-        for (const { args, value } of store.getAllQueries(api.todos.list)) {
-          if (value) store.setQuery(api.todos.list, args, value.map((t) => (t._id === id ? { ...t, done: !t.done } : t)));
-        }
+        const [open, done] = lists(store);
+        const todo = [...open, ...done].find((t) => t._id === id);
+        if (!todo) return;
+        const flipped = { ...todo, done: !todo.done };
+        const without = (list) => list.filter((t) => t._id !== id);
+        if (todo.done) setLists(store, [flipped, ...open], without(done));
+        else setLists(store, without(open), [flipped, ...done]);
+      }
+      function removeNow(store, { id }) {
+        const [open, done] = lists(store);
+        setLists(store, open.filter((t) => t._id !== id), done.filter((t) => t._id !== id));
       }
 
       client.onUpdate(api.todos.list, {}, renderOpen, (e) => error(e.message));
@@ -105,20 +119,26 @@
         check.onchange = () => client.mutation(api.todos.toggle, { id: todo._id }, { optimisticUpdate: toggleNow }).catch((e) => error(e.message));
         const label = Object.assign(document.createElement("label"), { textContent: todo.text });
         const del = Object.assign(document.createElement("button"), { className: "del", textContent: "Delete" });
-        del.onclick = () => client.mutation(api.todos.remove, { id: todo._id }).catch((e) => error(e.message));
+        del.onclick = () => client.mutation(api.todos.remove, { id: todo._id }, { optimisticUpdate: removeNow }).catch((e) => error(e.message));
+        // A todo still waiting to be added has no real id for these to use yet.
+        check.disabled = del.disabled = Boolean(todo.local);
         li.append(check, label, del);
         return li;
       }
 
-      $("form").onsubmit = async (e) => {
+      let localIds = 0;
+      $("form").onsubmit = (e) => {
         e.preventDefault();
         error();
-        try {
-          await client.mutation(api.todos.add, { text: $("text").value });
-          $("text").value = "";
-        } catch (err) {
-          error(err.message);
-        }
+        const text = $("text").value.trim();
+        if (!text) return;
+        $("text").value = "";
+        const row = { _id: `local-${++localIds}`, _creationTime: Date.now(), text, done: false, local: true };
+        const addNow = (store) => {
+          const [open, done] = lists(store);
+          setLists(store, [row, ...open], done);
+        };
+        client.mutation(api.todos.add, { text }, { optimisticUpdate: addNow }).catch((err) => error(err.message));
       };
     </script>
   </body>

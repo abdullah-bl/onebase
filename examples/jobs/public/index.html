@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>onebase jobs</title>
+    <style>
+      :root { color-scheme: light dark; --bg: #fafafa; --fg: #1a1a1a; --muted: #777; --line: #e3e3e3; --accent: #3b5bdb; --card: #fff; --danger: #e03131; --ok: #2b8a3e; --warn: #e67700; }
+      @media (prefers-color-scheme: dark) { :root { --bg: #141414; --fg: #eee; --muted: #999; --line: #2c2c2c; --accent: #748ffc; --card: #1d1d1d; } }
+      * { box-sizing: border-box; }
+      body { margin: 0; font: 15px/1.45 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+      main { max-width: 640px; margin: 0 auto; padding: 16px; }
+      header { display: flex; justify-content: space-between; align-items: baseline; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+      h1 { font-size: 17px; margin: 0; }
+      h2 { font-size: 13px; color: var(--muted); margin: 18px 0 6px; }
+      form { display: flex; gap: 8px; }
+      input { flex: 1; min-width: 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--fg); font: inherit; }
+      button { font: inherit; cursor: pointer; padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--fg); }
+      button.primary { border: 0; background: var(--accent); color: #fff; }
+      ul { list-style: none; margin: 0; padding: 0; }
+      li { display: flex; gap: 10px; align-items: baseline; padding: 8px 10px; margin: 6px 0; background: var(--card); border: 1px solid var(--line); border-radius: 8px; }
+      li .title { flex: 1; overflow-wrap: anywhere; }
+      li .small { color: var(--muted); font-size: 12px; }
+      .state { font-size: 12px; border-radius: 999px; padding: 1px 10px; border: 1px solid var(--line); color: var(--muted); flex: none; }
+      .state.running { color: var(--warn); border-color: var(--warn); }
+      .state.done { color: var(--ok); border-color: var(--ok); }
+      .state.failed { color: var(--danger); border-color: var(--danger); }
+      li button { border: 0; background: none; color: var(--muted); padding: 0; font-size: 12px; }
+      #error { color: var(--danger); font-size: 13px; min-height: 1.2em; }
+      .hint { color: var(--muted); font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>onebase jobs</h1>
+        <span id="queue" class="small"></span>
+      </header>
+      <p class="hint">Titles containing “fail” throw on purpose — watch the queue retry with backoff before the run is marked failed. Two jobs process at a time.</p>
+      <form id="form">
+        <input id="title" placeholder="Job title, e.g. resize photo 12" autocomplete="off" required />
+        <button type="button" id="later">In 5s</button>
+        <button class="primary">Run now</button>
+        <button type="button" id="clear">Clear finished</button>
+      </form>
+      <div id="error"></div>
+      <h2>Tasks</h2>
+      <ul id="tasks"></ul>
+      <h2>Queue (pending items, oldest first)</h2>
+      <ul id="pending"></ul>
+      <p class="hint">The same list over HTTP: <code>curl localhost:8090/jobs</code> · <code>curl -X POST localhost:8090/jobs -d '{"title":"from curl"}'</code></p>
+    </main>
+    <script type="module">
+      import { OnebaseClient, anyApi as api } from "/_onebase/client.js";
+
+      const client = new OnebaseClient();
+      const $ = (id) => document.getElementById(id);
+      const error = (msg) => ($("error").textContent = msg ?? "");
+
+      client.onUpdate(api.tasks.queuePending, {}, (items) => {
+        $("queue").textContent = `${items.length} pending`;
+        $("pending").replaceChildren(...items.map((item) => {
+          const li = document.createElement("li");
+          const title = Object.assign(document.createElement("span"), { className: "title", textContent: item.id.slice(-6) });
+          const small = Object.assign(document.createElement("span"), { className: "small", textContent: `attempt ${item.attempts}` });
+          li.append(title, small);
+          return li;
+        }));
+      }, (e) => error(e.message));
+      client.onUpdate(api.tasks.list, {}, (tasks) => {
+        $("tasks").replaceChildren(...tasks.map((t) => {
+          const li = document.createElement("li");
+          const title = Object.assign(document.createElement("span"), { className: "title" });
+          title.textContent = t.title;
+          if (t.output) title.textContent += " — " + t.output;
+          if (t.error) title.textContent += " — " + t.error;
+          const state = Object.assign(document.createElement("span"), { className: "state " + t.state, textContent: t.state });
+          li.append(title, state);
+          if (t.state === "scheduled" || t.state === "queued") {
+            const cancel = document.createElement("button");
+            cancel.textContent = "cancel";
+            cancel.onclick = () => client.mutation(api.tasks.cancel, { id: t._id }).catch((e) => error(e.message));
+            li.append(cancel);
+          }
+          return li;
+        }));
+      }, (e) => error(e.message));
+
+      $("form").onsubmit = async (e) => {
+        e.preventDefault();
+        error();
+        try {
+          await client.mutation(api.tasks.enqueue, { title: $("title").value });
+          $("title").value = "";
+        } catch (err) {
+          error(err.message);
+        }
+      };
+
+      $("later").onclick = async () => {
+        error();
+        try {
+          await client.mutation(api.tasks.enqueueLater, { title: $("title").value, delayMs: 5000 });
+          $("title").value = "";
+        } catch (err) {
+          error(err.message);
+        }
+      };
+
+      $("clear").onclick = async () => {
+        await client.mutation(api.tasks.clearFinished, {});
+      };
+    </script>
+  </body>
+</html>

@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>onebase vector search</title>
+    <style>
+      :root { color-scheme: light dark; --bg: #fafafa; --fg: #1a1a1a; --muted: #777; --line: #e3e3e3; --accent: #3b5bdb; --card: #fff; --danger: #e03131; }
+      @media (prefers-color-scheme: dark) { :root { --bg: #141414; --fg: #eee; --muted: #999; --line: #2c2c2c; --accent: #748ffc; --card: #1d1d1d; } }
+      * { box-sizing: border-box; }
+      body { margin: 0; font: 15px/1.45 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+      main { max-width: 640px; margin: 0 auto; padding: 16px; }
+      h1 { font-size: 17px; }
+      .panel { border: 1px solid var(--line); border-radius: 8px; background: var(--card); padding: 12px; margin: 12px 0; }
+      .panel h2 { font-size: 14px; margin: 0 0 8px; color: var(--muted); font-weight: 600; }
+      input, select { padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--fg); font: inherit; }
+      button { font: inherit; cursor: pointer; padding: 8px 14px; border: 0; border-radius: 8px; background: var(--accent); color: #fff; }
+      .row { display: flex; gap: 8px; flex-wrap: wrap; }
+      .row input[type="text"] { flex: 1; min-width: 160px; }
+      ul { list-style: none; margin: 8px 0 0; padding: 0; }
+      li { display: flex; gap: 8px; align-items: baseline; padding: 6px 8px; border-radius: 6px; }
+      li:nth-child(odd) { background: var(--bg); }
+      li .score { font-variant-numeric: tabular-nums; color: var(--accent); font-size: 13px; width: 52px; flex: none; }
+      li .text { flex: 1; overflow-wrap: anywhere; }
+      li .kind { color: var(--muted); font-size: 12px; border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; }
+      #error { color: var(--danger); font-size: 13px; min-height: 1.2em; }
+      .hint { color: var(--muted); font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>onebase vector search</h1>
+      <p class="hint">Embeddings here are computed locally in an action (a hashed bag-of-words), so the demo needs no API keys. A real app would call a model and get semantically similar text, not just shared words.</p>
+      <div id="error"></div>
+
+      <div class="panel">
+        <h2>Find similar (vector search in an action, with filters)</h2>
+        <div class="row">
+          <input id="query" type="text" placeholder="e.g. databases and replication" />
+          <select id="kindFilter">
+            <option value="">any kind</option>
+            <option value="fact">facts only</option>
+            <option value="idea">ideas only</option>
+            <option value="note">notes only</option>
+            <option value="fact+idea">facts or ideas (q.or)</option>
+          </select>
+          <button id="similarBtn">Similar</button>
+        </div>
+        <ul id="similar"></ul>
+      </div>
+
+      <div class="panel">
+        <h2>Keyword search (FTS, live query) — for comparison</h2>
+        <div class="row">
+          <input id="search" type="text" placeholder="exact words…" />
+        </div>
+        <ul id="results"></ul>
+      </div>
+
+      <div class="panel">
+        <h2>Add an item (action embeds it, then a mutation stores it)</h2>
+        <div class="row">
+          <input id="text" type="text" placeholder="Write something…" />
+          <select id="kind">
+            <option value="fact">fact</option>
+            <option value="idea">idea</option>
+            <option value="note">note</option>
+          </select>
+          <button id="addBtn">Add</button>
+        </div>
+        <ul id="items"></ul>
+      </div>
+    </main>
+    <script type="module">
+      import { OnebaseClient, anyApi as api } from "/_onebase/client.js";
+
+      const client = new OnebaseClient();
+      const $ = (id) => document.getElementById(id);
+      const error = (msg) => ($("error").textContent = msg ?? "");
+
+      await client.mutation(api.items.seed, {});
+
+      $("similarBtn").onclick = async () => {
+        error();
+        const text = $("query").value.trim();
+        if (!text) return;
+        const kind = $("kindFilter").value;
+        const args = { text };
+        if (kind === "fact+idea") args.kinds = ["fact", "idea"];
+        else if (kind) args.kind = kind;
+        try {
+          const hits = await client.action(api.items.similar, args);
+          $("similar").replaceChildren(...hits.map(({ score, item }) => {
+            const li = document.createElement("li");
+            const s = Object.assign(document.createElement("span"), { className: "score", textContent: score.toFixed(3) });
+            const t = Object.assign(document.createElement("span"), { className: "text", textContent: item.text });
+            const k = Object.assign(document.createElement("span"), { className: "kind", textContent: item.kind });
+            li.append(s, t, k);
+            return li;
+          }));
+        } catch (err) {
+          error(err.message);
+        }
+      };
+      $("query").onkeydown = (e) => e.key === "Enter" && $("similarBtn").click();
+
+      let stopSearch = () => {};
+      $("search").oninput = () => {
+        stopSearch();
+        const text = $("search").value.trim();
+        if (!text) return ($("results").replaceChildren(), undefined);
+        stopSearch = client.onUpdate(api.items.search, { text }, (items) => {
+          $("results").replaceChildren(...items.map(({ text, kind }) => {
+            const li = document.createElement("li");
+            const t = Object.assign(document.createElement("span"), { className: "text", textContent: text });
+            const k = Object.assign(document.createElement("span"), { className: "kind", textContent: kind });
+            li.append(t, k);
+            return li;
+          }));
+        }, (e) => error(e.message));
+      };
+
+      $("addBtn").onclick = async () => {
+        error();
+        const text = $("text").value.trim();
+        if (!text) return;
+        try {
+          await client.action(api.items.addAndIndex, { text, kind: $("kind").value });
+          $("text").value = "";
+        } catch (err) {
+          error(err.message);
+        }
+      };
+
+      client.onUpdate(api.items.list, {}, (items) => {
+        $("items").replaceChildren(...items.map(({ text, kind }) => {
+          const li = document.createElement("li");
+          const t = Object.assign(document.createElement("span"), { className: "text", textContent: text });
+          const k = Object.assign(document.createElement("span"), { className: "kind", textContent: kind });
+          li.append(t, k);
+          return li;
+        }));
+      }, (e) => error(e.message));
+    </script>
+  </body>
+</html>

@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>onebase poll</title>
+    <style>
+      :root { color-scheme: light dark; --bg: #fafafa; --fg: #1a1a1a; --muted: #777; --line: #e3e3e3; --accent: #3b5bdb; --card: #fff; --danger: #e03131; }
+      @media (prefers-color-scheme: dark) { :root { --bg: #141414; --fg: #eee; --muted: #999; --line: #2c2c2c; --accent: #748ffc; --card: #1d1d1d; } }
+      * { box-sizing: border-box; }
+      body { margin: 0; font: 15px/1.45 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+      main { max-width: 560px; margin: 0 auto; padding: 16px; }
+      header { display: flex; gap: 8px; align-items: baseline; justify-content: space-between; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+      h1 { font-size: 17px; margin: 0; }
+      #total { font-size: 13px; color: var(--muted); }
+      #voter { padding: 10px 0; display: flex; gap: 8px; align-items: center; font-size: 14px; }
+      #voter input { width: 140px; padding: 4px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--fg); font: inherit; }
+      ul { list-style: none; margin: 0; padding: 0; }
+      li { display: flex; gap: 10px; align-items: center; padding: 10px 12px; margin: 8px 0; background: var(--card); border: 1px solid var(--line); border-radius: 8px; }
+      li .rank { color: var(--muted); width: 28px; text-align: right; }
+      li .label { flex: 1; font-weight: 600; overflow-wrap: anywhere; }
+      li .count { font-variant-numeric: tabular-nums; color: var(--muted); margin-right: 4px; }
+      li button { border: 1px solid var(--line); background: var(--card); color: var(--fg); border-radius: 999px; padding: 3px 12px; }
+      li .vote { border-color: var(--accent); color: var(--accent); }
+      form#add { display: flex; gap: 8px; padding-top: 12px; border-top: 1px solid var(--line); }
+      input { flex: 1; min-width: 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--fg); font: inherit; }
+      form#add button { padding: 8px 14px; border: 0; border-radius: 8px; background: var(--accent); color: #fff; }
+      #error { color: var(--danger); font-size: 13px; min-height: 1.2em; }
+      .hint { color: var(--muted); font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>onebase poll</h1>
+        <span id="total"></span>
+      </header>
+      <div id="voter">
+        <label for="voterName">Voting as</label>
+        <input id="voterName" placeholder="your name" />
+      </div>
+      <ul id="options"></ul>
+      <div id="error"></div>
+      <form id="add">
+        <input id="label" placeholder="Add an option…" autocomplete="off" />
+        <button>Add</button>
+      </form>
+      <p class="hint">Open this page in two windows and vote at the same time — every window updates live. Three quick votes per voter are allowed, then one every 2 seconds.</p>
+    </main>
+    <script type="module">
+      import { OnebaseClient, anyApi as api } from "/_onebase/client.js";
+
+      const client = new OnebaseClient();
+      const $ = (id) => document.getElementById(id);
+      $("voterName").value = localStorage.getItem("voter") || "voter" + Math.floor(Math.random() * 1000);
+      $("voterName").onchange = () => localStorage.setItem("voter", $("voterName").value);
+
+      for (const label of ["Pineapple on pizza", "Tabs", "Spaces"]) {
+        await client.mutation(api.polls.getOrCreateOption, { label });
+      }
+
+      const votes = new Map();
+
+      client.onUpdate(api.polls.leaderboard, {}, (options) => {
+        // Rank by votes; every write pushes a new order to every window.
+        options.sort((a, b) => b.votes - a.votes || a.label.localeCompare(b.label));
+        $("options").replaceChildren(...options.map((o, i) => rowEl(o, i + 1)));
+      });
+      client.onUpdate(api.polls.totalVotes, {}, (n) => ($("total").textContent = `${n} vote${n === 1 ? "" : "s"} total`));
+
+      function rowEl(option, rank) {
+        const li = document.createElement("li");
+        const place = Object.assign(document.createElement("span"), { className: "rank", textContent: "#" + rank });
+        const label = Object.assign(document.createElement("span"), { className: "label", textContent: option.label });
+        const count = Object.assign(document.createElement("span"), { className: "count", textContent: String(option.votes) });
+        const undo = document.createElement("button");
+        undo.textContent = "Undo";
+        undo.onclick = () => call(api.polls.undo, { option: option._id });
+        const vote = document.createElement("button");
+        vote.className = "vote";
+        vote.textContent = "Vote";
+        vote.onclick = () => call(api.polls.vote, { option: option._id });
+        li.append(place, label, count, undo, vote);
+        votes.set(option._id, { vote });
+        return li;
+      }
+
+      async function call(fn, args) {
+        $("error").textContent = "";
+        const voter = $("voterName").value;
+        try {
+          await client.mutation(fn, { ...args, voter });
+        } catch (err) {
+          $("error").textContent = err.message;
+        }
+      }
+
+      // Preflight the rate limit so the button knows before you click.
+      setInterval(async () => {
+        const voter = $("voterName").value;
+        if (!voter) return;
+        try {
+          const ok = await client.query(api.polls.canVote, { voter });
+          for (const { vote } of votes.values()) vote.disabled = !ok;
+        } catch {
+          /* the server may be restarting; the next tick retries */
+        }
+      }, 1000);
+
+      $("add").onsubmit = async (e) => {
+        e.preventDefault();
+        await client.mutation(api.polls.getOrCreateOption, { label: $("label").value });
+        $("label").value = "";
+      };
+    </script>
+  </body>
+</html>

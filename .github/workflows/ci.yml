@@ -30,7 +30,7 @@ jobs:
         env:
           TEST_POSTGRES_URL: postgres://postgres:onebase@127.0.0.1:5432/onebase
           TEST_LIBSQL_URL: http://127.0.0.1:8080
-      - name: Doctor on the example
-        run: cd example && bun ../src/cli.ts doctor
+      - name: Doctor on every example
+        run: for d in examples/*/; do echo "== $d"; (cd "$d" && bun ../../src/cli.ts doctor) || exit 1; done
       - name: Site builds
         run: bun site/build.ts

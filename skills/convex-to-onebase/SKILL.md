@@ -28,7 +28,7 @@ Work in this order, and run the checks at each step before moving on.
 
    `doctor` lists the remaining `convex/*` imports; fix those in app files. Until components are migrated, it also reports errors for files that import `@convex-dev/*` or `convex-helpers` ("Failed to load", "Cannot find package"). Those clear up in steps 3–4.
 
-3. **Replace components with built-ins** where one exists:
+3. **Replace components with built-ins** where one exists (`@convex-dev/crons` becomes native cron jobs, and batch-worker/action-retrier fold into the work queue):
 
    | Convex package | onebase built-in | Mapping |
    |---|---|---|
@@ -36,6 +36,12 @@ Work in this order, and run the checks at each step before moving on.
    | `@convex-dev/aggregate` | `onebase/components/aggregate` | [aggregate](references/components.md#aggregate) |
    | `@convex-dev/sharded-counter` | `onebase/components/sharded-counter` | [sharded counter](references/components.md#sharded-counter) |
    | `@convex-dev/workpool` | `onebase/components/work-queue` | [work queue](references/components.md#workpool--work-queue) |
+   | `@convex-dev/migrations` | `onebase/components/migrations` | [migrations](references/components.md#migrations) |
+   | `@convex-dev/workflow` | `onebase/components/workflow` | [workflow](references/components.md#workflow) |
+   | `@convex-dev/rag` | `onebase/components/rag` | [rag](references/components.md#rag) |
+   | `@convex-dev/agent` | `onebase/components/agent` | [agent](references/components.md#agent) |
+   | `@convex-dev/presence` | `onebase/components/presence` | [presence](references/components.md#presence) |
+   | `@convex-dev/action-cache` | `onebase/components/action-cache` | [action cache](references/components.md#action-cache) |
 
    Mount them in `components.ts` in the functions folder (`onebase/components.ts` or `convex/components.ts`) with `defineComponents`, keeping Convex's mount names (`app.use(x, { name })`) so call sites read the same. Rewrite each call site as the mapping shows, and delete the Convex client objects. For the aggregate, also delete the triggers that fed it (`convex-helpers` `Triggers`, and `customMutation` wrappers that only existed for them): onebase's aggregate follows its table by itself.
 

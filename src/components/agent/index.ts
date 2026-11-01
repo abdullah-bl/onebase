@@ -37,8 +37,11 @@ type Config = {
   embeddingDimensions?: number;
 };
 
+/** Documents deleteThread removes in one transaction. */
+const PURGE_BATCH = 500;
+
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
-const storable = (value: unknown): unknown => {
+const storable =(value: unknown): unknown => {
   try {
     return value === undefined ? null : JSON.parse(JSON.stringify(value));
   } catch {
@@ -101,7 +104,7 @@ export function agent<const E extends keyof AgentApi = never>(opts: Config & Mou
       state: v.union(v.literal("streaming"), v.literal("complete"), v.literal("canceled")),
       ordinal: v.number(),
       createdAt: v.number(),
-    }),
+    }).index("by_thread", ["threadId"]),
     deltas: defineTable({
       streamId: v.string(),
       ordinal: v.number(),
@@ -189,22 +192,41 @@ export function agent<const E extends keyof AgentApi = never>(opts: Config & Mou
     },
   });
 
-  /** Deletes a thread and everything in it (messages and streams) in batches of one page per call. */
+  /** Deletes up to one transaction's worth of a thread's messages and streams, and schedules the rest. */
+  async function purgeThread(ctx: { db: any; scheduler: any }, threadId: string): Promise<void> {
+    let left = PURGE_BATCH;
+    for (const m of await ctx.db.query("messages").withIndex("by_thread_order", (q: any) => q.eq("threadId", threadId)).take(left)) {
+      await ctx.db.delete(m._id);
+      left--;
+    }
+    while (left > 0) {
+      const stream = await ctx.db.query("streams").withIndex("by_thread", (q: any) => q.eq("threadId", threadId)).first();
+      if (!stream) return;
+      for (const d of await ctx.db.query("deltas").withIndex("by_stream_ordinal", (q: any) => q.eq("streamId", stream._id)).take(left)) {
+        await ctx.db.delete(d._id);
+        left--;
+      }
+      if (left > 0) await ctx.db.delete(stream._id); // the page wasn't full, so no deltas remain
+    }
+    await ctx.scheduler.runAfter(0, purgeRest, { threadId });
+  }
+
+  const purgeRest = internalMutation({
+    args: { threadId: v.string() },
+    handler: async (ctx, { threadId }) => {
+      await purgeThread(ctx, threadId);
+      return null;
+    },
+  });
+
+  /** Deletes a thread right away; what it holds goes in this call, or in the background for a long thread. */
   const deleteThread = mutation({
     args: { threadId: v.string() },
     handler: async (ctx, { threadId }): Promise<boolean> => {
       const thread = await ctx.db.get(threadId as GenericId<"threads">);
       if (!thread || thread.lastMessageAt === undefined) return false;
-      const messages = await ctx.db.query("messages").withIndex("by_thread_order", (q: any) => q.eq("threadId", threadId)).take(500);
-      for (const m of messages) await ctx.db.delete(m._id);
-      for (const s of await ctx.db.query("streams").collect()) {
-        if (s.threadId === threadId) {
-          for (const d of await ctx.db.query("deltas").withIndex("by_stream_ordinal", (q: any) => q.eq("streamId", s._id)).collect()) await ctx.db.delete(d._id);
-          await ctx.db.delete(s._id);
-        }
-      }
-      if (messages.length >= 500) return true; // more to delete: call again
       await ctx.db.delete(thread._id);
+      await purgeThread(ctx, threadId);
       return true;
     },
   });
@@ -421,17 +443,18 @@ export function agent<const E extends keyof AgentApi = never>(opts: Config & Mou
     },
   });
 
-  /** The stream's text so far, from `cursor` on, a page at a time. */
+  /** The stream's text so far, from `cursor` on, a page at a time. A delta bigger than `maxSize` comes back whole, alone in its page. */
   const getStreamChunks = query({
     args: { streamId: v.string(), cursor: v.optional(v.number()), maxSize: v.optional(v.number()) },
     handler: async (ctx, { streamId, cursor = 0, maxSize = 8_000 }) => {
       const stream = await ctx.db.get(streamId as GenericId<"streams">);
       if (!stream) return { text: "", cursor, done: true };
-      const deltas = await ctx.db.query("deltas").withIndex("by_stream_ordinal", (q: any) => q.eq("streamId", streamId).gte("ordinal", cursor)).collect();
+      // Deltas hold at least a character each, so a page never needs more than this many.
+      const deltas = await ctx.db.query("deltas").withIndex("by_stream_ordinal", (q: any) => q.eq("streamId", streamId).gte("ordinal", cursor)).take(Math.max(1, Math.ceil(maxSize)) + 1);
       let text = "";
       let last = cursor;
       for (const d of deltas) {
-        if (text.length + d.text.length > maxSize) break;
+        if (last > cursor && text.length + d.text.length > maxSize) break;
         text += d.text;
         last = d.ordinal + 1;
       }
@@ -445,7 +468,7 @@ export function agent<const E extends keyof AgentApi = never>(opts: Config & Mou
     functions: {
       setChat, setEmbedder, createThread, getThread, listThreads, deleteThread, saveMessage, listMessages, generateText, searchMessages,
       createStream, addDelta, finishStream, cancelStream, streamStatus, getStreamChunks,
-      threadRow, messageRow, history, settingRow, embedMessage, setEmbedding,
+      threadRow, messageRow, history, settingRow, embedMessage, setEmbedding, purgeRest,
     },
   });
 

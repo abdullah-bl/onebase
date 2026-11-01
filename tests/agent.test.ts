@@ -77,7 +77,7 @@ const modules = {
     addDelta: mutation({ args: { streamId: v.string(), text: v.string() }, handler: (ctx: any, { streamId, text }) => ctx.components.bot.addDelta({ streamId, text }) }),
     finishStream: mutation({ args: { streamId: v.string() }, handler: (ctx: any, { streamId }) => ctx.components.bot.finishStream({ streamId }) }),
     streamStatus: query({ args: { streamId: v.string() }, handler: (ctx: any, { streamId }) => ctx.components.bot.streamStatus({ streamId }) }),
-    streamChunks: query({ args: { streamId: v.string() }, handler: (ctx: any, { streamId }) => ctx.components.bot.getStreamChunks({ streamId }) }),
+    streamChunks: query({ args: { streamId: v.string(), cursor: v.optional(v.number()), maxSize: v.optional(v.number()) }, handler: (ctx: any, args) => ctx.components.bot.getStreamChunks(args) }),
     logCount: query({ args: {}, handler: async (ctx) => (await ctx.db.query("log").collect()).length }),
   },
 };
@@ -184,6 +184,37 @@ for (const D of DRIVERS) describe(`${D.name}: agent`, () => {
     expect(await q("admin:streamStatus", { streamId })).toMatchObject({ state: "complete", deltas: 2 });
     expect(await q("admin:streamChunks", { streamId })).toMatchObject({ text: "hello", done: true });
     await expect(runtime.runMutation("admin:addDelta", { streamId, text: "x" })).rejects.toThrow("isn't streaming");
+  });
+
+  test("getStreamChunks always advances, even past a delta bigger than maxSize", async () => {
+    const { streamId } = (await runtime.runMutation("admin:createStream", {})) as any;
+    const big = "x".repeat(9_000);
+    await runtime.runMutation("admin:addDelta", { streamId, text: big });
+    await runtime.runMutation("admin:addDelta", { streamId, text: "aaa" });
+    await runtime.runMutation("admin:addDelta", { streamId, text: "bbb" });
+    expect(await q("admin:streamChunks", { streamId })).toMatchObject({ text: big, cursor: 1 });
+    expect(await q("admin:streamChunks", { streamId, cursor: 1, maxSize: 4 })).toMatchObject({ text: "aaa", cursor: 2 });
+    expect(await q("admin:streamChunks", { streamId, cursor: 2, maxSize: 4 })).toMatchObject({ text: "bbb", cursor: 3, done: false });
+  });
+
+  test("deleting a long thread finishes in the background, and leaves other threads alone", async () => {
+    const long = await thread({ userId: "a" });
+    const other = await thread({ userId: "b" });
+    await runtime.adminWrite(async (db) => {
+      for (let order = 0; order < 1_100; order++) await db.insert("bot.messages", { threadId: long.threadId, order, role: "user", text: "hi" });
+      await db.insert("bot.messages", { threadId: other.threadId, order: 0, role: "user", text: "stay" });
+      const stream = await db.insert("bot.streams", { threadId: long.threadId, state: "streaming", ordinal: 0, createdAt: Date.now() });
+      for (let ordinal = 0; ordinal < 600; ordinal++) await db.insert("bot.deltas", { streamId: stream, ordinal, text: "x" });
+    });
+    expect(await runtime.runMutation("admin:deleteThread", { threadId: long.threadId })).toBe(true);
+    expect(await q("admin:thread", { threadId: long.threadId })).toBeNull();
+    const count = async (table: string) => {
+      let n = 0;
+      await runtime.adminWrite(async (db) => void (n = (await db.query(table).collect()).length));
+      return n;
+    };
+    await until(async () => (await count("bot.messages")) === 1 && (await count("bot.streams")) === 0 && (await count("bot.deltas")) === 0);
+    expect((await messages(other.threadId)).map((m) => m.text)).toEqual(["stay"]);
   });
 
   test("threads are listed per user and deleting one removes its messages", async () => {

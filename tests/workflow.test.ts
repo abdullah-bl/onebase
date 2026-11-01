@@ -172,6 +172,15 @@ for (const D of DRIVERS) describe(`${D.name}: workflow`, () => {
     expect(await status(id)).toMatchObject({ status: "failed", error: "user code broke" });
   });
 
+  test("a runner that can't be called fails the workflow instead of leaving it running", async () => {
+    await runtime.startScheduler();
+    // greet isn't a workflow: the call is refused before any workflow code runs.
+    const id = await start("greet");
+    await until(async () => (await status(id))?.status === "failed");
+    expect((await status(id)).error).toContain("Invalid arguments");
+    expect(await log()).toEqual([]);
+  });
+
   test("re-running mid-sleep doesn't duplicate steps or run them twice", async () => {
     const id = await start("delayed", { ms: 60_000 });
     await runtime.runMutation("components/jobs:run", { workflowId: id }, { allowInternal: true, source: "dashboard" });

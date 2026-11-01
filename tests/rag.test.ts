@@ -19,10 +19,12 @@ const vec = (text: string): number[] => {
 };
 let embedFails = 0;
 let embedBadDims = false;
+let embedBatchSizes: number[] = [];
 
 const embed = internalAction({
   args: { texts: v.array(v.string()) },
   handler: async (_ctx, { texts }) => {
+    embedBatchSizes.push(texts.length);
     if (embedFails > 0) {
       embedFails--;
       throw new Error("embedder down");
@@ -78,6 +80,7 @@ for (const D of DRIVERS) describe(`${D.name}: rag`, () => {
     await runtime.startScheduler();
     embedFails = 0;
     embedBadDims = false;
+    embedBatchSizes = [];
   });
 
   afterEach(async () => {
@@ -134,6 +137,71 @@ for (const D of DRIVERS) describe(`${D.name}: rag`, () => {
     expect(await status(first.entryId)).toBeNull(); // the old entry is gone
     const results = await search({ namespace: "ns", query: "apples", limit: 5 });
     expect(results.map((r) => r.entryId)).toEqual([second.entryId]);
+  });
+
+  test("replace without content is refused and keeps the entry", async () => {
+    const entryId = await addReady({ namespace: "ns", key: "doc", text: "Bananas ripen fast." });
+    await expect(runtime.runMutation("admin:replace", { namespace: "ns", key: "doc" })).rejects.toThrow("text or chunks");
+    await expect(add({ namespace: "ns", key: "empty" })).rejects.toThrow("text or chunks");
+    expect(await status(entryId)).toMatchObject({ state: "ready", chunkCount: 1 });
+  });
+
+  test("only embedded entries are searchable, and the old entry serves while its replacement isn't ready", async () => {
+    const first = await addReady({ namespace: "ns", key: "doc", text: "Bananas ripen fast." });
+    embedFails = 1;
+    const second = (await runtime.runMutation("admin:replace", { namespace: "ns", key: "doc", text: "Bananas keep for weeks." })) as { entryId: string };
+    await until(async () => (await status(second.entryId))?.state === "errored");
+    for (const mode of ["vector", "text", "hybrid"]) {
+      const results = await search({ namespace: "ns", query: "bananas", mode });
+      expect(results.map((r) => r.entryId)).toEqual([first]);
+    }
+  });
+
+  test("a newer replace supersedes one still embedding, leaving one entry for the key", async () => {
+    await addReady({ namespace: "ns", key: "doc", text: "Bananas one." });
+    embedFails = 1;
+    const second = (await runtime.runMutation("admin:replace", { namespace: "ns", key: "doc", text: "Bananas two." })) as { entryId: string };
+    await until(async () => (await status(second.entryId))?.state === "errored");
+    const third = (await runtime.runMutation("admin:replace", { namespace: "ns", key: "doc", text: "Bananas three." })) as { entryId: string };
+    await until(async () => (await status(third.entryId))?.state === "ready");
+    const entries = (await runtime.runQuery("admin:list", { namespace: "ns" })).value as any;
+    expect(entries.page.map((e: any) => e.id)).toEqual([third.entryId]);
+  });
+
+  test("deleting during a replacement removes both rows, by key or by either id", async () => {
+    for (const target of ["key", "old", "new"]) {
+      const key = `doc-${target}`;
+      const first = await addReady({ namespace: target, key, text: "Bananas one." });
+      embedFails = 1;
+      const second = (await runtime.runMutation("admin:replace", { namespace: target, key, text: "Bananas two." })) as { entryId: string };
+      await until(async () => (await status(second.entryId))?.state === "errored");
+      const args = target === "key" ? { namespace: target, key } : { entryId: target === "old" ? first : second.entryId };
+      expect(await runtime.runMutation("admin:remove", args)).toBe(true);
+      const entries = (await runtime.runQuery("admin:list", { namespace: target })).value as any;
+      expect(entries.page).toEqual([]);
+    }
+  });
+
+  test("large entries reach the embedder in batches", async () => {
+    const chunks = Array.from({ length: 150 }, (_, i) => `banana chunk ${i}`);
+    await addReady({ namespace: "ns", chunks });
+    expect(embedBatchSizes).toEqual([64, 64, 22]);
+    expect(await search({ namespace: "ns", query: "banana", limit: 3 })).toHaveLength(3);
+  });
+
+  test("a retry only embeds the chunks still missing a vector", async () => {
+    const chunks = Array.from({ length: 70 }, (_, i) => `banana chunk ${i}`);
+    const { entryId } = await add({ namespace: "ns", chunks });
+    await until(async () => (await status(entryId))?.state === "ready");
+    embedBatchSizes = [];
+    await runtime.adminWrite(async (db) => {
+      const row = await db.query("docs.chunks").withIndex("by_entry", (q: any) => q.eq("entryId", entryId).eq("ordinal", 69)).unique();
+      await db.patch(row!._id, { vector: undefined });
+      await db.patch(entryId as any, { state: "errored" });
+    });
+    await runtime.runAction("components/docs:embedEntry", { entryId }, { allowInternal: true, source: "dashboard" });
+    expect(embedBatchSizes).toEqual([1]);
+    expect(await status(entryId)).toMatchObject({ state: "ready" });
   });
 
   test("delete removes an entry and its chunks", async () => {

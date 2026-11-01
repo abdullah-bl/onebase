@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 // onebase command line. Also the entry point of the single-file binary.
 
-import { existsSync, mkdirSync, watch, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, statSync, watch, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { directoryAssets, embeddedAssets, startApp, VERSION } from "./app";
@@ -331,9 +331,28 @@ async function devCommand(opts: ReturnType<typeof options>, argv: string[]) {
     if (!name || name.startsWith("_generated") || name.includes("node_modules")) return;
     changed(name);
   });
-  watch(process.cwd(), (_event, file) => {
-    if (file && /^\.env(\..+)?$/.test(String(file))) changed(String(file));
-  });
+  // The .env files are polled, not watched: a watch on the project root makes bun report writes in a
+  // sibling folder like onebase_data/ as changes under `dir`, which restarts the server in a loop.
+  const envFiles = () => {
+    const found = new Map<string, string>();
+    for (const name of readdirSync(process.cwd())) {
+      if (!/^\.env(\..+)?$/.test(name)) continue;
+      try {
+        const stat = statSync(join(process.cwd(), name));
+        found.set(name, `${stat.mtimeMs}:${stat.size}`);
+      } catch {} // removed between the listing and the stat; the next poll sees it gone
+    }
+    return found;
+  };
+  let seen = envFiles();
+  const poll = setInterval(() => {
+    const now = envFiles();
+    for (const name of new Set([...seen.keys(), ...now.keys()])) {
+      if (seen.get(name) !== now.get(name)) changed(name);
+    }
+    seen = now;
+  }, 500);
+  poll.unref();
   const stop = () => {
     child?.kill();
     process.exit(0);

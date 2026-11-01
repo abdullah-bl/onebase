@@ -71,8 +71,8 @@ const hits = await ctx.components.docs.search({ namespace: "help", query: "how d
 |---|---|
 | `setEmbedder({ embed })` | Mutation. Registers your embedder action (once per mount). |
 | `add({ namespace, key?, title?, metadata?, importance?, text?, chunks? })` | Mutation. Stores an entry and schedules embedding; returns `{ entryId }`. |
-| `replace({ entryId \| namespace+key, ... })` | Mutation. Adds a new entry under the same key; the old one serves until the new one is ready, then it's removed. |
-| `delete({ entryId \| namespace+key })` | Mutation. Removes an entry and its chunks. |
+| `replace({ entryId \| namespace+key, text \| chunks, ... })` | Mutation. Adds a new entry under the same key; the old one serves until the new one is ready, then it's removed. Needs new content, and a newer `replace` cancels one still embedding. |
+| `delete({ entryId \| namespace+key })` | Mutation. Removes an entry and its chunks, along with any replacement still embedding. |
 | `search({ namespace, query, limit?, mode? })` | Action. The `limit` (default 10, at most 256) best chunks. |
 | `status({ entryId })` | Query. `{ state, chunkCount, attempts, error }` for one entry. |
 | `list({ namespace, paginationOpts })` | Query. A namespace's entries, oldest first. |
@@ -81,7 +81,7 @@ Namespaces keep indices apart: a help center, a per-tenant corpus, whatever you 
 
 ## Rules to keep in mind
 
-- **Embedding is asynchronous.** Until an entry is `ready` it isn't searchable. A failed embedder marks the entry `errored` with the error; the component retries it every minute, up to 5 attempts.
+- **Embedding is asynchronous.** Until an entry is `ready` it isn't searchable. A failed embedder marks the entry `errored` with the error; the component retries it every minute, up to 5 attempts. Your embedder receives at most 64 texts per call.
 - **`key` is unique per namespace** — `add` with a taken key is refused; use `replace`.
 - **Chunk texts must be non-empty**; `text` that trims to nothing is refused.
 - **The embedder must agree with the mount.** Vectors of the wrong size are rejected with an error naming both counts.

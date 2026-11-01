@@ -141,6 +141,7 @@ Renaming a mount is like removing one and adding another: the new name starts wi
 | [Aggregate](./aggregate.md) | `onebase/components/aggregate` | Counts, sums, ranks and the n-th item over a table in O(log n), kept in step with it |
 | [Sharded counter](./sharded-counter.md) | `onebase/components/sharded-counter` | Counters that many writers can bump at once |
 | [Work queue](./work-queue.md) | `onebase/components/work-queue` | Background actions and mutations with limited parallelism, retries and completion callbacks |
+| [Migrations](./migrations.md) | `onebase/components/migrations` | Batched data migrations with progress tracking that keep going across restarts |
 
 To write your own, see [Writing components](./components-authoring.md).
 

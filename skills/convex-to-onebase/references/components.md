@@ -319,7 +319,7 @@ useQuery(api.components.here.list, { room: roomId }); // was listRoom
 await ctx.components.here.disconnect({ sessionId }); // was disconnect
 ```
 
-`formatRoom`/`listRoom`'s shape becomes `list`'s array of `{ user, sessionId, online, lastActive }`; sessions go offline on their own when heartbeats stop.
+`formatRoom`/`listRoom`'s shape becomes `list`'s array of `{ id, user, online, lastActive }`; sessions go offline on their own when heartbeats stop.
 
 ## Action cache
 

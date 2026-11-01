@@ -100,7 +100,7 @@
         const voter = $("voterName").value;
         if (!voter) return;
         try {
-          const ok = await client.query(api.polls.canVote, { voter });
+          const { ok } = await client.query(api.polls.canVote, { voter });
           for (const { vote } of votes.values()) vote.disabled = !ok;
         } catch {
           /* the server may be restarting; the next tick retries */

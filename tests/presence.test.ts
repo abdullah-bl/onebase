@@ -50,7 +50,10 @@ for (const D of DRIVERS) describe(`${D.name}: presence`, () => {
 
   test("a heartbeat shows the session online, and disconnect marks it offline", async () => {
     await runtime.runMutation("admin:heartbeat", { room: "lobby", user: "ada", sessionId: "s1" });
-    expect(await list("lobby")).toEqual([expect.objectContaining({ user: "ada", sessionId: "s1", online: true })]);
+    const [entry] = await list("lobby");
+    expect(entry).toMatchObject({ user: "ada", online: true });
+    expect(entry.id).toEqual(expect.any(String));
+    expect(entry).not.toHaveProperty("sessionId");
     expect(await runtime.runMutation("admin:disconnect", { sessionId: "s1" })).toBe(true);
     expect((await list("lobby"))[0]!.online).toBe(false);
     expect(await runtime.runMutation("admin:disconnect", { sessionId: "s1" })).toBe(false);
@@ -99,6 +102,28 @@ for (const D of DRIVERS) describe(`${D.name}: presence`, () => {
     expect((await list("lobby"))[0]!.online).toBe(true);
     // No further heartbeats: the chained checks take it offline (10s window + grace + scheduling slack).
     await until(async () => (await list("lobby"))[0]!.online === false, 15_000);
+  });
+
+  test("a client can't ask for an interval past the limit", async () => {
+    await runtime.runMutation("admin:heartbeat", { room: "lobby", user: "ada", sessionId: "s1", interval: 1e12 });
+    let interval = 0;
+    await runtime.adminWrite(async (db) => {
+      const row = await db.query("here.presence").withIndex("by_session", (q: any) => q.eq("sessionId", "s1")).unique();
+      interval = row!.interval as number;
+    });
+    expect(interval).toBe(5 * 60_000);
+  });
+
+  test("sessions offline past the retention window are forgotten", async () => {
+    for (const sessionId of ["old", "recent", "live"]) await runtime.runMutation("admin:heartbeat", { room: "lobby", user: sessionId, sessionId });
+    await runtime.runMutation("admin:disconnect", { sessionId: "old" });
+    await runtime.runMutation("admin:disconnect", { sessionId: "recent" });
+    await runtime.adminWrite(async (db) => {
+      const row = await db.query("here.presence").withIndex("by_session", (q: any) => q.eq("sessionId", "old")).unique();
+      await db.patch(row!._id, { disconnectedAt: Date.now() - 2 * 3_600_000 });
+    });
+    await runtime.runMutation("components/here:prune", {}, { allowInternal: true, source: "dashboard" });
+    expect((await list("lobby")).map((e) => e.user).sort()).toEqual(["live", "recent"]);
   });
 
   test("reconnecting flips a session back online", async () => {

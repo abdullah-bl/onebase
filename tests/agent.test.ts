@@ -43,6 +43,7 @@ const embed = internalAction({
 const components = defineComponents({
   bot: agent({ instructions: "be brief", embeddingDimensions: 3 }),
   other: agent({}),
+  short: agent({ maxHistory: 3 }),
 });
 
 const schema = defineSchema({
@@ -63,13 +64,14 @@ const modules = {
   admin: {
     init: mutation({ args: {}, handler: (ctx: any) => ctx.components.bot.setChat({ chat: internal.ai.chat }) }),
     initEmbed: mutation({ args: {}, handler: (ctx: any) => ctx.components.bot.setEmbedder({ embed: internal.ai.embed }) }),
+    initShort: mutation({ args: {}, handler: (ctx: any) => ctx.components.short.setChat({ chat: internal.ai.chat }) }),
     createThread: mutation({ args: { title: v.optional(v.string()), userId: v.optional(v.string()), mount: v.optional(v.string()) }, handler: (ctx: any, { mount = "bot", ...args }) => ctx.components[mount].createThread(args) }),
     generate: action({
       args: { threadId: v.string(), prompt: v.string(), maxSteps: v.optional(v.number()), mount: v.optional(v.string()) },
       handler: (ctx: any, { mount = "bot", ...args }) => ctx.components[mount].generateText({ ...args, tools: [{ name: "weather", kind: "mutation", fn: internal.tools.weather, description: "current weather" }] }),
     }),
     messages: query({ args: { threadId: v.string() }, handler: (ctx: any, { threadId }) => ctx.components.bot.listMessages({ threadId, paginationOpts: { numItems: 50, cursor: null } }) }),
-    threads: query({ args: { userId: v.optional(v.string()), mount: v.optional(v.string()) }, handler: (ctx: any, { mount = "bot", userId }) => ctx.components[mount].listThreads({ userId, paginationOpts: { numItems: 50, cursor: null } }) }),
+    threads: query({ args: { userId: v.optional(v.string()), status: v.optional(v.union(v.literal("active"), v.literal("archived"))), mount: v.optional(v.string()) }, handler: (ctx: any, { mount = "bot", ...args }) => ctx.components[mount].listThreads({ ...args, paginationOpts: { numItems: 50, cursor: null } }) }),
     thread: query({ args: { threadId: v.string() }, handler: (ctx: any, { threadId }) => ctx.components.bot.getThread({ threadId }) }),
     deleteThread: mutation({ args: { threadId: v.string() }, handler: (ctx: any, { threadId }) => ctx.components.bot.deleteThread({ threadId }) }),
     searchMessages: action({ args: { threadId: v.string(), query: v.string() }, handler: (ctx: any, { threadId, query }) => ctx.components.bot.searchMessages({ threadId, query }) }),
@@ -217,6 +219,36 @@ for (const D of DRIVERS) describe(`${D.name}: agent`, () => {
     await until(async () => (await count("bot.messages")) === 1 && (await count("bot.streams")) === 0 && (await count("bot.deltas")) === 0, 25_000);
     expect((await messages(other.threadId)).map((m) => m.text)).toEqual(["stay"]);
   }, 30_000); // a thousand inserts take a while on a networked database
+
+  test("listThreads filters by status, with or without a user", async () => {
+    const live = await thread({ userId: "a" });
+    const archived = await thread({ userId: "a" });
+    await thread({ userId: "b" });
+    await runtime.adminWrite((db) => db.patch(archived.threadId as any, { status: "archived" }));
+    const ids = async (args: Record<string, unknown>) => ((await q("admin:threads", args)) as any).page.map((t: any) => t.id);
+    expect(await ids({ userId: "a" })).toEqual([live.threadId]);
+    expect(await ids({ userId: "a", status: "active" })).toEqual([live.threadId]);
+    expect(await ids({ userId: "a", status: "archived" })).toEqual([archived.threadId]);
+    expect(await ids({ status: "archived" })).toEqual([archived.threadId]);
+  });
+
+  test("the history window never opens on a tool result", async () => {
+    await runtime.runMutation("admin:initShort", {});
+    const { threadId } = await thread({ mount: "short" });
+    await runtime.adminWrite(async (db) => {
+      for (const [order, row] of [
+        { role: "user", text: "weather?" },
+        { role: "assistant", toolCalls: [{ name: "weather", args: {} }] },
+        { role: "tool", name: "weather", toolResults: [{ name: "weather", result: "sunny" }] },
+        { role: "assistant", text: "It's sunny." },
+      ].entries()) {
+        await db.insert("short.messages", { threadId, order, ...row });
+      }
+    });
+    // The prompt makes five messages; the last three would start on the tool result.
+    await runtime.runAction("admin:generate", { threadId, prompt: "thanks", mount: "short" });
+    expect(lastCall!.messages.map((m) => m.role)).toEqual(["assistant", "user"]);
+  });
 
   test("threads are listed per user and deleting one removes its messages", async () => {
     await runtime.runMutation("admin:init", {});

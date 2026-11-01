@@ -98,6 +98,11 @@ for (const D of DRIVERS) describe(`${D.name}: rag`, () => {
     await until(async () => (await status(entryId))?.state === "ready");
     return entryId;
   };
+  /** Makes the entry due and runs the retry pass by hand, since the cron only comes round every minute. */
+  const retryNow = async (entryId: string) => {
+    await runtime.adminWrite((db) => db.patch(entryId as any, { retryAt: Date.now() - 1 }));
+    await runtime.runMutation("components/docs:retryPending", {}, { allowInternal: true, source: "dashboard" });
+  };
   const until = async (check: () => Promise<boolean>, ms = 5000) => {
     for (const end = Date.now() + ms; Date.now() < end; await Bun.sleep(20)) if (await check()) return;
     throw new Error("timed out waiting");
@@ -233,11 +238,47 @@ for (const D of DRIVERS) describe(`${D.name}: rag`, () => {
     await until(async () => (await status(added.entryId))?.state === "errored");
     expect((await status(added.entryId)).error).toBe("embedder down");
     expect((await status(added.entryId)).attempts).toBe(1);
-    // The cron only picks up stale entries; age this one and run the retry pass by hand.
-    await runtime.adminWrite((db) => db.patch(added.entryId, { updatedAt: Date.now() - 120_000 }));
-    await runtime.runMutation("components/docs:retryPending", {}, { allowInternal: true, source: "dashboard" });
+    await retryNow(added.entryId);
     await until(async () => (await status(added.entryId))?.state === "ready");
     expect(await search({ namespace: "ns", query: "banana" })).toHaveLength(1);
+  });
+
+  test("entries out of attempts don't block the retries behind them", async () => {
+    await runtime.adminWrite(async (db) => {
+      for (let i = 0; i < 60; i++) await db.insert("docs.entries", { namespace: "ns", importance: 0, state: "errored", chunkCount: 0, attempts: 5, updatedAt: 1 });
+    });
+    embedFails = 1;
+    const added = await add({ namespace: "ns", text: "Bananas someday." });
+    await until(async () => (await status(added.entryId))?.state === "errored");
+    await retryNow(added.entryId);
+    await until(async () => (await status(added.entryId))?.state === "ready");
+  });
+
+  test("an entry stops retrying after its last attempt", async () => {
+    embedFails = 5;
+    const added = await add({ namespace: "ns", text: "Bananas someday." });
+    await until(async () => (await status(added.entryId))?.attempts === 1);
+    for (let attempt = 2; attempt <= 5; attempt++) {
+      await retryNow(added.entryId);
+      await until(async () => (await status(added.entryId))?.attempts === attempt);
+    }
+    embedBatchSizes = [];
+    await runtime.runMutation("components/docs:retryPending", {}, { allowInternal: true, source: "dashboard" });
+    await Bun.sleep(100);
+    expect(embedBatchSizes).toEqual([]);
+    expect(await status(added.entryId)).toMatchObject({ state: "errored", attempts: 5 });
+  });
+
+  test("two retry passes in a row start one run", async () => {
+    embedFails = 1;
+    const added = await add({ namespace: "ns", text: "Bananas someday." });
+    await until(async () => (await status(added.entryId))?.state === "errored");
+    embedBatchSizes = [];
+    await retryNow(added.entryId);
+    await runtime.runMutation("components/docs:retryPending", {}, { allowInternal: true, source: "dashboard" });
+    await until(async () => (await status(added.entryId))?.state === "ready");
+    await Bun.sleep(100);
+    expect(embedBatchSizes).toEqual([1]);
   });
 
   test("an embedder with the wrong dimensions is reported, not stored", async () => {

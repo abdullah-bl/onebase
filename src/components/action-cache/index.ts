@@ -30,6 +30,8 @@ const schema = defineSchema({
     error: v.optional(v.string()),
     expiresAt: v.number(),
     createdAt: v.number(),
+    /** Who's running the computation: only the holder's result gets stored. */
+    claim: v.optional(v.string()),
   })
     .index("by_key", ["key"])
     .index("by_expiresAt", ["expiresAt"]),
@@ -42,38 +44,53 @@ const claimFor = (config: Config) => Math.max(1, config.claimMs ?? 30_000);
 
 /**
  * Reads a cached result and claims the key on a miss: `"hit"` carries the stored value, `"miss"`
- * means the caller won the claim and should run the computation, `"inProgress"` means someone
- * else is running it right now.
+ * means the caller won the claim and should run the computation (pass `claim` back to `write`),
+ * `"inProgress"` means someone else is running it right now.
  */
 const read = mutation({
   args: { key: v.string() },
   handler: async (ctx, { key }) => {
     const now = Date.now();
+    const claim = crypto.randomUUID();
     const row = await ctx.db.query("entries").withIndex("by_key", (q: any) => q.eq("key", key)).first();
     if (!row || (row.state === "completed" && row.expiresAt <= now)) {
       if (row) await ctx.db.delete(row._id);
-      await ctx.db.insert("entries", { key, state: "inProgress", expiresAt: now + claimFor(ctx.config), createdAt: now });
-      return { state: "miss" as const };
+      await ctx.db.insert("entries", { key, state: "inProgress", expiresAt: now + claimFor(ctx.config), createdAt: now, claim });
+      return { state: "miss" as const, claim };
     }
     if (row.state === "inProgress" && row.expiresAt <= now) {
       // The runner went away: take the claim over.
-      await ctx.db.patch(row._id, { expiresAt: now + claimFor(ctx.config), createdAt: now });
-      return { state: "miss" as const };
+      await ctx.db.patch(row._id, { expiresAt: now + claimFor(ctx.config), createdAt: now, claim });
+      return { state: "miss" as const, claim };
     }
     if (row.state === "inProgress") return { state: "inProgress" as const };
     return { state: "hit" as const, value: row.result ?? null };
   },
 });
 
-/** Stores a computed result for the TTL (default: the mount's). */
+/**
+ * Stores a computed result for the TTL (default: the mount's). With `claim`, it stores only if that
+ * claim still holds: a key invalidated or taken over mid-run keeps the old result out of the cache.
+ */
 const write = mutation({
-  args: { key: v.string(), value: v.any(), ttl: v.optional(v.number()) },
-  handler: async (ctx, { key, value, ttl }) => {
+  args: { key: v.string(), value: v.any(), ttl: v.optional(v.number()), claim: v.optional(v.string()) },
+  handler: async (ctx, { key, value, ttl, claim }) => {
     const now = Date.now();
     const row = await ctx.db.query("entries").withIndex("by_key", (q: any) => q.eq("key", key)).first();
-    const entry = { state: "completed" as const, result: value === undefined ? null : value, error: undefined, expiresAt: now + ttlFor(ctx.config, ttl), createdAt: now };
+    if (claim !== undefined && row?.claim !== claim) return null;
+    const entry = { state: "completed" as const, result: value === undefined ? null : value, error: undefined, expiresAt: now + ttlFor(ctx.config, ttl), createdAt: now, claim: undefined };
     if (row) await ctx.db.patch(row._id, entry);
     else await ctx.db.insert("entries", { key, ...entry });
+    return null;
+  },
+});
+
+/** Gives a claim back after a failed run, so the next caller runs the computation right away. */
+const release = mutation({
+  args: { key: v.string(), claim: v.string() },
+  handler: async (ctx, { key, claim }) => {
+    const row = await ctx.db.query("entries").withIndex("by_key", (q: any) => q.eq("key", key)).first();
+    if (row?.claim === claim) await ctx.db.delete(row._id);
     return null;
   },
 });
@@ -121,17 +138,18 @@ const cleanup = internalMutation({
 export const definition = defineComponent({
   name: "actionCache",
   schema,
-  functions: { read, write, invalidate, peek, cleanup },
+  functions: { read, write, release, invalidate, peek, cleanup },
   crons: () => [{ name: "cleanup", schedule: { minutes: 1 }, fn: cleanup }],
 });
 
 // ---- Types and the app-side helper ----
 
-export type CacheRead = { state: "hit"; value: unknown } | { state: "miss" } | { state: "inProgress" };
+export type CacheRead = { state: "hit"; value: unknown } | { state: "miss"; claim: string } | { state: "inProgress" };
 
 export type ActionCacheApi = {
   read: ComponentFn<"mutation", (args: { key: string }) => Promise<CacheRead>>;
-  write: ComponentFn<"mutation", (args: { key: string; value: unknown; ttl?: number }) => Promise<null>>;
+  write: ComponentFn<"mutation", (args: { key: string; value: unknown; ttl?: number; claim?: string }) => Promise<null>>;
+  release: ComponentFn<"mutation", (args: { key: string; claim: string }) => Promise<null>>;
   invalidate: ComponentFn<"mutation", (args: { key?: string; prefix?: string }) => Promise<number>>;
   peek: ComponentFn<"query", (args: { key: string }) => Promise<{ key: string; result: unknown; expiresAt: number } | null>>;
 };
@@ -146,13 +164,13 @@ export function actionCache<const E extends keyof ActionCacheApi = never>(opts: 
  * Wraps one of your actions in the cache: `cached("cache", internal.reports.computeSales, (args) => ...)`.
  * The key is prefixed with the action's name, so one mount caches many functions. On a miss the
  * claim is ours and the action runs; while another caller holds the claim we poll briefly for its
- * result, then run the action ourselves rather than wait forever. The action's args and its
- * return value must be storable JSON.
+ * result, then run the action ourselves rather than wait forever, leaving the cache to the claim's
+ * holder. The action's args and its return value must be storable JSON.
  */
 type CallableCache = {
   read: (args: { key: string }) => Promise<CacheRead>;
-  write: (args: { key: string; value: unknown; ttl?: number }) => Promise<null>;
-  invalidate: (args: { key?: string; prefix?: string }) => Promise<number>;
+  write: (args: { key: string; value: unknown; ttl?: number; claim?: string }) => Promise<null>;
+  release: (args: { key: string; claim: string }) => Promise<null>;
 };
 
 export function cached<A extends Record<string, unknown>, R>(
@@ -167,25 +185,21 @@ export function cached<A extends Record<string, unknown>, R>(
     const cache = (ctx.components as any)[mount] as CallableCache | undefined;
     if (!cache) throw new Error(`cached: no component mounted as "${mount}". Mount actionCache under that name.`);
     const key = `${String((fn as any)?.[Symbol.for("onebase.functionPath")] ?? fn)}:${keyFor(args)}`;
-    const claim = await cache.read({ key });
-    if (claim.state === "hit") return claim.value as R;
-    if (claim.state === "inProgress") {
-      for (const end = Date.now() + timeoutMs; Date.now() < end; await new Promise((r) => setTimeout(r, pollMs))) {
-        const again = await cache.read({ key });
-        if (again.state === "hit") return again.value as R;
-        if (again.state === "miss") break; // the claim expired: take it over below
-      }
-      const last = await cache.read({ key });
-      if (last.state === "hit") return last.value as R;
+    let seen = await cache.read({ key });
+    for (const end = Date.now() + timeoutMs; seen.state === "inProgress" && Date.now() < end; ) {
+      await new Promise((r) => setTimeout(r, pollMs));
+      seen = await cache.read({ key });
     }
+    if (seen.state === "hit") return seen.value as R;
+    const claim = seen.state === "miss" ? seen.claim : undefined;
     let value: R;
     try {
       value = await (ctx as any).runAction(fn, args);
     } catch (err) {
-      await cache.invalidate({ key });
+      if (claim) await cache.release({ key, claim });
       throw err;
     }
-    await cache.write({ key, value, ttl: opts.ttl });
+    if (claim) await cache.write({ key, value, ttl: opts.ttl, claim });
     return value;
   };
 }

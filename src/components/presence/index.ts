@@ -7,7 +7,7 @@
 //   // client, every few seconds (expose heartbeat and list when mounting)
 //   api.components.here.heartbeat({ room: "lobby", user: userId, sessionId });
 //   // live query
-//   useQuery(api.components.here.list, { room: "lobby" }) // [{ user, sessionId, online, lastActive }]
+//   useQuery(api.components.here.list, { room: "lobby" }) // [{ id, user, online, lastActive }]
 
 import { componentServer, defineComponent, splitMountOptions, type ComponentFn, type Mount, type MountOptions } from "..";
 import { defineSchema, defineTable, type DataModelFromSchema } from "../../schema";
@@ -18,6 +18,8 @@ type Config = {
   heartbeatInterval?: number;
   /** Extra grace before the scheduled check gives up on a session (default 5_000 ms). */
   heartbeatTimer?: number;
+  /** How long an offline session stays in `list` before it's forgotten (default 1 hour). */
+  offlineRetentionMs?: number;
 };
 
 const schema = defineSchema({
@@ -34,12 +36,17 @@ const schema = defineSchema({
     checkAt: v.optional(v.number()),
   })
     .index("by_room", ["room", "online", "lastActive"])
-    .index("by_session", ["sessionId"]),
+    .index("by_session", ["sessionId"])
+    .index("by_online_disconnectedAt", ["online", "disconnectedAt"]),
 });
 
 const { query, mutation, internalMutation } = componentServer<DataModelFromSchema<typeof schema>, Config>();
 
-const intervalFor = (config: Config, override?: number) => Math.max(1_000, override ?? config.heartbeatInterval ?? 10_000);
+/** The longest `interval` a heartbeat may ask for, so a client can't stay online long after it's gone. */
+const MAX_SESSION_INTERVAL = 5 * 60_000;
+
+const intervalFor = (config: Config, override?: number) =>
+  Math.max(1_000, override === undefined ? (config.heartbeatInterval ?? 10_000) : Math.min(override, MAX_SESSION_INTERVAL));
 const staleAfter = (config: Config, interval: number) => interval + (config.heartbeatTimer ?? 5_000);
 
 /** Makes this the session's one live check, due `delayMs` from now. */
@@ -106,19 +113,32 @@ const list = query({
     const rows = await ctx.db.query("presence").withIndex("by_room", (q: any) => q.eq("room", room)).collect();
     return rows
       .sort((a: any, b: any) => Number(b.online) - Number(a.online) || b.lastActive - a.lastActive)
-      .map((row: any) => ({ user: row.user as string, sessionId: row.sessionId as string, online: row.online as boolean, lastActive: row.lastActive as number, disconnectedAt: row.disconnectedAt ?? null }));
+      // Never the sessionId: holding one is what lets a client heartbeat or disconnect that session.
+      .map((row: any) => ({ id: row._id as string, user: row.user as string, online: row.online as boolean, lastActive: row.lastActive as number, disconnectedAt: row.disconnectedAt ?? null }));
+  },
+});
+
+/** Every minute: forgets sessions that have been offline past the retention window. */
+const prune = internalMutation({
+  args: {},
+  handler: async (ctx) => {
+    const before = Date.now() - (ctx.config.offlineRetentionMs ?? 3_600_000);
+    const old = await ctx.db.query("presence").withIndex("by_online_disconnectedAt", (q: any) => q.eq("online", false).lt("disconnectedAt", before)).take(500);
+    for (const row of old) await ctx.db.delete(row._id);
+    return null;
   },
 });
 
 export const definition = defineComponent({
   name: "presence",
   schema,
-  functions: { heartbeat, list, disconnect, checkSession },
+  functions: { heartbeat, list, disconnect, checkSession, prune },
+  crons: () => [{ name: "prune", schedule: { minutes: 1 }, fn: prune }],
 });
 
 // ---- Types for the app ----
 
-export type PresenceEntry = { user: string; sessionId: string; online: boolean; lastActive: number; disconnectedAt: number | null };
+export type PresenceEntry = { id: string; user: string; online: boolean; lastActive: number; disconnectedAt: number | null };
 
 export type PresenceApi = {
   heartbeat: ComponentFn<"mutation", (args: { room: string; user: string; sessionId: string; interval?: number }) => Promise<null>>;

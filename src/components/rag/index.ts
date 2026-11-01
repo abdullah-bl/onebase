@@ -41,6 +41,9 @@ const message = (err: unknown) => (err instanceof Error ? err.message : String(e
 
 /** Chunks sent to the embedder in one call, and written back in one transaction. */
 const EMBED_BATCH = 64;
+/** How long an embedding run may go without progress before it's tried again. */
+const RETRY_AFTER = 60_000;
+const MAX_ATTEMPTS = 5;
 /** Search reads this many times `limit`, since hits from entries that aren't searchable get skipped. */
 const SEARCH_OVERFETCH = 3;
 const MAX_SEARCH = 256;
@@ -120,9 +123,11 @@ export function rag<const E extends keyof RagApi = never>(opts: Config & MountOp
       attempts: v.number(),
       error: v.optional(v.string()),
       updatedAt: v.number(),
+      /** When to try embedding again; unset once the entry is ready or out of attempts. */
+      retryAt: v.optional(v.number()),
     })
       .index("by_namespace_key", ["namespace", "key"])
-      .index("by_state_updatedAt", ["state", "updatedAt"]),
+      .index("by_retryAt", ["retryAt"]),
     chunks: defineTable({
       namespace: v.string(),
       entryId: v.string(),
@@ -214,6 +219,7 @@ export function rag<const E extends keyof RagApi = never>(opts: Config & MountOp
       replaces: args.replaces,
       attempts: 0,
       updatedAt: now,
+      retryAt: now + RETRY_AFTER,
     });
     for (let ordinal = 0; ordinal < texts.length; ordinal++) {
       await ctx.db.insert("chunks", { namespace: args.namespace, entryId, ordinal, text: texts[ordinal]! });
@@ -257,7 +263,7 @@ export function rag<const E extends keyof RagApi = never>(opts: Config & MountOp
         text: args.text,
         chunks: args.chunks,
       });
-      await ctx.db.patch(serving._id, { state: "replacing", replacedBy: newId, updatedAt: Date.now() });
+      await ctx.db.patch(serving._id, { state: "replacing", replacedBy: newId, updatedAt: Date.now(), retryAt: undefined });
       return { entryId: newId };
     },
   });
@@ -393,7 +399,7 @@ export function rag<const E extends keyof RagApi = never>(opts: Config & MountOp
             return null;
           }
         }
-        await ctx.runMutation(setVectors, { vectors: batch.map((c: any, i: number) => ({ id: c._id, vector: (vectors as number[][])[i]! })) });
+        await ctx.runMutation(setVectors, { entryId, vectors: batch.map((c: any, i: number) => ({ id: c._id, vector: (vectors as number[][])[i]! })) });
       }
       await ctx.runMutation(markReady, { entryId });
       return null;
@@ -401,12 +407,15 @@ export function rag<const E extends keyof RagApi = never>(opts: Config & MountOp
   });
 
   const setVectors = internalMutation({
-    args: { vectors: v.array(v.object({ id: v.string(), vector: v.array(v.number()) })) },
-    handler: async (ctx, { vectors }) => {
+    args: { entryId: v.string(), vectors: v.array(v.object({ id: v.string(), vector: v.array(v.number()) })) },
+    handler: async (ctx, { entryId, vectors }) => {
       for (const { id, vector } of vectors) {
         // The entry may have been deleted or replaced while the embedder ran.
         if (await ctx.db.get(id as GenericId<"chunks">)) await ctx.db.patch(id as GenericId<"chunks">, { vector });
       }
+      // This run is making progress, so the retry pass shouldn't start another beside it.
+      const entry = await ctx.db.get(entryId as GenericId<"entries">);
+      if (entry && (entry.state === "pending" || entry.state === "errored")) await ctx.db.patch(entry._id, { retryAt: Date.now() + RETRY_AFTER });
       return null;
     },
   });
@@ -416,7 +425,8 @@ export function rag<const E extends keyof RagApi = never>(opts: Config & MountOp
     handler: async (ctx, { entryId, error }) => {
       const entry = await ctx.db.get(entryId as GenericId<"entries">);
       if (!entry || (entry.state !== "pending" && entry.state !== "errored")) return null;
-      await ctx.db.patch(entry._id, { state: "errored", error, attempts: entry.attempts + 1, updatedAt: Date.now() });
+      const attempts = entry.attempts + 1;
+      await ctx.db.patch(entry._id, { state: "errored", error, attempts, updatedAt: Date.now(), retryAt: attempts < MAX_ATTEMPTS ? Date.now() + RETRY_AFTER : undefined });
       return null;
     },
   });
@@ -426,7 +436,7 @@ export function rag<const E extends keyof RagApi = never>(opts: Config & MountOp
     handler: async (ctx, { entryId }) => {
       const entry = await ctx.db.get(entryId as GenericId<"entries">);
       if (!entry || (entry.state !== "pending" && entry.state !== "errored")) return null;
-      await ctx.db.patch(entry._id, { state: "ready", error: undefined, updatedAt: Date.now() });
+      await ctx.db.patch(entry._id, { state: "ready", error: undefined, updatedAt: Date.now(), retryAt: undefined });
       if (entry.replaces) {
         const old = await ctx.db.get(entry.replaces as GenericId<"entries">);
         if (old) await removeEntry(ctx, old);
@@ -435,20 +445,18 @@ export function rag<const E extends keyof RagApi = never>(opts: Config & MountOp
     },
   });
 
-  /** Every minute: retries entries whose embedding failed (up to 5 attempts). */
+  /** Every minute: retries entries whose embedding failed or stalled (up to 5 failed attempts). */
   const retryPending = internalMutation({
     args: {},
     handler: async (ctx) => {
       const now = Date.now();
-      for (const state of ["pending", "errored"] as const) {
-        const stale = await ctx.db
-          .query("entries")
-          .withIndex("by_state_updatedAt", (q: any) => q.eq("state", state).lt("updatedAt", now - 60_000))
-          .take(50);
-        for (const entry of stale) {
-          if (entry.attempts >= 5) continue;
-          await ctx.scheduler.runAfter(0, embedEntry, { entryId: entry._id });
-        }
+      const due = await ctx.db
+        .query("entries")
+        .withIndex("by_retryAt", (q: any) => q.gt("retryAt", 0).lte("retryAt", now))
+        .take(50);
+      for (const entry of due) {
+        await ctx.db.patch(entry._id, { retryAt: now + RETRY_AFTER });
+        await ctx.scheduler.runAfter(0, embedEntry, { entryId: entry._id });
       }
       return null;
     },

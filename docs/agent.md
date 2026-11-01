@@ -86,7 +86,7 @@ Clients poll `getStreamChunks({ streamId, cursor })` (a live query — `{ text, 
 | `setChat({ chat })` | Mutation. Registers your chat fn (once per mount; call again to change it). |
 | `setEmbedder({ embed })` | Mutation. Registers your embedder for searchable history. |
 | `createThread({ userId?, title? })` | Mutation. Returns `{ threadId }`. |
-| `getThread({ threadId })` / `listThreads({ userId?, status?, paginationOpts })` | Queries. |
+| `getThread({ threadId })` / `listThreads({ userId?, status?, paginationOpts })` | Queries. `status` defaults to `"active"`. |
 | `deleteThread({ threadId })` | Mutation. Removes the thread right away, and its messages and streams too; for a long thread, those finish in the background. |
 | `saveMessage({ threadId, role, text?, ... })` | Mutation. Appends a message by hand. |
 | `listMessages({ threadId, paginationOpts })` | Live query. |

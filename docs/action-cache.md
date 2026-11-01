@@ -35,14 +35,15 @@ const salesReport = cached("cache", internal.reports.computeSales, (args) => `${
 const report = await salesReport(ctx, { org, month });
 ```
 
-The cache key is the action's name plus your key, so one cache mount serves many functions. Arguments and return values must be storable JSON. On a miss the wrapper claims the key and runs the action; a caller that sees someone else's claim polls briefly for the stored result and, if the claim outlives its patience, runs the action itself rather than wait forever — so a crashed runner can't block a key. A computation that throws isn't cached and its error is rethrown.
+The cache key is the action's name plus your key, so one cache mount serves many functions. Arguments and return values must be storable JSON. On a miss the wrapper claims the key and runs the action; a caller that sees someone else's claim polls briefly for the stored result and, if the claim outlives its patience, runs the action itself rather than wait forever — so a crashed runner can't block a key. That caller's result isn't stored, since the claim isn't theirs. A computation that throws isn't cached and its error is rethrown. If you invalidate a key while its action is running, that run's result isn't stored either.
 
 ## Functions
 
 | | |
 |---|---|
-| `read({ key })` | Mutation. `"hit"` with the value, `"miss"` (with the claim granted), or `"inProgress"`. |
-| `write({ key, value, ttl? })` | Mutation. Stores a result for the TTL. |
+| `read({ key })` | Mutation. `"hit"` with the value, `"miss"` with the `claim` you were granted, or `"inProgress"`. |
+| `write({ key, value, ttl?, claim? })` | Mutation. Stores a result for the TTL. With `claim`, only if that claim still holds. |
+| `release({ key, claim })` | Mutation. Gives a claim back after a failed run. |
 | `invalidate({ key? , prefix? })` | Mutation. Forgets one key, or every key with a prefix; returns how many. |
 | `peek({ key })` | Query. The stored result and its expiry, if any. |
 

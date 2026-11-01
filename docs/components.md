@@ -144,6 +144,7 @@ Renaming a mount is like removing one and adding another: the new name starts wi
 | [Migrations](./migrations.md) | `onebase/components/migrations` | Batched data migrations with progress tracking that keep going across restarts |
 | [Workflow](./workflow.md) | `onebase/components/workflow` | Durable multi-step workflows: journaled steps, sleeps, out-of-band actions, retries |
 | [RAG](./rag.md) | `onebase/components/rag` | Chunked, embedded documents searched by vector, text or both |
+| [Agent](./agent.md) | `onebase/components/agent` | AI agents with threads, tool calling, usage and streams, over any provider |
 
 To write your own, see [Writing components](./components-authoring.md).
 

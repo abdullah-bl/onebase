@@ -39,6 +39,15 @@ type Ctx = { db: any; config: Config; scheduler: any; runQuery: any; runMutation
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
+/** Chunks sent to the embedder in one call, and written back in one transaction. */
+const EMBED_BATCH = 64;
+/** Search reads this many times `limit`, since hits from entries that aren't searchable get skipped. */
+const SEARCH_OVERFETCH = 3;
+const MAX_SEARCH = 256;
+
+/** An entry serves searches once it's ready, and keeps serving while its replacement embeds. */
+const searchable = (entry: any) => entry.state === "ready" || entry.state === "replacing";
+
 /** Splits `text` into chunks of at most `maxChars`, sharing `overlap` characters between neighbors. */
 export function chunkText(text: string, maxChars = 1000, overlap = 100): string[] {
   if (text.length <= maxChars) return text.trim() ? [text.trim()] : [];
@@ -176,17 +185,19 @@ export function rag<const E extends keyof RagApi = never>(opts: Config & MountOp
       ctx.db.query("chunks").withSearchIndex("by_text", (q: any) => q.search("text", text).eq("namespace", namespace)).take(limit),
   });
 
+  /** One batch of an entry's chunks after ordinal `after`, with those still lacking a vector. `last` is null at the end. */
   const missingVectors = internalQuery({
-    args: { entryId: v.string() },
-    handler: async (ctx, { entryId }) => {
-      const chunks = await ctx.db.query("chunks").withIndex("by_entry", (q: any) => q.eq("entryId", entryId)).collect();
-      return chunks.filter((c: any) => c.vector === undefined);
+    args: { entryId: v.string(), after: v.number() },
+    handler: async (ctx, { entryId, after }) => {
+      const chunks = await ctx.db.query("chunks").withIndex("by_entry", (q: any) => q.eq("entryId", entryId).gt("ordinal", after)).take(EMBED_BATCH);
+      return { missing: chunks.filter((c: any) => c.vector === undefined), last: (chunks.at(-1)?.ordinal ?? null) as number | null };
     },
   });
 
   /** Inserts the entry and its chunks, then schedules the embedder. */
   async function addEntry(ctx: { db: any; config: Config; scheduler: any }, args: { namespace: string; key?: string; title?: string; metadata?: unknown; importance?: number; replaces?: string; text?: string; chunks?: string[] }) {
-    const texts = args.text !== undefined ? chunkText(args.text, chunkingFor(ctx.config).maxChars, chunkingFor(ctx.config).overlap) : args.chunks ?? [];
+    if (args.text === undefined && !args.chunks?.length) throw new Error("add and replace need content: pass text or chunks.");
+    const texts =args.text !== undefined ? chunkText(args.text, chunkingFor(ctx.config).maxChars, chunkingFor(ctx.config).overlap) : args.chunks ?? [];
     if (args.text !== undefined && texts.length === 0) throw new Error("add: the text is empty.");
     for (const text of texts) {
       if (typeof text !== "string" || text.length === 0) throw new Error("add: chunks must be non-empty strings.");
@@ -233,17 +244,20 @@ export function rag<const E extends keyof RagApi = never>(opts: Config & MountOp
         old = await ctx.db.query("entries").withIndex("by_namespace_key", (q: any) => q.eq("namespace", args.namespace).eq("key", args.key)).first();
       } else throw new Error("replace: pass entryId, or namespace and key.");
       if (!old) throw new Error("replace: no such entry.");
+      const { serving, incoming } = await replacementPair(ctx, old);
+      // A newer replace wins over one still embedding.
+      if (incoming) await removeEntry(ctx, incoming);
       const newId = await addEntry(ctx, {
-        namespace: old.namespace,
-        key: old.key ?? undefined,
-        title: args.title ?? old.title ?? undefined,
-        metadata: args.metadata ?? old.metadata ?? undefined,
-        importance: args.importance ?? old.importance,
-        replaces: old._id,
+        namespace: serving.namespace,
+        key: serving.key ?? undefined,
+        title: args.title ?? serving.title ?? undefined,
+        metadata: args.metadata ?? serving.metadata ?? undefined,
+        importance: args.importance ?? serving.importance,
+        replaces: serving._id,
         text: args.text,
         chunks: args.chunks,
       });
-      await ctx.db.patch(old._id, { state: "replacing", replacedBy: newId, updatedAt: Date.now() });
+      await ctx.db.patch(serving._id, { state: "replacing", replacedBy: newId, updatedAt: Date.now() });
       return { entryId: newId };
     },
   });
@@ -258,10 +272,25 @@ export function rag<const E extends keyof RagApi = never>(opts: Config & MountOp
         entry = await ctx.db.query("entries").withIndex("by_namespace_key", (q: any) => q.eq("namespace", args.namespace).eq("key", args.key)).first();
       } else throw new Error("delete: pass entryId, or namespace and key.");
       if (!entry) return false;
-      await removeEntry(ctx, entry);
+      const { serving, incoming } = await replacementPair(ctx, entry);
+      if (incoming) await removeEntry(ctx, incoming);
+      await removeEntry(ctx, serving);
       return true;
     },
   });
+
+  /**
+   * While a replacement embeds, one document is two rows sharing a key: `serving` answers searches
+   * and `incoming` will take over. Given either row, this returns both, so nothing acts on half.
+   */
+  async function replacementPair(ctx: { db: any }, entry: any): Promise<{ serving: any; incoming: any }> {
+    if (entry.state !== "ready" && entry.replaces) {
+      const base = await ctx.db.get(entry.replaces as GenericId<"entries">);
+      if (base) return { serving: base, incoming: entry };
+    }
+    const incoming = entry.replacedBy ? await ctx.db.get(entry.replacedBy as GenericId<"entries">) : null;
+    return { serving: entry, incoming };
+  }
 
   async function removeEntry(ctx: { db: any }, entry: any) {
     for (const chunk of await ctx.db.query("chunks").withIndex("by_entry", (q: any) => q.eq("entryId", entry._id)).collect()) {
@@ -295,6 +324,7 @@ export function rag<const E extends keyof RagApi = never>(opts: Config & MountOp
       const limit = args.limit ?? 10;
       if (!Number.isInteger(limit) || limit < 1 || limit > 256) throw new Error("search: limit must be a whole number from 1 to 256.");
       const mode = args.mode ?? "vector";
+      const fetchLimit = Math.min(limit * SEARCH_OVERFETCH, MAX_SEARCH);
       const results: RagResult[] = [];
       const seen = new Set<string>(); // chunk ids, so hybrid doesn't list a chunk twice
 
@@ -304,24 +334,30 @@ export function rag<const E extends keyof RagApi = never>(opts: Config & MountOp
         if (!Array.isArray(vector) || vector.length !== ctx.config.dimensions) {
           throw new Error(`search: the embedder returned ${Array.isArray(vector) ? vector.length : "no"} dimensions, this mount indexes ${ctx.config.dimensions}.`);
         }
-        const hits = await ctx.vectorSearch("chunks", "by_vector", { vector, limit, filter: (q: any) => q.eq("namespace", args.namespace) });
+        const hits = await ctx.vectorSearch("chunks", "by_vector", { vector, limit: fetchLimit, filter: (q: any) => q.eq("namespace", args.namespace) });
+        let found = 0;
         for (const hit of hits) {
+          if (found === limit) break;
           const chunk = await ctx.runQuery(chunkRow, { id: hit._id });
           if (!chunk || seen.has(chunk._id)) continue;
           seen.add(chunk._id);
           const entry = await ctx.runQuery(entryRow, { entryId: chunk.entryId });
-          if (!entry) continue;
+          if (!entry || !searchable(entry)) continue;
           results.push({ entryId: entry._id, text: chunk.text, score: hit._score + (entry.importance ?? 0), title: entry.title ?? null, metadata: entry.metadata ?? null });
+          found++;
         }
       }
       if (mode !== "vector") {
-        const rows = await ctx.runQuery(searchText, { namespace: args.namespace, query: args.query, limit });
+        const rows = await ctx.runQuery(searchText, { namespace: args.namespace, query: args.query, limit: fetchLimit });
+        let found = 0;
         for (const chunk of rows) {
+          if (found === limit) break;
           if (seen.has(chunk._id)) continue;
           seen.add(chunk._id);
           const entry = await ctx.runQuery(entryRow, { entryId: chunk.entryId });
-          if (!entry) continue;
+          if (!entry || !searchable(entry)) continue;
           results.push({ entryId: entry._id, text: chunk.text, score: null, title: entry.title ?? null, metadata: entry.metadata ?? null });
+          found++;
         }
       }
       return results.sort((a, b) => (b.score ?? -Infinity) - (a.score ?? -Infinity));
@@ -334,9 +370,11 @@ export function rag<const E extends keyof RagApi = never>(opts: Config & MountOp
     handler: async (ctx, { entryId }) => {
       const entry = await ctx.runQuery(entryRow, { entryId });
       if (!entry || (entry.state !== "pending" && entry.state !== "errored")) return null;
-      for (;;) {
-        const batch = await ctx.runQuery(missingVectors, { entryId });
-        if (batch.length === 0) break;
+      for (let after = -1; ; ) {
+        const { missing: batch, last } = await ctx.runQuery(missingVectors, { entryId, after });
+        if (last === null) break;
+        after = last;
+        if (batch.length === 0) continue; // an earlier attempt already embedded these
         let vectors: unknown;
         try {
           vectors = await ctx.runAction(await ctx.runQuery(embedderRow, {}), { texts: batch.map((c: any) => c.text) });
@@ -354,18 +392,21 @@ export function rag<const E extends keyof RagApi = never>(opts: Config & MountOp
             await ctx.runMutation(markErrored, { entryId, error: `The embedder returned a ${Array.isArray(vector) ? vector.length : "non-vector"} for "${batch[i]!.text.slice(0, 40)}…", this mount indexes ${ctx.config.dimensions} dimensions.` });
             return null;
           }
-          await ctx.runMutation(setVector, { id: batch[i]!._id, vector });
         }
+        await ctx.runMutation(setVectors, { vectors: batch.map((c: any, i: number) => ({ id: c._id, vector: (vectors as number[][])[i]! })) });
       }
       await ctx.runMutation(markReady, { entryId });
       return null;
     },
   });
 
-  const setVector = internalMutation({
-    args: { id: v.string(), vector: v.array(v.number()) },
-    handler: async (ctx, { id, vector }) => {
-      await ctx.db.patch(id as GenericId<"chunks">, { vector });
+  const setVectors = internalMutation({
+    args: { vectors: v.array(v.object({ id: v.string(), vector: v.array(v.number()) })) },
+    handler: async (ctx, { vectors }) => {
+      for (const { id, vector } of vectors) {
+        // The entry may have been deleted or replaced while the embedder ran.
+        if (await ctx.db.get(id as GenericId<"chunks">)) await ctx.db.patch(id as GenericId<"chunks">, { vector });
+      }
       return null;
     },
   });
@@ -384,7 +425,7 @@ export function rag<const E extends keyof RagApi = never>(opts: Config & MountOp
     args: { entryId: v.string() },
     handler: async (ctx, { entryId }) => {
       const entry = await ctx.db.get(entryId as GenericId<"entries">);
-      if (!entry) return null;
+      if (!entry || (entry.state !== "pending" && entry.state !== "errored")) return null;
       await ctx.db.patch(entry._id, { state: "ready", error: undefined, updatedAt: Date.now() });
       if (entry.replaces) {
         const old = await ctx.db.get(entry.replaces as GenericId<"entries">);
@@ -416,7 +457,7 @@ export function rag<const E extends keyof RagApi = never>(opts: Config & MountOp
   const definition = defineComponent({
     name: "rag",
     schema,
-    functions: { add, replace, delete: delete_, list, status, search: searchFn, setEmbedder, entryRow, chunkRow, searchText, embedderRow, missingVectors, embedEntry, setVector, markErrored, markReady, retryPending },
+    functions: { add, replace, delete: delete_, list, status, search: searchFn, setEmbedder, entryRow, chunkRow, searchText, embedderRow, missingVectors, embedEntry, setVectors, markErrored, markReady, retryPending },
     crons: () => [{ name: "retryPending", schedule: { minutes: 1 }, fn: retryPending }],
   });
 

@@ -161,8 +161,16 @@ const run = internalMutation({
     const done = rows
       .filter((s) => s.state === "completed" || (s.kind === "sleep" && s.state === "pending" && (s.wakeAt ?? 0) <= now))
       .map((s) => ({ number: s.number as number, result: s.kind === "sleep" ? null : (s.result ?? null) }));
-    const outcome: WorkflowSignal = await ctx.runMutation(wf.fn as any, { workflowId, args: wf.args, completed: done });
-    await journal(ctx, workflowId, outcome.steps);
+    let outcome: WorkflowSignal;
+    try {
+      outcome = await ctx.runMutation(wf.fn as any, { workflowId, args: wf.args, completed: done });
+      await journal(ctx, workflowId, outcome.steps);
+    } catch (err) {
+      // The runner itself couldn't run (renamed, not a workflow) or its steps can't be journaled.
+      // Retrying won't help, so report it rather than stay "running" forever.
+      await fail(ctx, workflowId, message(err));
+      return null;
+    }
 
     const pause = outcome.pause;
     if (!pause) {

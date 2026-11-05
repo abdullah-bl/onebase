@@ -139,6 +139,27 @@ The limit counts from when the call gets its database snapshot (a query), the wr
 
 Change the limits with `ONEBASE_QUERY_TIMEOUT`, `ONEBASE_MUTATION_TIMEOUT` and `ONEBASE_ACTION_TIMEOUT`, e.g. `30s`, `2m`, or `off`. Keep mutations short: while one runs, every other write waits for it.
 
+## Read and write limits
+
+One query or mutation may read and write only so much. The defaults are far above Convex's, and are there to stop a runaway call from filling memory or holding the write lock, not to shape normal code.
+
+| | Default | Convex | Set with |
+|---|---|---|---|
+| Documents read by one query or mutation | 256,000 | 32,000 | `ONEBASE_MAX_READS` |
+| Documents written by one mutation | 128,000 | 16,000 | `ONEBASE_MAX_WRITES` |
+| Data written by one mutation | 128 MB | 16 MiB | `ONEBASE_MAX_WRITE_MB` |
+| One document | 16 MB | 1 MiB | `ONEBASE_MAX_DOCUMENT_MB` |
+
+Set any of them to `off` to remove it. Sizes are of the document as stored JSON.
+
+- **Reads** are the documents `db.get()` and `db.query()` hand your function. Unlike Convex, documents that `.filter()` leaves out don't count, because the database drops them before your code sees them. The [time limit](#time-limits) covers a slow scan. A query never loads more rows than it has left, so `.collect()` on a huge table fails without loading the whole table into memory.
+- **Writes** are every insert, patch, replace and delete, including those made by mutations called with `ctx.runMutation()`, components and table hooks in the same transaction.
+- **Going over a total fails the call.** The error is thrown again on every later read or write and when the function returns, so catching it doesn't help. A mutation's writes are rolled back.
+- **A document over the size limit** is refused like an invalid one. Nothing is written, and the function may catch the error and carry on.
+- Actions have no limits of their own: each `ctx.runQuery()` and `ctx.runMutation()` they make gets its own. Dashboard edits aren't limited.
+
+To work through more data than this, read with `.paginate()` and write in batches, each a mutation scheduled by the last with `ctx.scheduler.runAfter(0, ...)`, or use the [work queue](./work-queue.md).
+
 ## The context object
 
 | | query | mutation | action |

@@ -100,9 +100,9 @@ The memory figures are process RSS at the end of the round. The limit (64 MB by 
 |---|---|---|
 | One document | fails at 1 MiB | 32 MiB passed (largest tried) |
 | Writes in one function | fails at 16,001 documents | 128,000 passed (largest tried) |
-| Scan 100,000 documents in a query | fails after about 15 s | 91 ms |
+| Scan 100,000 documents in a query | fails, after about 15 s (it allows 32,000 scanned per query) | 91 ms |
 
-Convex's limits are deliberate protections. Having fewer limits isn't simply better: on onebase, nothing stops a function from using up the server.
+Convex's limits are deliberate protections. Having fewer limits isn't simply better: at the time, nothing stopped a function on onebase from using up the server. onebase has since added [read and write limits](./functions.md#read-and-write-limits), set far above Convex's: 16 MB per document, 128,000 writes and 256,000 reads per call by default. The 32 MiB document above would now fail unless you raise the limit. Nothing yet limits CPU time inside a function, as the [crash tests](#crash-and-correctness-tests) show.
 
 ### Crash and correctness tests
 
@@ -130,7 +130,7 @@ These ran on onebase only, once each, with default settings.
 
 ## What these tests don't show
 
-- **Tuned Convex.** Convex ran with its defaults, including 16 concurrent functions per kind and a 4 MiB/s write limit, and these may cap its write numbers. We didn't try raising them, or running on Postgres.
+- **Tuned Convex.** Convex ran with its defaults, including at most 16 queries and 16 mutations at once (64 actions, 8 scheduled jobs) and a 4 MiB/s write limit, and these may cap its write numbers. We didn't try raising them, or running on Postgres.
 - **Convex Cloud.** Only the self-hosted backend was tested.
 - **Fair memory numbers for Convex.** Its memory grows with stored write history. The volume had been through several rounds: idle memory was 2.4 GiB here, against 177 MiB on a younger volume.
 - **The cache against Convex.** The Convex comparison above was run before the cache existed, and we didn't confirm that Convex's scan result came from its own cache.

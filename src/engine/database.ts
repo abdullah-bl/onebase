@@ -4,6 +4,7 @@ import { describeValue, isPlainObject, validate, type AnyValidator } from "../va
 import { cosineDistance, FIELD_PATH, isIdForTable, newId, systemKind, tableLiteral, type Dialect, type ValueKind, type VectorHit } from "./dialect";
 import type { Exec } from "./driver";
 import { indexIdent, TableScope, tableMount, validatesTable, type Catalog } from "./catalog";
+import type { CallBudget } from "./limits";
 
 export type Doc = Record<string, unknown> & { _id: string; _creationTime: number };
 
@@ -39,6 +40,8 @@ export type DbOptions = {
   explain?: (tx: Exec, sql: string, params: unknown[]) => Promise<string[]>;
   /** Query shapes already warned about (shared per runtime). */
   warned?: Set<string>;
+  /** The call's read and write limits; none for the system's own reads and writes. */
+  budget?: CallBudget;
 };
 
 export class OnebaseError extends Error {
@@ -516,8 +519,11 @@ class QueryImpl {
     const pinned = new Set(this.rangeConds.filter((c) => c.op === "eq").map((c) => c.field));
     const ordering = keys.filter((k) => !(k.field && pinned.has(k.field)));
     let sql = `SELECT id, ct, doc, ${select} FROM documents WHERE ${where.join(" AND ")} ORDER BY ${ordering.map((k) => `${k.sql} ${dir}`).join(", ")}`;
-    if (opts.limit !== undefined) {
-      sql += ` LIMIT ${Math.floor(opts.limit)}`;
+    // Never load more than the call may still read: one row past that is enough to know it's over.
+    const left = this.db.budget?.readsLeft() ?? Infinity;
+    const limit = opts.limit !== undefined && opts.limit <= left ? opts.limit : left === Infinity ? opts.limit : left + 1;
+    if (limit !== undefined) {
+      sql += ` LIMIT ${Math.floor(limit)}`;
     }
 
     await this.db.checkPlan(sql, params, this.table, this.filters);
@@ -525,6 +531,7 @@ class QueryImpl {
       doc: { _id: row.id, _creationTime: Number(row.ct), ...d.parseDoc(row.doc) } as Doc,
       key: keys.map((k, i) => (k.kind === "ct" ? Number(row[`k${i}`]) : d.decode(row[`k${i}`], k.kind))),
     }));
+    this.db.budget?.read(rows.length);
     // The scan covered keys after the cursor, up to the end cursor or the last row of a full page.
     const full = opts.limit !== undefined && rows.length > 0 && rows.length === opts.limit;
     this.recordRead({
@@ -556,10 +563,12 @@ class QueryImpl {
     const compiler = new ExprCompiler(d, params);
     for (const f of this.filters) where.push(compiler.bool(f));
     if (sql.rankTakesQuery) params.push(query);
+    const capped = Math.min(limit, (this.db.budget?.readsLeft() ?? Infinity) + 1);
     const rows = await this.db.tx.all(
-      `SELECT id, ct, doc FROM ${sql.from} WHERE ${where.join(" AND ")} ORDER BY ${sql.rank}, ct DESC, id LIMIT ${Math.floor(limit)} OFFSET ${offset}`,
+      `SELECT id, ct, doc FROM ${sql.from} WHERE ${where.join(" AND ")} ORDER BY ${sql.rank}, ct DESC, id LIMIT ${Math.floor(capped)} OFFSET ${offset}`,
       params,
     );
+    this.db.budget?.read(rows.length);
     return rows.map((row, i) => ({
       doc: { _id: row.id, _creationTime: Number(row.ct), ...d.parseDoc(row.doc) } as Doc,
       key: ["search", offset + i + 1] as unknown[],
@@ -644,6 +653,7 @@ export class DatabaseImpl {
   readonly dialect: Dialect;
   readonly readSet?: ReadSet;
   readonly scope: TableScope;
+  readonly budget?: CallBudget;
   private readonly catalog: Catalog | null;
   private readonly writes?: Write[];
   private readonly onWarning?: (message: string) => void;
@@ -656,6 +666,7 @@ export class DatabaseImpl {
     this.catalog = opts.catalog;
     this.scope = opts.scope ?? TableScope.app;
     this.readSet = opts.readSet;
+    this.budget = opts.budget;
     this.writes = opts.writes;
     this.onWarning = opts.onWarning;
     this.explain = opts.explain;
@@ -900,6 +911,7 @@ export class DatabaseImpl {
     const docId = this.requireId(rest[0], "get");
     this.readSet?.ids.add(docId);
     const raw = await this.loadRaw(docId);
+    this.budget?.read(raw ? 1 : 0);
     if (raw && table && raw.table !== table) throw new OnebaseError(`db.get("${args[0]}", id): "${docId}" is a "${raw.table}" document.`);
     // Another component's (or the app's) documents don't exist as far as this scope is concerned.
     return raw && this.scope.owns(raw.table) ? raw.doc : null;
@@ -919,9 +931,11 @@ export class DatabaseImpl {
   async insert(table: unknown, value: unknown): Promise<string> {
     const t = this.checkTable(table);
     const doc = this.prepareValue(t, value, "insert");
+    const json = JSON.stringify(doc);
+    this.budget?.write(t, json);
     const id = newId(t);
     const ct = this.nextCreationTime();
-    await this.tx.run(`INSERT INTO documents (id, tbl, ct, doc) VALUES (?, ?, ?, ${this.dialect.docPlaceholder})`, [id, t, ct, JSON.stringify(doc)]);
+    await this.tx.run(`INSERT INTO documents (id, tbl, ct, doc) VALUES (?, ?, ?, ${this.dialect.docPlaceholder})`, [id, t, ct, json]);
     await this.syncSearch(t, id, doc);
     await this.syncVectors(t, id, doc);
     this.writes?.push({ table: t, id, before: null, after: { _id: id, _creationTime: ct, ...doc } });
@@ -945,7 +959,9 @@ export class DatabaseImpl {
   }
 
   private async writeDoc(table: string, before: Doc, fields: Record<string, unknown>) {
-    await this.tx.run(`UPDATE documents SET doc = ${this.dialect.docPlaceholder} WHERE id = ?`, [JSON.stringify(fields), before._id]);
+    const json = JSON.stringify(fields);
+    this.budget?.write(table, json);
+    await this.tx.run(`UPDATE documents SET doc = ${this.dialect.docPlaceholder} WHERE id = ?`, [json, before._id]);
     await this.syncSearch(table, before._id, fields);
     await this.syncVectors(table, before._id, fields);
     this.writes?.push({ table, id: before._id, before, after: { _id: before._id, _creationTime: before._creationTime, ...fields } });
@@ -986,6 +1002,7 @@ export class DatabaseImpl {
   async delete(...args: unknown[]): Promise<void> {
     const { table: expected, rest } = this.tableFirst(args, 1, "delete");
     const { id: docId, table, doc } = await this.existing(rest[0], "delete", expected);
+    this.budget?.write(table, null);
     await this.tx.run("DELETE FROM documents WHERE id = ?", [docId]);
     await this.syncSearch(table, docId, null);
     await this.syncVectors(table, docId, null);

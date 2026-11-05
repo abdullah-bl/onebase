@@ -12,6 +12,7 @@ import { doctor, printFindings } from "./doctor";
 import { SqliteDriver } from "./engine/driver";
 import { LocalBlobs } from "./engine/files";
 import { parseRateLimit } from "./engine/http";
+import { CALL_LIMIT_ENV } from "./engine/limits";
 import type { AuthConfig } from "./engine/jwt";
 import type { Modules } from "./engine/runtime";
 import { loadEnv, withoutBunEnv } from "./env";
@@ -182,6 +183,18 @@ function timeLimit(name: string): number | undefined {
   }
 }
 
+/** A read or write limit from $name: a number (`mb`: of megabytes), or off (0). Unset: the default. */
+function callLimit(name: string, mb = false): number | undefined {
+  const value = process.env[name]?.trim();
+  if (!value) return undefined;
+  if (["0", "off", "none"].includes(value.toLowerCase())) return 0;
+  const n = Number(value.replace(/_/g, ""));
+  if (!Number.isFinite(n) || n <= 0 || (!mb && !Number.isInteger(n))) {
+    throw new Error(`${name}=${value} isn't understood: use ${mb ? "a number of megabytes, e.g. 16" : "a whole number, e.g. 100000"}, or off.`);
+  }
+  return mb ? Math.round(n * 2 ** 20) : n;
+}
+
 /** Database, storage, backup and HTTP settings shared by `serve` and embedded binaries. */
 function serverOptions(opts: ReturnType<typeof options>) {
   const keep = Number(opts["backup-keep"]);
@@ -199,6 +212,12 @@ function serverOptions(opts: ReturnType<typeof options>) {
       queryMs: timeLimit("ONEBASE_QUERY_TIMEOUT"),
       mutationMs: timeLimit("ONEBASE_MUTATION_TIMEOUT"),
       actionMs: timeLimit("ONEBASE_ACTION_TIMEOUT"),
+    },
+    callLimits: {
+      documentsRead: callLimit(CALL_LIMIT_ENV.documentsRead),
+      documentsWritten: callLimit(CALL_LIMIT_ENV.documentsWritten),
+      bytesWritten: callLimit(CALL_LIMIT_ENV.bytesWritten, true),
+      documentBytes: callLimit(CALL_LIMIT_ENV.documentBytes, true),
     },
   };
 }

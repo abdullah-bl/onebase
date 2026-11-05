@@ -15,7 +15,8 @@ import { clientBundle } from "./client/bundle.generated";
 import { dashboardAssets } from "./dashboard/bundle.generated";
 import { createAdmin, loadAdminKey } from "./engine/admin";
 import { serveAsset } from "./engine/deployments";
-import { importBundle } from "./deploy";
+import { importBundle } from "./project";
+import type { CodeSource } from "./engine/action-wire";
 
 export const VERSION = "0.2.0";
 
@@ -58,6 +59,12 @@ export type AppOptions = {
   loadTimeoutMs?: number;
   /** How long a query, mutation or action may run (default 10s, 10s and 10m). */
   timeLimits?: Partial<TimeLimits>;
+  /** Where `modules` etc. came from, so actions can run on worker threads (none: on the main thread). */
+  source?: CodeSource | null;
+  /** Worker threads for actions (default: $ONEBASE_ACTION_WORKERS, else one per core up to 8; 0: the main thread). */
+  actionWorkers?: number;
+  /** The action workers' program, for a binary from `onebase build`. */
+  actionWorkerEntry?: string | URL;
   quiet?: boolean;
 };
 
@@ -102,6 +109,9 @@ export async function startApp(opts: AppOptions) {
     loadCode: opts.deploys === false ? null : importBundle,
     loadTimeoutMs: opts.loadTimeoutMs,
     timeLimits: opts.timeLimits,
+    source: opts.source,
+    actionWorkers: opts.actionWorkers,
+    actionWorkerEntry: opts.actionWorkerEntry,
   });
   const { created, dropped } = await runtime.init();
   const adminKey = opts.dashboard === false ? null : loadAdminKey(opts.dataDir);
@@ -139,6 +149,7 @@ export async function startApp(opts: AppOptions) {
     }
     if (runtime.cronJobs.length) console.log(`  crons      ${runtime.cronJobs.map((j) => j.name).join(", ")}`);
     if (runtime.auth) console.log(`  sign-in    ${runtime.auth.ids.join(", ")}`);
+    if (runtime.actionPool) console.log(`  actions    on up to ${runtime.actionPool.maxThreads} worker thread${runtime.actionPool.maxThreads === 1 ? "" : "s"}`);
     console.log(`  database   ${driver.description}`);
     console.log(`  files      ${blobs.description}`);
     if (opts.backup) console.log(`  backups    ${opts.backup.url} every ${Math.round(opts.backup.everyMs / 60_000)} min, keep ${opts.backup.keep}`);

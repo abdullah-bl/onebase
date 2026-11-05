@@ -64,6 +64,7 @@ Each flag can also be set with an environment variable, which can come from a [.
 | `ONEBASE_QUERY_TIMEOUT`, `ONEBASE_MUTATION_TIMEOUT`, `ONEBASE_ACTION_TIMEOUT` | How long a call may run (default `10s`, `10s`, `10m`; `off` for no limit). See [Time limits](./functions.md#time-limits). |
 | `ONEBASE_QUERY_CACHE_MB` | Memory for repeated query results on SQLite (default `64`; `0` to run every read). See [Repeated reads](./functions.md#repeated-reads). |
 | `ONEBASE_VECTOR_MEMORY_MB` | Memory for SQLite's vector indexes (default `2048`; `0` to search them in SQL). See [Vector search](./vector-search.md#memory-and-threads-on-sqlite). |
+| `ONEBASE_ACTION_WORKERS` | Worker threads for actions (default: one per CPU core, up to 8; `0` runs actions on the main thread). See [Worker threads](./functions.md#worker-threads). |
 | `ONEBASE_VECTOR_WORKERS` | Threads for searching SQLite's vector indexes (default: up to 8, one less than the CPU cores; `0` for the main thread only) |
 
 ## doctor

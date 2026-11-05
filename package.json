@@ -29,7 +29,7 @@
     "bench": "bun scripts/bench.ts",
     "typecheck": "tsc --noEmit",
     "build:client": "bun scripts/build-client.ts",
-    "build:binary": "bun run build:assets && bun build --compile --minify --no-compile-autoload-dotenv src/cli.ts --outfile dist/onebase",
+    "build:binary": "bun run build:assets && bun build --compile --minify --no-compile-autoload-dotenv src/cli.ts src/engine/action-worker.ts --outfile dist/onebase",
     "example": "cd examples/chat && bun ../../src/cli.ts dev",
     "site": "bun site/build.ts",
     "build:assets": "bun scripts/build-client.ts && bun scripts/build-dashboard.ts"

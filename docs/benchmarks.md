@@ -114,11 +114,12 @@ These ran on onebase only, once each, with default settings.
 | 200 concurrent increments of one document | All succeeded, returning exactly 1 to 200 |
 | 30 updates on a live query | Final value correct, in order. 17 of the 30 were delivered because close updates merge |
 | Vector search right after each write | 2,500 searches, each of a vector just written, 0 missed it (8 dimensions, outside Docker) |
-| Pings during a 3-second CPU-bound function | **The ping waited 3,013 ms**, against 3 ms normally |
+| Pings during a 3-second CPU-bound mutation | **The ping waited 3,013 ms**, against 3 ms normally |
 
 ## Where onebase falls short
 
-- **Long-running functions block the server.** Functions share one thread, so CPU-bound code stalls every other request, as the last row above shows. [Time limits](./functions.md#time-limits) can't interrupt code that never yields.
+- **Long-running queries and mutations block the server.** They share the main thread, so CPU-bound code in one stalls every other request, as the last row above shows. [Time limits](./functions.md#time-limits) can't interrupt them while they never yield. Actions now run on [worker threads](./functions.md#worker-threads) and don't have this problem: in `bun run bench`, pings during a 0.8-second CPU-bound action waited at most 1 to 2.5 ms over three runs, against about 770 ms with actions on the main thread. A worker is stopped when its action runs out of time.
+- **No memory limit per action.** Bun ignores the memory limits a worker asks for: one capped at 64 MB grew past 40 GB in our test. One action can still use up the server's memory.
 - **Power loss is untested.** `kill -9` only tests a process crash. With the default `synchronous=NORMAL`, a power cut or OS crash can lose the most recent commits. Set `ONEBASE_SYNCHRONOUS=FULL` if you can't accept that, and expect the slower numbers above.
 - **It writes more to disk.** An earlier version wrote 20.6 KB per 1 KB write, against Convex's 7.8 KB, and 545 KB per 512 KB write, against 8 KB. Convex seems to merge an insert and delete in one transaction, which flatters it here. We haven't repeated this since the write path changed.
 - **Scans slow down as the database grows, even with other tables.** One scan of a 2,000-document table took 0.49 ms alone and 18.6 ms after adding 20,000 documents of 4 KB to a different table, in a single in-process run. We haven't found out why. The scan numbers here come from small databases, so they may flatter a large one. Use an index, or let the [cache](./functions.md#repeated-reads) absorb repeats.

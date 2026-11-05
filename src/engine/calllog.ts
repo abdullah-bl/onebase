@@ -132,6 +132,16 @@ type FnSlot = {
   hist: Uint32Array;
 };
 const capture = new AsyncLocalStorage<LogLine[]>();
+
+/** The running call's console lines, for output that arrives from elsewhere (an action worker). */
+export function callLines(): LogLine[] | undefined {
+  return capture.getStore();
+}
+
+/** Adds a line to a call's record, within the same caps as console output. */
+export function addLine(lines: LogLine[], level: LogLine["level"], text: string) {
+  if (lines.length < MAX_LINES) lines.push({ level, text: text.slice(0, MAX_LINE_CHARS) });
+}
 let patched = false;
 
 /** console.* inside a function also goes to that call's record (and still to stdout). */
@@ -142,7 +152,7 @@ function patchConsole() {
     const original = console[level].bind(console);
     console[level] = (...args: unknown[]) => {
       const lines = capture.getStore();
-      if (lines && lines.length < MAX_LINES) lines.push({ level, text: format(...args).slice(0, MAX_LINE_CHARS) });
+      if (lines) addLine(lines, level, format(...args));
       original(...args);
     };
   }

@@ -13,9 +13,10 @@
  *   - shared-subscription fan-out (per-listener send cost)
  *   - query throughput (per-row doc JSON.parse + read-set recording)
  *   - canonical-JSON kernels (stableStringify, clone-by-roundtrip, sameValue compare)
+ *   - actions on the main thread vs worker threads: call overhead, and pings during a CPU-bound action
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { cpus } from "node:os";
 import { join } from "node:path";
@@ -24,6 +25,7 @@ import { Runtime } from "../src/engine/runtime";
 import { SubscriptionManager, stableStringify } from "../src/engine/sync";
 import { defineSchema, defineTable, mutation, query } from "../src/server";
 import { v } from "../src/values";
+import { loadProjectCode } from "../src/project";
 
 // ---------- knobs ----------
 
@@ -348,11 +350,81 @@ async function main() {
     micro("sameValue compare (equal docs)", 20_000, () => JSON.stringify(doc) === JSON.stringify(clone));
     micro("sameValue compare (different docs)", 20_000, () => JSON.stringify(doc) === JSON.stringify(other));
 
+    // --- 8. actions: main thread vs workers ------------------------------------
+    console.log(`\n— actions (a project on disk, as onebase serve runs it) —`);
+    await benchActions(dir);
+
     console.log(`\ndone in ${fmtMs(performance.now() - started)} ms | rss ${(process.memoryUsage().rss / 1e6).toFixed(0)} MB`);
   } finally {
     runtime.stop();
     await driver.close();
     rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** The same fixed computation as benchmarks/convex's busy function: it never yields. */
+const BURN_ITERATIONS = 1e9;
+
+async function benchActions(dir: string) {
+  const project = join(dir, "actions", "onebase");
+  mkdirSync(project, { recursive: true });
+  writeFileSync(
+    join(project, "bench.ts"),
+    `import { action, query } from "onebase/server";
+     import { v } from "onebase/values";
+     export const ping = query({ args: {}, handler: async () => "pong" });
+     export const empty = action({ args: {}, handler: async () => null });
+     export const roundTrip = action({ args: {}, handler: (ctx) => ctx.runQuery("bench:ping", {}) });
+     export const burn = action({
+       args: { iterations: v.number() },
+       handler: async (_ctx, { iterations }) => {
+         let x = 1;
+         for (let i = 0; i < iterations; i++) { x ^= x << 13; x ^= x >>> 17; x ^= x << 5; }
+         return x >>> 0;
+       },
+     });`,
+  );
+  const code = await loadProjectCode(project);
+  // ONEBASE_ACTION_WORKERS, if set, picks the worker count for the second run.
+  for (const [label, workers] of [["main thread", 0], ["workers", undefined]] as const) {
+    const driver = new SqliteDriver(join(dir, "actions", `${label}.sqlite`));
+    const runtime = new Runtime({ driver, log: { info() {}, warn() {}, error() {} }, ...code, timeLimits: { actionMs: 0 }, actionWorkers: workers });
+    try {
+      await runtime.init();
+      await runtime.runAction("bench:empty", {}); // starts the first worker
+      rowRun(`empty action (${label})`, await benchLoop(1000, () => runtime.runAction("bench:empty", {})));
+      rowRun(`action, one ctx.runQuery (${label})`, await benchLoop(1000, () => runtime.runAction("bench:roundTrip", {})));
+      // Pings "arrive" every 10 ms; each is timed from its arrival, as a client would see it.
+      let burnMs = 0;
+      let doneAt = 0;
+      const burning = new Promise<void>((resolve) =>
+        setTimeout(() => {
+          const t0 = performance.now();
+          void runtime.runAction("bench:burn", { iterations: BURN_ITERATIONS }).then(() => {
+            doneAt = performance.now();
+            burnMs = doneAt - t0;
+            resolve();
+          });
+        }, 50),
+      );
+      const pings: number[] = [];
+      let next = performance.now();
+      while (!doneAt || performance.now() - doneAt < 100) {
+        next += 10;
+        await Bun.sleep(Math.max(0, next - performance.now()));
+        const arrived = Math.min(next, performance.now());
+        await runtime.runQuery("bench:ping", {});
+        pings.push(performance.now() - arrived);
+      }
+      await burning;
+      const max = Math.max(...pings);
+      console.log(
+        `${`pings during a CPU-bound action (${label})`.padEnd(44)}${nf.format(pings.length).padStart(11)} pings  p50 ${fmtMs(pct(pings, 0.5)).padStart(7)} ms  max ${fmtMs(max).padStart(7)} ms  (action ran ${fmtMs(burnMs)} ms)`,
+      );
+    } finally {
+      runtime.stop();
+      await driver.close();
+    }
   }
 }
 

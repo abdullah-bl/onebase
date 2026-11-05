@@ -84,6 +84,23 @@ export const summarize = action({
 
 Every function runs in Bun, so `node:*` modules and npm packages work in queries and mutations too. **`fetch()` is the exception: only actions can call it.** A query re-runs whenever its data changes, and a mutation holds the write lock and may be retried when it conflicts with another instance (see [Databases](./databases.md)), so outside calls belong in actions. Calling `fetch()` from a query or mutation fails with an error that says so.
 
+### Worker threads
+
+Actions, including [HTTP actions](./http-actions.md), run on worker threads, so a CPU-heavy action doesn't hold up other requests. Queries and mutations run on the main thread. There is one worker per CPU core, up to 8. They start with the first action, and extra workers stop after 30 seconds without work. `ONEBASE_ACTION_WORKERS` sets how many there are, and `0` runs actions on the main thread.
+
+A worker runs several actions at once, since most of them spend their time waiting on `fetch()`. A new action goes to an idle worker while there are fewer than the maximum.
+
+Each worker loads its own copy of your code: the functions folder, or the bundle from `onebase deploy`. So:
+
+- **Top-level code runs once per worker**, and once on the main thread. A variable at the top of a file isn't shared between workers, or with queries and mutations.
+- **Values are copied between threads.** Arguments, return values and everything passed to `ctx` must be plain values, `Blob`s, `Date`s or typed arrays. Class instances arrive as plain objects, and functions can't be passed at all. Errors keep their message, and a `ConvexError` keeps its `data`.
+- **Await every `ctx` call.** One still running when its action returns fails with an error, as on Convex.
+- **An HTTP action gets its request body in full** before it starts. Its response body streams back.
+
+Each worker costs about 6 to 9 MB of memory. The first action on a new worker waits about 20 ms for it to load the code, and each action call or `ctx` call costs about 0.05 ms more than on the main thread. There's no memory limit per action: Bun doesn't enforce the limits a worker asks for.
+
+Code given to the runtime as objects rather than loaded from a folder or bundle (when embedding the runtime in your own program) runs its actions on the main thread. So does code whose workers find different functions from the main thread, for example because a file checks `Bun.isMainThread`. The server then logs a warning.
+
 ## Internal functions
 
 `internalQuery`, `internalMutation` and `internalAction` can't be called by clients, only from other functions, the scheduler and crons. Reference them through `internal` instead of `api`:
@@ -114,9 +131,11 @@ Any other error appears as `Server Error` to clients in production; the full mes
 
 A query or mutation may run for 10 seconds, and an action (including an HTTP action) for 10 minutes. A call that runs longer fails with `notes:list didn't finish within the query time limit (10s).` A mutation's writes are rolled back.
 
-JavaScript can't stop a function in the middle of an `await`, so the function itself keeps running until it next yields. Anything it then tries fails with the same error, so it can't read or write any more, call other functions, or schedule them. Code that never yields, such as `while (true) {}`, can't be stopped this way and blocks the whole server.
+An action's worker is stopped when its time is up, even in the middle of `while (true) {}`. Other actions running on the same worker finish first if the worker still responds. If it doesn't, they fail too, since they were stuck behind it.
 
-The limit counts from when the call gets its database snapshot (a query) or the write lock (a mutation), not from when it was queued. A mutation called from a mutation shares its caller's limit; one called from an action gets its own.
+Queries and mutations run on the main thread, and JavaScript can't stop a function in the middle of an `await`. So a query or mutation keeps running until it next yields. Anything it then tries fails with the same error, so it can't read or write any more, call other functions, or schedule them. Code that never yields, such as `while (true) {}`, can't be stopped this way and blocks the whole server. The same goes for actions with `ONEBASE_ACTION_WORKERS=0`.
+
+The limit counts from when the call gets its database snapshot (a query), the write lock (a mutation) or a worker (an action), not from when it was queued. A mutation called from a mutation shares its caller's limit; one called from an action gets its own.
 
 Change the limits with `ONEBASE_QUERY_TIMEOUT`, `ONEBASE_MUTATION_TIMEOUT` and `ONEBASE_ACTION_TIMEOUT`, e.g. `30s`, `2m`, or `off`. Keep mutations short: while one runs, every other write waits for it.
 

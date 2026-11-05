@@ -3,86 +3,136 @@
 <head>
 <!--HEAD-->
 </head>
-<body>
+<body class="home">
 <!--HEADER-->
 
 <main>
-  <section class="hero">
-    <div class="wrap hero-inner">
-      <span class="eyebrow">v<!--VERSION--> · self-hosted · Convex-style API</span>
-      <h1>The reactive backend<br>in <em>one file</em>.</h1>
-      <p class="lede">TypeScript functions, a typed document database and live queries, running as a single binary on SQLite, Postgres or Turso. Copy it to a server and run it.</p>
-      <div class="hero-ctas">
-        <a class="btn primary" href="docs/getting-started.html">Get started <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8h10M9 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
-        <a class="btn" href="<!--REPO-->" target="_blank" rel="noopener"><svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
+  <section class="hero" aria-labelledby="hero-title">
+    <div class="wrap">
+      <h1 id="hero-title">The reactive backend<br> in one file</h1>
+      <p class="lead">Convex-style TypeScript functions, a typed document database and live queries. One binary that runs on SQLite, Postgres or Turso.</p>
+      <div class="actions">
+        <a class="btn primary" href="docs/getting-started.html">Get started</a>
+        <button class="btn" type="button" data-copy="Add a OneBase backend to this project. First read https://abdullah-bl.github.io/onebase/llms-full.txt, the full OneBase docs, and follow its LLM guide. Install it with bun add github:abdullah-bl/onebase, write the schema and functions in onebase/, and start it with bunx onebase dev. After every change run bunx onebase doctor and fix what it reports.">Copy prompt for your agent</button>
       </div>
-      <div class="install"><span class="prompt">$</span><code>bun add github:abdullah-bl/onebase</code><button type="button" data-copy="bun add github:abdullah-bl/onebase">Copy</button></div>
+      <div class="install"><code>bun add github:abdullah-bl/onebase</code><button type="button" data-copy="bun add github:abdullah-bl/onebase" aria-label="Copy the install command">Copy</button></div>
+      <ul class="checks">
+        <li>Live queries</li><li>Typed database</li><li>Auth</li><li>File storage</li><li>Admin dashboard</li><li>Agents and RAG</li>
+      </ul>
+    </div>
+    <div class="wrap shot">
+    <div class="dash ui" data-ui data-dash role="img" aria-label="The OneBase dashboard at /_admin: an overview with 1,058 calls, 0% errors, 3.2 ms p95 latency, 24 connections and 62 MB of memory">
+      <div class="dash-side" aria-hidden="true">
+        <span class="b"><svg viewBox="0 0 32 32"><circle cx="16" cy="16" r="5" fill="currentColor"/><circle cx="16" cy="16" r="10.5" fill="none" stroke="currentColor" stroke-width="2" opacity=".55"/></svg>onebase</span>
+        <span class="on" data-dash-tab="0">Overview</span>
+        <span data-dash-tab="1">Data</span>
+        <span>Functions</span>
+        <span data-dash-tab="2">Logs</span>
+        <span>Scheduler</span>
+        <span>Files</span>
+      </div>
+      <div class="dash-main" aria-hidden="true">
+        <div class="dash-view on" data-dash-view="0">
+          <h3>Overview</h3>
+          <p class="meta">onebase v<!--VERSION-->, sqlite, up 3m 45s</p>
+          <div class="kpis">
+            <div><small>Calls</small><b>1,058</b></div>
+            <div><small>Error rate</small><b>0%</b></div>
+            <div><small>p95 latency</small><b>3.2 ms</b></div>
+            <div><small>Connections</small><b>24</b></div>
+            <div><small>Memory</small><b>62 MB</b></div>
+          </div>
+          <div class="bars"><i style="--h:6%"></i><i style="--h:9%"></i><i style="--h:30%" class="hot"></i><i style="--h:84%" class="hot"></i><i style="--h:84%" class="hot"></i><i style="--h:36%" class="hot"></i><i style="--h:8%"></i><i style="--h:5%"></i><i style="--h:7%"></i><i style="--h:4%"></i><i style="--h:6%"></i><i style="--h:3%"></i></div>
+          <table>
+            <thead><tr><th>Function</th><th class="r">Calls</th><th class="r">Cached</th><th class="r">p95</th></tr></thead>
+            <tbody>
+              <tr><td><code>messages:search</code><span class="tag">query</span></td><td class="r">522</td><td class="r">67%</td><td class="r">0.28 ms</td></tr>
+              <tr><td><code>messages:send</code><span class="tag">mutation</span></td><td class="r">180</td><td class="r">–</td><td class="r">4.5 ms</td></tr>
+              <tr><td><code>messages:count</code><span class="tag">query</span></td><td class="r">175</td><td class="r">–</td><td class="r">1.1 ms</td></tr>
+              <tr><td><code>messages:list</code><span class="tag">query</span></td><td class="r">175</td><td class="r">–</td><td class="r">0.40 ms</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="dash-view" data-dash-view="1">
+          <h3>messages</h3>
+          <p class="meta">180 documents. Indexes: by_channel, search_body</p>
+          <table>
+            <thead><tr><th>_id</th><th>author</th><th>body</th></tr></thead>
+            <tbody>
+              <tr><td><code>w3k8f2…tg</code></td><td>Alice</td><td>Pushed the new schema</td></tr>
+              <tr><td><code>p9d0a1…tg</code></td><td>Bob</td><td>Seeing it already, no refresh</td></tr>
+              <tr><td><code>c7m2x5…tg</code></td><td>Alice</td><td>It's one binary on a small VPS</td></tr>
+              <tr><td><code>h4q6e8…tg</code></td><td>Cara</td><td>Can we search old messages?</td></tr>
+              <tr><td><code>t1v9z3…tg</code></td><td>Bob</td><td>Same functions, one flag</td></tr>
+              <tr><td><code>r5n7b2…tg</code></td><td>Dan</td><td>Postgres next week?</td></tr>
+              <tr><td><code>k2s4j6…tg</code></td><td>Alice</td><td>Backups go to S3 hourly</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="dash-view" data-dash-view="2">
+          <h3>Logs</h3>
+          <p class="meta">The last 1,000 function calls, live.</p>
+          <table>
+            <thead><tr><th>Time</th><th>Function</th><th>Source</th><th class="r">Duration</th><th>Result</th></tr></thead>
+            <tbody>
+              <tr><td>15:13:27</td><td><code>messages:send</code></td><td>http</td><td class="r">1.4 ms</td><td class="ok">ok</td></tr>
+              <tr><td>15:13:27</td><td><code>messages:count</code></td><td>subscription</td><td class="r">0.48 ms</td><td class="ok">ok</td></tr>
+              <tr><td>15:13:27</td><td><code>messages:list</code></td><td>subscription</td><td class="r">0.12 ms</td><td class="ok">ok</td></tr>
+              <tr><td>15:13:26</td><td><code>messages:search</code></td><td>http</td><td class="r">0.17 ms</td><td class="ok">ok</td></tr>
+              <tr><td>15:13:26</td><td><code>messages:send</code></td><td>http</td><td class="r">1.4 ms</td><td class="ok">ok</td></tr>
+              <tr><td>15:13:26</td><td><code>messages:list</code></td><td>subscription</td><td class="r">0.12 ms</td><td class="ok">ok</td></tr>
+              <tr><td>15:13:25</td><td><code>messages:send</code></td><td>http</td><td class="r">1.5 ms</td><td class="ok">ok</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
 
-      <div class="terminal" aria-label="Example server output">
-        <div class="terminal-bar"><i></i><i></i><i></i><span>~/my-app</span></div>
-<pre><span class="t-acc">$</span> <span class="t-cmd">onebase serve --backup s3://my-bucket/backups</span>
-<span class="t-b">onebase</span> v<!--VERSION-->
-  <span class="t-dim">functions</span>  9 (channels:list, messages:list, messages:send, …)
-  <span class="t-dim">crons</span>      prune old messages
-  <span class="t-dim">database</span>   onebase_data/db.sqlite
-  <span class="t-dim">files</span>      onebase_data/files
-  <span class="t-dim">backups</span>    s3://my-bucket/backups every 60 min, keep 24
-  <span class="t-dim">http</span>       <span class="t-acc">http://localhost:8090</span>
-  <span class="t-dim">sync</span>       ws://localhost:8090/api/sync</pre>
-      </div>
     </div>
   </section>
 
-  <div class="wrap">
-    <div class="stats">
-      <div class="stat"><b>~40 MB</b><span>memory at startup, dashboard included</span></div>
-      <div class="stat"><b>8.6 ms</b><span>per mutation, pushed to 100 live clients</span></div>
-      <div class="stat"><b>1 file</b><span>to deploy: the binary, optionally with your app inside</span></div>
-      <div class="stat"><b>5 KB</b><span>browser client, served by the server</span></div>
-    </div>
-    <p class="stats-note">Measured on Linux arm64, Bun 1.4.2, SQLite, with the example chat app.</p>
-  </div>
-
-  <section class="section">
+  <section class="section" aria-labelledby="box-title">
     <div class="wrap">
-      <div class="section-head">
-        <span class="eyebrow">Live queries</span>
-        <h2>Every client stays up to date. You don't write any sync code.</h2>
-        <p>Clients subscribe to queries. When a mutation commits, onebase re-runs only the queries whose data changed and pushes the new results over WebSocket. Try it:</p>
+      <div class="head">
+        <h2 id="box-title">Ready to use out of the box</h2>
+        <p>A schema, some functions and a hook. That is the whole backend, and it deploys as one file.</p>
       </div>
-      <div class="demo" data-demo>
-        <div class="demo-window">
-          <div class="demo-head"><b>Alice</b><span>connected</span></div>
-          <ul class="demo-list" data-list></ul>
-          <form class="demo-form" data-form data-author="Alice"><input placeholder="Message as Alice…" maxlength="60" aria-label="Message as Alice"><button>Send</button></form>
-        </div>
-        <div class="demo-window">
-          <div class="demo-head"><b>Bob</b><span>connected</span></div>
-          <ul class="demo-list" data-list></ul>
-          <form class="demo-form" data-form data-author="Bob"><input placeholder="Message as Bob…" maxlength="60" aria-label="Message as Bob"><button>Send</button></form>
-        </div>
-        <p class="demo-log" data-log aria-live="polite">Simulated in your browser. Waiting for a mutation…</p>
-      </div>
-    </div>
-  </section>
+      <div class="box">
+        <ul class="feat">
+          <li><b>Live queries</b><span>A write re-runs only the queries whose data changed and pushes the new result over WebSocket.</span></li>
+          <li><b>Typed document database</b><span>A schema in TypeScript, real indexes and transactions. Types flow to every caller.</span></li>
+          <li><b>Authentication</b><span>Passwords and OAuth with sessions, or tokens from Clerk, Auth0 and any OIDC issuer.</span></li>
+          <li><b>File storage</b><span>Uploads stream to disk, S3, R2 or MinIO, with database backups to the same bucket.</span></li>
+          <li><b>Search and scheduling</b><span>Full-text and vector search, plus <code>runAfter</code>, <code>runAt</code> and crons that survive restarts.</span></li>
+          <li><b>Admin dashboard</b><span>Browse data, run functions and watch every call at <code>/_admin</code>, inside the binary.</span></li>
+        </ul>
+        <div class="codebox" data-tabs>
+          <div class="tabbar" role="tablist" aria-label="Code samples"><button type="button" role="tab" id="code-tab-0" aria-selected="true" aria-controls="code-panel-0" data-tab="0">schema.ts</button><button type="button" role="tab" id="code-tab-1" aria-selected="false" aria-controls="code-panel-1" tabindex="-1" data-tab="1">messages.ts</button><button type="button" role="tab" id="code-tab-2" aria-selected="false" aria-controls="code-panel-2" tabindex="-1" data-tab="2">Chat.tsx</button><button type="button" role="tab" id="code-tab-3" aria-selected="false" aria-controls="code-panel-3" tabindex="-1" data-tab="3">Deploy</button></div>
+<div class="code-panel" id="code-panel-0" role="tabpanel" aria-labelledby="code-tab-0" data-panel="0"><p class="code-file">onebase/schema.ts</p>
+<pre data-lang="ts">
+import { defineSchema, defineTable } from "onebase/server";
+import { v } from "onebase/values";
 
-  <section class="section">
-    <div class="wrap">
-      <div class="section-head">
-        <span class="eyebrow">Write the backend in TypeScript</span>
-        <h2>A schema, some functions, and a hook. That's the whole backend.</h2>
-        <p>The API follows Convex: <code>query</code>, <code>mutation</code>, <code>action</code>, <code>v.*</code> validators, <code>ctx.db</code>. Everything is typed, from the schema to the React component.</p>
-      </div>
-      <div class="showcase">
-        <div class="code-card">
-          <header><span>onebase/messages.ts</span><span>server</span></header>
+export default defineSchema({
+  channels: defineTable({ name: v.string() })
+    .index("by_name", ["name"]),
+
+  messages: defineTable({
+    channel: v.id("channels"),
+    author: v.string(),
+    body: v.string(),
+  }).index("by_channel", ["channel"]),
+});
+</pre>
+</div>
+<div class="code-panel" id="code-panel-1" role="tabpanel" aria-labelledby="code-tab-1" data-panel="1" hidden><p class="code-file">onebase/messages.ts</p>
 <pre data-lang="ts">
 import { v } from "onebase/values";
 import { mutation, query } from "./_generated/server";
 
 export const list = query({
   args: { channel: v.id("channels") },
-  handler: (ctx, { channel }) =>
+  handler: (ctx, { channel }) =&gt;
     ctx.db
       .query("messages")
       .withIndex("by_channel", (q) =&gt; q.eq("channel", channel))
@@ -98,9 +148,8 @@ export const send = mutation({
   },
 });
 </pre>
-        </div>
-        <div class="code-card">
-          <header><span>app/Chat.tsx</span><span>client</span></header>
+</div>
+<div class="code-panel" id="code-panel-2" role="tabpanel" aria-labelledby="code-tab-2" data-panel="2" hidden><p class="code-file">app/Chat.tsx</p>
 <pre data-lang="tsx">
 import { useMutation, useQuery } from "onebase/react";
 import { api } from "../onebase/_generated/api";
@@ -122,176 +171,169 @@ export function Chat({ channel }) {
   );
 }
 </pre>
+</div>
+<div class="code-panel" id="code-panel-3" role="tabpanel" aria-labelledby="code-tab-3" data-panel="3" hidden><p class="code-file">Your terminal</p>
+<pre data-lang="bash">
+# Push to a running server. No restart; clients keep their queries.
+onebase deploy
+
+# Or compile functions and frontend into one executable.
+onebase build
+
+# Run it anywhere, with hourly snapshots to S3.
+./my-app serve --backup s3://my-bucket/backups
+</pre>
+</div>
         </div>
       </div>
+      <p class="more"><a class="link" href="docs/index.html">Explore all features</a></p>
     </div>
   </section>
 
-  <section class="section">
+  <section class="section" id="live" data-live data-channel="general" aria-labelledby="live-title">
     <div class="wrap">
-      <div class="section-head">
-        <span class="eyebrow">Batteries included</span>
-        <h2>The parts every app ends up needing.</h2>
+      <div class="head">
+        <h2 id="live-title">Only the queries you touch re-run</h2>
+        <p>Alice and Bob read #general, Cara reads #random. Send a message: the server re-runs one query and pushes it only to the clients reading that channel.</p>
       </div>
-      <div class="features">
-        <div class="feature">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2.5"/><path d="M7.8 7.8a6 6 0 0 0 0 8.4M16.2 7.8a6 6 0 0 1 0 8.4M5 5a10 10 0 0 0 0 14M19 5a10 10 0 0 1 0 14"/></svg>
-          <h3>Fine-grained live queries</h3>
-          <p>A new message in channel A never re-runs the query for channel B. Identical subscriptions share a single execution.</p>
+      <div class="demo">
+        <form class="composer" data-composer>
+          <div class="seg" role="group" aria-label="Channel">
+            <button type="button" aria-pressed="true" data-channel-btn="general">#general</button>
+            <button type="button" aria-pressed="false" data-channel-btn="random">#random</button>
+          </div>
+          <label class="sr-only" for="live-msg">Message</label>
+          <input id="live-msg" name="body" maxlength="48" placeholder="Write a message" autocomplete="off">
+          <button class="btn primary" type="submit">Send</button>
+        </form>
+        <div class="clients">
+          <div class="client" data-client="general"><div class="client-head"><b>Alice</b><span>#general</span></div>
+            <ul><li><b>Bob</b>deploying now</li><li><b>Alice</b>seeing it already</li></ul>
+            <p class="client-state" data-state>Subscribed</p></div>
+          <div class="client" data-client="general"><div class="client-head"><b>Bob</b><span>#general</span></div>
+            <ul><li><b>Bob</b>deploying now</li><li><b>Alice</b>seeing it already</li></ul>
+            <p class="client-state" data-state>Subscribed</p></div>
+          <div class="client" data-client="random"><div class="client-head"><b>Cara</b><span>#random</span></div>
+            <ul><li><b>Cara</b>lunch at one?</li></ul>
+            <p class="client-state" data-state>Subscribed</p></div>
         </div>
-        <div class="feature">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
-          <h3>Real transactions</h3>
-          <p>Mutations are atomic and serializable. Throw an error and none of the writes happen, even across several servers.</p>
-        </div>
-        <div class="feature">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/><path d="M4 7.5 12 12l8-4.5M12 12v9"/></svg>
-          <h3>Node and npm everywhere</h3>
-          <p>Every function runs in Bun. Import any package from a query, a mutation or an action. There's no <code>"use node"</code>.</p>
-        </div>
-        <div class="feature">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6 3 12l5 6M16 6l5 6-5 6M14 4l-4 16"/></svg>
-          <h3>Typed end to end</h3>
-          <p>The types flow from the schema to <code>ctx.db</code>, to <code>api.*</code>, to <code>useQuery</code>. Arguments are validated at runtime too.</p>
-        </div>
-        <div class="feature">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2.5M9 2h6"/></svg>
-          <h3>Scheduler and crons</h3>
-          <p><code>runAfter</code>, <code>runAt</code> and cron jobs survive restarts. Each run happens exactly once, even with several instances.</p>
-        </div>
-        <div class="feature">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3M12 4v12M7 9l5-5 5 5"/></svg>
-          <h3>File storage</h3>
-          <p>Uploads stream to disk or to S3, R2 or MinIO, so big files never sit in memory. Downloads come from presigned URLs.</p>
-        </div>
-        <div class="feature">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>
-          <h3>Sign-in built in</h3>
-          <p>Passwords, GitHub, Google or any OAuth provider, with sessions, in an API shaped like Convex Auth. Or bring Clerk, Auth0 or any OIDC issuer.</p>
-        </div>
-        <div class="feature">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5.5" rx="8" ry="2.5"/><path d="M4 5.5v13c0 1.4 3.6 2.5 8 2.5s8-1.1 8-2.5v-13M4 12c0 1.4 3.6 2.5 8 2.5s8-1.1 8-2.5"/></svg>
-          <h3>SQLite, Postgres or Turso</h3>
-          <p>Start on SQLite. Switch with <code>--db</code> when you need more servers, and your functions don't change.</p>
-        </div>
-        <div class="feature">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v4h-4"/></svg>
-          <h3>Backups to S3</h3>
-          <p>Consistent SQLite snapshots, gzipped and uploaded on a schedule. <code>onebase restore</code> brings them back.</p>
-        </div>
+        <p class="live-log" data-log aria-live="polite">Simulated in your browser with the rule the server uses. Measured: one write reaches 100 clients in 8.6 ms.</p>
       </div>
     </div>
   </section>
 
-  <section class="section">
-    <div class="wrap split">
-      <div class="section-head" style="margin:0">
-        <span class="eyebrow">Hard to get wrong</span>
-        <h2>Made for code written by people and by LLMs.</h2>
-        <p>The API is the one models already know from Convex. It forgives the usual mistakes, and when something is wrong it says how to fix it.</p>
-        <ul>
-          <li><span><code>.filter({ done: false })</code> works, and it uses an index when one exists.</span></li>
-          <li><span>Every error names the problem and the fix: the wrong field, a missing index, an argument that doesn't match.</span></li>
-          <li><span><code>onebase doctor</code> checks a project in one command, and the docs come as <a href="llms-full.txt">llms-full.txt</a> to give your assistant.</span></li>
-        </ul>
-      </div>
-<pre class="error-card"><span class="d">$ onebase doctor</span>
-<span class="e">✗ error</span> posts.ts:2: Imports from the convex package
-         instead of onebase.
-         <span class="f">fix:</span> Use "./_generated/server" and "onebase/values".
-<span class="e">✗ error</span> posts.ts:4: .filter() on a query gets a filter
-         builder, not a document.
-         <span class="f">fix:</span> .filter(q =&gt; q.eq(q.field("x"), v)) or .filter({ x: v })
-<span class="e">✗ error</span> schema.ts › posts.index("by_athor"):
-         Field "athor" doesn't exist on "posts".
-         <span class="f">fix:</span> Known fields: title, author
-<span class="w">⚠ warn </span> Query on "posts" reads every document to apply
-         .filter(). Add .index("by_author", ["author"])
-         and it will be used automatically.</pre>
-    </div>
-  </section>
-
-  <section class="section">
+  <!-- AI: agents, RAG and vector search, and the agent that writes the code -->
+  <section class="section" id="ai" aria-labelledby="ai-title">
     <div class="wrap">
-      <div class="section-head">
-        <span class="eyebrow">Deploy</span>
-        <h2>From a $5 VPS to a fleet of servers.</h2>
-        <p>One binary. Pick the database that fits your setup today, and change it later without touching your functions.</p>
-      </div>
-      <div class="deploy">
-        <div class="deploy-card">
-          <span class="tag">one server</span>
-          <h3>SQLite + S3 backups</h3>
-          <p>The default. Reads take microseconds, there's no database to run, and hourly snapshots go to any S3-compatible storage.</p>
-          <pre>onebase serve \
-  --backup s3://bucket/backups</pre>
-        </div>
-        <div class="deploy-card">
-          <span class="tag">many servers</span>
-          <h3>Postgres</h3>
-          <p>Run as many instances as you need behind a load balancer. Live queries are shared through LISTEN/NOTIFY, and mutations are serializable.</p>
-          <pre>onebase serve \
-  --db postgres://…/app \
-  --files s3://bucket/files</pre>
-        </div>
-        <div class="deploy-card">
-          <span class="tag">managed SQLite</span>
-          <h3>Turso</h3>
-          <p>SQLite semantics without running a database yourself, and still as many instances as you like.</p>
-          <pre>TURSO_AUTH_TOKEN=… onebase serve \
-  --db libsql://my-db.turso.io</pre>
+    <div class="head">
+      <h2 id="ai-title">Built for AI apps</h2>
+      <p>Agents, RAG and vector search are components in the same binary. Bring any model; the threads, tool calls and streams live in your own database.</p>
+    </div>
+    <div class="ai-grid">
+    <figure class="ai-fig">
+      <div class="ai-stage">
+        <div class="thread ui" data-ui data-thread role="img" aria-label="A support agent thread: the user asks about order 1042, the agent calls the orders:get tool, and the reply streams in">
+          <div class="thread-head"><b>Support</b><span>thread k7f2…q9</span></div>
+          <div class="msg user"><small>User</small><p>Has order 1042 shipped yet?</p></div>
+          <div class="msg tool"><small>Tool call</small><p><code>orders:get</code><span class="tag">query</span><code>{ id: 1042 }</code></p><p class="res"><code>status: "shipped", carrier: "DHL", eta: "Fri"</code></p></div>
+          <div class="msg bot"><small>Assistant</small><p data-stream>Yes. Order 1042 shipped with DHL and should arrive on Friday. Do you want the tracking link?</p></div>
+          <div class="thread-foot"><span data-stream-state>Streamed to 2 clients</span><span>418 tokens</span></div>
         </div>
       </div>
+      <figcaption>The thread is a live query. Each piece of the reply is saved as it arrives, and every client following the thread sees it grow.</figcaption>
+    </figure>
+    <ul class="ai-list">
+      <li><a href="docs/agent.html">Agent</a><span>Threads with history, a tool-calling loop over your own functions, streamed text and usage per message.</span></li>
+      <li><a href="docs/rag.html">RAG</a><span>Chunk and embed documents in the background, then search by meaning, keyword or both.</span></li>
+      <li><a href="docs/vector-search.html">Vector search</a><span>Vector indexes on your tables, with filters, on every database OneBase runs on.</span></li>
+      <li><a href="docs/workflow.html">Workflows</a><span>Multi-step jobs that survive restarts and retry, for model calls that take minutes.</span></li>
+    </ul>
+    </div>
+    <div class="agents">
+      <div class="agents-copy">
+        <h3>For the agent writing your code</h3>
+        <p>The whole manual as one text file, a one-page guide for your <code>AGENTS.md</code>, and a checker that tells the agent how to fix each mistake.</p>
+        <button class="btn primary" type="button" data-copy="Add a OneBase backend to this project. First read https://abdullah-bl.github.io/onebase/llms-full.txt, the full OneBase docs, and follow its LLM guide. Install it with bun add github:abdullah-bl/onebase, write the schema and functions in onebase/, and start it with bunx onebase dev. After every change run bunx onebase doctor and fix what it reports.">Copy the prompt for your agent</button>
+        <p class="agents-links"><a class="link" href="llms-full.txt">llms-full.txt</a><a class="link" href="docs/llm-guide.html">LLM guide</a><a class="link" href="docs/cli.html#doctor">onebase doctor</a></p>
+      </div>
+<pre class="frag-doctor" data-ui aria-label="Output of onebase doctor with two errors and a warning"><span class="d">$ bunx onebase doctor</span>
+<span class="e">error</span> posts.ts:2 Imports from the convex package.
+<span class="f">fix:</span> Use "./_generated/server" and "onebase/values".
+
+<span class="e">error</span> schema.ts posts.index("by_athor"):
+field "athor" doesn't exist.
+<span class="f">fix:</span> Known fields: title, author
+
+<span class="w">warn</span> Query on "posts" reads every document.
+<span class="f">fix:</span> Add .index("by_author", ["author"]).</pre>
+    </div>
     </div>
   </section>
 
-  <section class="section">
+  <!-- Next to Convex: the trade-offs, then the measurements -->
+  <section class="section vs" data-vs aria-labelledby="vs-title">
     <div class="wrap">
-      <div class="section-head">
-        <span class="eyebrow">Compared to Convex</span>
-        <h2>Same model. Different trade-offs.</h2>
-        <p>Convex is a polished managed platform. onebase is for when you want to own the whole stack. See the <a href="docs/benchmarks.html">benchmarks</a>, including what we haven't tested.</p>
-      </div>
-      <div class="compare-wrap">
-        <table class="compare">
-          <thead><tr><th></th><th>Convex</th><th class="us">onebase</th></tr></thead>
-          <tbody>
+    <div class="head">
+      <h2 id="vs-title">OneBase next to Convex</h2>
+      <p>Same model, different trade-offs. Convex is a polished managed platform; OneBase is for when you want to own the whole stack.</p>
+    </div>
+    <div class="tabs" role="tablist" aria-label="Comparison with Convex">
+      <button type="button" role="tab" id="vs-tab-0" aria-selected="true" aria-controls="vs-panel-0" data-vs-tab="0">Trade-offs</button>
+      <button type="button" role="tab" id="vs-tab-1" aria-selected="false" aria-controls="vs-panel-1" tabindex="-1" data-vs-tab="1">Benchmarks</button>
+    </div>
+    <div class="vs-panel traits-table" id="vs-panel-0" role="tabpanel" aria-labelledby="vs-tab-0" data-vs-panel="0">
+      <table>
+        <thead><tr><th><span class="sr-only">Feature</span></th><th>Convex</th><th>OneBase</th></tr></thead>
+        <tbody>
             <tr><th>Hosting</th><td>Managed cloud, or a self-hosted backend</td><td>One binary you run anywhere</td></tr>
             <tr><th>Runtime</th><td>V8 isolates; Node only in actions</td><td>Bun in every function</td></tr>
             <tr><th>Database</th><td>Convex's own</td><td>SQLite, Postgres, MySQL or Turso</td></tr>
-            <tr><th>.filter()</th><td>Builder; scans the documents</td><td>Builder or object; uses indexes</td></tr>
+            <tr><th><code>.filter()</code></th><td>Builder; scans the documents</td><td>Builder or object; uses indexes</td></tr>
             <tr><th>Dashboard</th><td>Included</td><td>Included, at <code>/_admin</code> in the binary</td></tr>
             <tr><th>Full-text search</th><td>Included</td><td>Included, same API</td></tr>
             <tr><th>Vector search</th><td>Included</td><td>Included, same API</td></tr>
-            <tr><th>Porting</th><td>n/a</td><td>Change the imports; <code>onebase doctor</code> lists them</td></tr>
+            <tr><th>Porting</th><td>Not applicable</td><td>Change the imports; <code>onebase doctor</code> lists them. <a href="docs/convex.html">Coming from Convex</a></td></tr>
           </tbody>
+      </table>
+    </div>
+    <div class="vs-panel" id="vs-panel-1" role="tabpanel" aria-labelledby="vs-tab-1" data-vs-panel="1">
+      <div class="compare-table">
+        <table>
+          <thead><tr><th>60 seconds of load</th><th>Convex</th><th>OneBase</th></tr></thead>
+          <tbody>
+          <tr><th>1 KB writes, 100 workers</th><td>971/s</td><td class="win">10,665/s</td></tr>
+          <tr><th>512 KB writes, 50 workers</th><td>805/s</td><td class="win">1,383/s</td></tr>
+          <tr><th>Vector search, 10,000 × 1536, 50 workers</th><td>1,575/s</td><td class="win">2,099/s</td></tr>
+          <tr><th>Repeated scan of 2,000 documents</th><td class="win">12,936/s</td><td>2,467/s</td></tr>
+          <tr><th>Memory during 1 KB writes</th><td>3,035 MiB</td><td class="win">39 MiB</td></tr>
+        </tbody>
         </table>
       </div>
+      <p class="note">Both in Docker with default settings, on an NVIDIA DGX Spark: arm64, 20 cores, 121 GiB of RAM. Where Convex won, the table says so. <a class="link" href="docs/benchmarks.html">The full benchmarks</a></p>
+      <ul class="caveats">
+        <li><span>Functions share one thread with no isolates, so a 3-second CPU-bound function delayed a ping by 3 seconds.</span></li>
+        <li><span>It lost none of 32,606 acknowledged writes to <code>kill -9</code>. Power loss is untested.</span></li>
+        <li><span>Convex wasn't tuned, and Convex Cloud wasn't tested.</span></li>
+        <li><span>Mostly single runs, with the load generator on the same machine. Nothing was measured on x86-64.</span></li>
+      </ul>
+    </div>
     </div>
   </section>
 
-  <div class="wrap">
-    <section class="cta">
-      <h2>Start with one file.</h2>
-      <p>Clone the example chat app and have a live, typed backend running in a minute.</p>
-      <div class="hero-ctas" style="margin:0">
+  <section class="section start" aria-labelledby="start-title">
+    <div class="wrap">
+      <h2 id="start-title">Start with one file</h2>
+      <p class="lead">Make a folder, add OneBase and start it in dev mode at http://localhost:8090.</p>
+      <div class="install big"><code>bun add github:abdullah-bl/onebase &amp;&amp; bunx onebase dev</code><button type="button" data-copy="bun add github:abdullah-bl/onebase &amp;&amp; bunx onebase dev" aria-label="Copy the commands">Copy</button></div>
+      <div class="actions">
         <a class="btn primary" href="docs/getting-started.html">Read the quick start</a>
-        <a class="btn" href="docs/index.html">Browse the docs</a>
+        <a class="btn" href="<!--REPO-->" target="_blank" rel="noopener">View on GitHub</a>
       </div>
-    </section>
-  </div>
+    </div>
+  </section>
 </main>
 
-<footer class="footer">
-  <div class="wrap">
-    <a class="brand" href="index.html"><svg class="logo-mark" viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="5" fill="currentColor"/><circle cx="16" cy="16" r="10.5" fill="none" stroke="currentColor" stroke-width="2" opacity=".55"/><circle cx="16" cy="16" r="15" fill="none" stroke="currentColor" stroke-width="1.5" opacity=".22"/></svg><span>OneBase</span></a>
-    <a href="docs/index.html">Docs</a>
-    <a href="<!--REPO-->" target="_blank" rel="noopener">GitHub</a>
-    <a href="<!--REPO-->/releases" target="_blank" rel="noopener">Releases</a>
-    <a href="llms.txt">llms.txt</a>
-    <a href="<!--REPO-->/blob/main/LICENSE" target="_blank" rel="noopener">MIT license</a>
-  </div>
-</footer>
+<!--FOOTER-->
 
 <script src="assets/site.js" defer></script>
 <script src="assets/landing.js" defer></script>

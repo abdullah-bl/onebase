@@ -16,6 +16,7 @@ import { isIdForTable, newId } from "./dialect";
 import { savepoint, SerialQueue, type Driver, type Exec } from "./driver";
 import { FileStore, LocalBlobs, type BlobBackend } from "./files";
 import { CallLog, type CallSource } from "./calllog";
+import { CallBudget, DEFAULT_CALL_LIMITS, type CallLimits } from "./limits";
 import { currentFunction, installGuards } from "./guard";
 import { AuthService, SESSION_PREFIX } from "./auth";
 import { createAuthenticate, type AuthConfig, type AuthenticateCtx } from "./jwt";
@@ -121,6 +122,8 @@ export type RuntimeOptions = {
   loadTimeoutMs?: number;
   /** How long a query, mutation or action may run (default: DEFAULT_TIME_LIMITS). */
   timeLimits?: Partial<TimeLimits>;
+  /** How much one query or mutation may read and write (default: DEFAULT_CALL_LIMITS). */
+  callLimits?: Partial<CallLimits>;
 };
 
 /** How long one call may run, in ms; 0 means no limit. */
@@ -237,6 +240,7 @@ export class Runtime {
   private readonly loadCode: RuntimeOptions["loadCode"];
   private readonly loadTimeoutMs: number;
   readonly timeLimits: TimeLimits;
+  readonly callLimits: CallLimits;
   private revokeListeners: ((sessionIds: string[]) => void)[] = [];
   private deployListeners: (() => Promise<void> | void)[] = [];
   private cronRunner: CronRunner | null = null;
@@ -268,6 +272,12 @@ export class Runtime {
       if (ms === undefined) continue; // unset: keep the default
       if (!(ms >= 0)) throw new Error(`timeLimits.${key} must be a number of ms (0 for no limit), got ${ms}.`);
       this.timeLimits[key] = ms;
+    }
+    this.callLimits = { ...DEFAULT_CALL_LIMITS };
+    for (const [key, n] of Object.entries(opts.callLimits ?? {}) as [keyof CallLimits, number | undefined][]) {
+      if (n === undefined) continue;
+      if (!(n >= 0)) throw new Error(`callLimits.${key} must be a non-negative number (0 for no limit), got ${n}.`);
+      this.callLimits[key] = n;
     }
     this.files = new FileStore(opts.blobs ?? new LocalBlobs(mkdtempSync(join(tmpdir(), "onebase-files-"))), () => this.nextCreationTime());
     this.siteUrl = (opts.siteUrl ?? "http://localhost:8090").replace(/\/$/, "");
@@ -997,7 +1007,7 @@ export class Runtime {
 
   private warn = (message: string) => this.log.warn(message);
 
-  private newDb(tx: Exec, extra: { readSet?: ReadSet; writes?: Write[] }, scope = TableScope.app) {
+  private newDb(tx: Exec, extra: { readSet?: ReadSet; writes?: Write[]; budget?: CallBudget }, scope = TableScope.app) {
     return new DatabaseImpl({
       tx,
       dialect: this.driver.dialect,
@@ -1368,8 +1378,10 @@ export class Runtime {
       this.driver.read((tx) =>
         this.withinLimit("query", name, async (deadline) => {
           const readSet: ReadSet = { ids: new Set(), ranges: [] };
-          const db = this.newDb(deadline.exec(tx), { readSet });
+          const budget = new CallBudget(name, "query", this.callLimits);
+          const db = this.newDb(deadline.exec(tx), { readSet, budget });
           const value = await this.invoke(name, fn, this.queryCtx(db, opts.identity ?? null, mount), args, readSet);
+          budget.check(); // a limit error the function caught still fails the query
           return { value, readSet };
         }),
       ),
@@ -1415,10 +1427,13 @@ export class Runtime {
     // The driver may run this more than once if another instance conflicts; each attempt starts fresh.
     const attempt = async (tx: Exec) => {
       const state: TxState = { tx, db: undefined as any, writes: [], scheduled: false, afterCommit: [], revoked: [], hookCursors: new Map() };
-      state.db = this.newDb(tx, { writes: state.writes }, scope);
+      // The system's own writes (dashboard, auth) have no budget; a function's count from scratch on each attempt.
+      const budget = limit ? new CallBudget(limit, "mutation", this.callLimits) : undefined;
+      state.db = this.newDb(tx, { writes: state.writes, budget }, scope);
       const value = await body(state);
       // Nothing commits before every table hook has seen every write.
       await this.flushHooks(state);
+      budget?.check(); // a limit error the function caught still rolls the mutation back
       if (this.driver.shared && this.driver.publish && (state.writes.length || state.scheduled || state.revoked.length)) {
         for (const message of this.broadcastMessages(state)) await this.driver.publish(tx, message);
       }

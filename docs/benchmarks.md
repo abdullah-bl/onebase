@@ -102,7 +102,7 @@ The memory figures are process RSS at the end of the round. The limit (64 MB by 
 | Writes in one function | fails at 16,001 documents | 128,000 passed (largest tried) |
 | Scan 100,000 documents in a query | fails after about 15 s | 91 ms |
 
-Convex's limits are deliberate protections. Having fewer limits isn't simply better: on onebase, nothing stops a function from using up the server.
+Convex's limits are deliberate protections. Having fewer limits isn't simply better: at the time, nothing stopped a function on onebase from using up the server. onebase has since added [read and write limits](./functions.md#read-and-write-limits), set far above Convex's: 16 MB per document, 128,000 writes and 256,000 reads per call by default. The 32 MiB document above would now fail unless you raise the limit. Nothing yet limits CPU time inside a function, as the [crash tests](#crash-and-correctness-tests) show.
 
 ### Crash and correctness tests
 

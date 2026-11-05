@@ -8,6 +8,7 @@ import { createDriver } from "./engine/driver";
 import { LocalBlobs, parseS3Url, S3Blobs } from "./engine/files";
 import type { AuthConfig } from "./engine/jwt";
 import { consoleLogger, DEFAULT_TIME_LIMITS, formatMs, Runtime, type Authenticate, type Modules, type TimeLimits } from "./engine/runtime";
+import { DEFAULT_CALL_LIMITS, formatBytes, type CallLimits } from "./engine/limits";
 import type { ComponentsDefinition } from "./components";
 import type { SchemaDefinition } from "./schema";
 import type { Crons, HttpRouter } from "./server";
@@ -58,6 +59,8 @@ export type AppOptions = {
   loadTimeoutMs?: number;
   /** How long a query, mutation or action may run (default 10s, 10s and 10m). */
   timeLimits?: Partial<TimeLimits>;
+  /** How much one query or mutation may read and write (default: DEFAULT_CALL_LIMITS). */
+  callLimits?: Partial<CallLimits>;
   quiet?: boolean;
 };
 
@@ -102,6 +105,7 @@ export async function startApp(opts: AppOptions) {
     loadCode: opts.deploys === false ? null : importBundle,
     loadTimeoutMs: opts.loadTimeoutMs,
     timeLimits: opts.timeLimits,
+    callLimits: opts.callLimits,
   });
   const { created, dropped } = await runtime.init();
   const adminKey = opts.dashboard === false ? null : loadAdminKey(opts.dataDir);
@@ -147,6 +151,15 @@ export async function startApp(opts: AppOptions) {
     if ((Object.keys(limits) as (keyof TimeLimits)[]).some((k) => limits[k] !== DEFAULT_TIME_LIMITS[k])) {
       const show = (ms: number) => (ms ? formatMs(ms) : "off");
       console.log(`  time limits query ${show(limits.queryMs)}, mutation ${show(limits.mutationMs)}, action ${show(limits.actionMs)}`);
+    }
+    const calls = runtime.callLimits;
+    if ((Object.keys(calls) as (keyof CallLimits)[]).some((k) => calls[k] !== DEFAULT_CALL_LIMITS[k])) {
+      const n = (v: number) => (v ? v.toLocaleString("en-US") : "off");
+      const b = (v: number) => (v ? formatBytes(v) : "off");
+      console.log(
+        `  limits     reads ${n(calls.documentsRead)}, writes ${n(calls.documentsWritten)}, ` +
+          `written ${b(calls.bytesWritten)}, document ${b(calls.documentBytes)}`,
+      );
     }
     if (opts.rateLimit) console.log(`  rate limit ${new RateLimiter(opts.rateLimit).describe()} per IP${opts.trustProxy ? " (X-Forwarded-For)" : ""}`);
     console.log(`  http       http://${host}:${server.port}`);

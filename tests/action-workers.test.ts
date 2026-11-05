@@ -229,11 +229,16 @@ test("a CPU-bound action over its limit is stopped, while queries keep answering
   expect(await runtime.runAction("notes:sleepy", { ms: 1 })).toBe("woke");
 });
 
-test("a CPU-bound action within its limit doesn't block other calls", async () => {
-  const burn = runtime.runAction("notes:burn", { iterations: 3e8 });
+test("a CPU-bound action doesn't block other calls", async () => {
+  // No time limit here, so the burn takes as long as the machine needs.
+  const unlimited = await start("unlimited", FILES, { actionWorkers: 1, timeLimits: { actionMs: 0 } });
+  let burnt = false;
+  const burn = unlimited.runAction("notes:burn", { iterations: 3e8 }).then((x) => ((burnt = true), x));
+  await Bun.sleep(20); // the burn is under way
   const t = performance.now();
-  expect((await runtime.runQuery("notes:ping", {})).value).toBe("pong");
+  expect((await unlimited.runQuery("notes:ping", {})).value).toBe("pong");
   expect(performance.now() - t).toBeLessThan(50);
+  expect(burnt).toBe(false);
   expect(typeof (await burn)).toBe("number");
 });
 

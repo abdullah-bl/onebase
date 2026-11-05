@@ -15,6 +15,42 @@
     store.set("theme", next);
   });
 
+  // Sticky bar: a shadow only once the page has scrolled under it. (taste-skill-ignore: sticky bar)
+  const bar = $("[data-topbar]");
+  if (bar) {
+    const onScroll = () => bar.classList.toggle("scrolled", scrollY > 8);
+    addEventListener("scroll", onScroll, { passive: true });
+    onScroll();
+  }
+
+  // Entrances: the parts of each block rise in turn, once. Nothing stays hidden if this never runs.
+  const reveals = $$("[data-reveal]");
+  reveals.forEach((el) => [...el.children].forEach((c, i) => c.style.setProperty("--i", String(i))));
+  if (!("IntersectionObserver" in window)) reveals.forEach((el) => el.classList.add("is-in"));
+  else {
+    const io = new IntersectionObserver((entries) => {
+      for (const e of entries) if (e.isIntersecting) { e.target.classList.add("is-in"); io.unobserve(e.target); }
+    }, { rootMargin: "0px 0px 20% 0px", threshold: 0 });
+    reveals.forEach((el) => io.observe(el));
+    addEventListener("load", () => setTimeout(() => reveals.forEach((el) => {
+      const r = el.getBoundingClientRect();
+      if (r.top < innerHeight && r.bottom > 0) el.classList.add("is-in");
+    }), 2500));
+  }
+
+  // "Copy as Markdown" on docs pages.
+  $("[data-copy-md]")?.addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    const label = btn.textContent;
+    try {
+      const text = await fetch(btn.dataset.copyMd).then((r) => r.text());
+      await navigator.clipboard.writeText(text);
+      btn.textContent = "Copied";
+    } catch { btn.textContent = "Couldn't copy"; }
+    btn.classList.add("done");
+    setTimeout(() => { btn.textContent = label; btn.classList.remove("done"); }, 1600);
+  });
+
   // Copy buttons on code blocks.
   document.addEventListener("click", async (e) => {
     const btn = e.target.closest?.(".copy, [data-copy]");
@@ -30,12 +66,17 @@
   });
 
   // Mobile sidebar.
-  $("[data-menu]")?.addEventListener("click", () => document.body.classList.toggle("nav-open"));
+  $("[data-menu]")?.addEventListener("click", (e) => {
+    const open = document.body.classList.toggle("nav-open");
+    e.currentTarget.setAttribute("aria-expanded", String(open));
+  });
   $("[data-sidebar]")?.addEventListener("click", (e) => { if (e.target.closest("a")) document.body.classList.remove("nav-open"); });
-  $("[data-sidebar] [aria-current]")?.scrollIntoView({ block: "center" });
+  const current = $("[data-sidebar] [aria-current]");
+  const side = $("[data-sidebar]");
+  if (current && side) side.scrollTop = current.offsetTop - side.clientHeight / 2;
 
   // Highlight the current section in "On this page".
-  const tocLinks = $$(".toc a");
+  const tocLinks = $$("nav.toc a");
   if (tocLinks.length) {
     const targets = tocLinks.map((a) => document.getElementById(a.hash.slice(1))).filter(Boolean);
     const update = () => {

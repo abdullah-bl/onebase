@@ -8,6 +8,9 @@ type Result = { ok: boolean; value?: unknown; error?: string; ms: number; at: nu
 
 const RECENT = 8;
 
+/** Functions that come from a mounted component live under `components/<mount>:`. */
+const isComponent = (name: string) => name.startsWith("components/");
+
 /** How this function has been doing: last hour's numbers and its latest calls. */
 function FunctionHealth({ name, go }: { name: string; go: (route: string) => void }) {
   const { metrics } = useLive();
@@ -78,10 +81,13 @@ export function FunctionsView({ name: selected, go }: { name?: string; go: (rout
   }, [fn?.name]);
 
   useEffect(() => {
-    if (!selected && fns?.length) go(`functions/${encodeURIComponent(fns[0]!.name)}`);
+    // Open on one of the app's own functions, not a component's.
+    const first = fns?.find((f) => !isComponent(f.name)) ?? fns?.[0];
+    if (!selected && first) go(`functions/${encodeURIComponent(first.name)}`);
   }, [fns, selected]);
 
-  const groups = useMemo(() => {
+  // The app's own modules first; component modules after them, folded.
+  const { app, comps } = useMemo(() => {
     const q = search.trim().toLowerCase();
     const map = new Map<string, Fn[]>();
     for (const f of fns ?? []) {
@@ -89,8 +95,16 @@ export function FunctionsView({ name: selected, go }: { name?: string; go: (rout
       const mod = f.name.split(":")[0]!;
       map.set(mod, [...(map.get(mod) ?? []), f]);
     }
-    return [...map];
+    const all = [...map];
+    return { app: all.filter(([mod]) => !isComponent(mod)), comps: all.filter(([mod]) => isComponent(mod)) };
   }, [fns, search]);
+
+  const item = (f: Fn) => (
+    <a href={`#/functions/${encodeURIComponent(f.name)}`} aria-current={f.name === selected ? "page" : undefined}>
+      <span>{f.name.split(":")[1]}</span>
+      <small class={`kind k-${f.type}`}>{f.type}</small>
+    </a>
+  );
 
   const run = async () => {
     if (!fn) return;
@@ -120,17 +134,20 @@ export function FunctionsView({ name: selected, go }: { name?: string; go: (rout
       <nav class="table-list" aria-label="Functions">
         <input class="list-search" placeholder="Search functions" value={search} onInput={(e) => setSearch((e.target as HTMLInputElement).value)} />
         {fns === null && <p class="muted pad">Loading…</p>}
-        {groups.map(([mod, list]) => (
+        {app.map(([mod, list]) => (
           <div class="fn-group">
-            <p class="list-title">{mod}</p>
-            {list.map((f) => (
-              <a href={`#/functions/${encodeURIComponent(f.name)}`} aria-current={f.name === selected ? "page" : undefined}>
-                <span>{f.name.split(":")[1]}</span>
-                <small title={f.type}>{f.type[0]!.toUpperCase()}</small>
-              </a>
-            ))}
+            <p class="list-title" title={mod}>{mod}</p>
+            {list.map(item)}
           </div>
         ))}
+        {comps.length > 0 && <p class="list-title list-section">Components</p>}
+        {comps.map(([mod, list]) => (
+          <details class="fn-group comp" open={!!search.trim() || list.some((f) => f.name === selected)}>
+            <summary title={mod}><span>{mod.replace(/^components\//, "")}</span><small>{list.length}</small></summary>
+            {list.map(item)}
+          </details>
+        ))}
+        {fns !== null && app.length === 0 && comps.length === 0 && <p class="muted pad">No function matches “{search.trim()}”.</p>}
       </nav>
       <section class="data-main">
         {!fn ? (

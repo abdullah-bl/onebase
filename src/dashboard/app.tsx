@@ -80,7 +80,7 @@ function Login({ onDone }: { onDone: () => void }) {
     <div class="login">
       <form class="login-card" onSubmit={submit}>
         <Logo />
-        <h1>onebase dashboard</h1>
+        <h1>OneBase dashboard</h1>
         <p class="muted">
           Enter the admin key. It's in <code>onebase_data/admin.key</code> (or <code>$ONEBASE_ADMIN_KEY</code>); in <code>onebase dev</code> the startup link signs you in.
         </p>
@@ -144,7 +144,7 @@ function App() {
   return (
     <div class="shell">
       <aside class="side">
-        <a class="brand" href="#/overview"><Logo /><span>onebase</span></a>
+        <a class="brand" href="#/overview"><Logo /><span>OneBase</span></a>
         <button class="side-search" onClick={() => setPalette(true)} aria-label="Go to a page, table or function">
           <Icon name="search" size={15} />
           <span>Go to…</span>
@@ -167,7 +167,7 @@ function App() {
       </aside>
       <main class="main">
         {page === "overview" && <OverviewView go={go} />}
-        {page === "data" && <DataView table={rest[0]} go={go} />}
+        {page === "data" && <DataView table={rest[0]} doc={rest[1]} go={go} />}
         {page === "functions" && <FunctionsView name={rest[0]} go={go} />}
         {page === "logs" && <LogsView scope={rest[0]} fn={rest[1]} go={go} />}
         {page === "scheduler" && <SchedulerView state={rest[0]} go={go} />}

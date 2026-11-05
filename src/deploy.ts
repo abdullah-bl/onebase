@@ -1,16 +1,13 @@
 // `onebase deploy`: bundles the functions (and the frontend) on your machine and pushes them to a
 // running server, which checks them against its data and swaps them in without a restart.
 
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { codegen } from "./codegen";
 import { doctor, printFindings } from "./doctor";
 import { buildCatalog } from "./engine/catalog";
-import { OnebaseError } from "./engine/database";
-import { rememberModule } from "./engine/deployments";
 import type { DeployResult, ProjectCode } from "./engine/runtime";
-import { projectEntry, registerVirtualModules } from "./project";
+import { projectEntry } from "./project";
 import { isRegisteredFunction } from "./server";
 
 /**
@@ -41,44 +38,7 @@ export async function bundleProject(dirInput: string): Promise<{ code: string; f
   return { code: await result.outputs[0]!.text(), files };
 }
 
-let bundleDir: string | null = null;
-
-/**
- * Server side: loads a bundle from bundleProject. Each deployment is a new file, so a new module.
- * Loads through require() where possible: unlike import(), its module cache can be emptied (see
- * releaseModules), so a replaced deployment's code can actually be freed. Bundles that need
- * top-level await can't be required and fall back to import(), which keeps them for the process's
- * lifetime.
- */
-export async function importBundle(source: string, id: string): Promise<ProjectCode> {
-  registerVirtualModules();
-  bundleDir ??= mkdtempSync(join(tmpdir(), "onebase-deploys-"));
-  const file = join(bundleDir, `${id}.js`);
-  writeFileSync(file, source);
-  let loaded: { default?: any };
-  try {
-    loaded = require(file) as { default?: any };
-    rememberModule(id, require.resolve(file));
-  } catch {
-    loaded = (await import(file)) as { default?: any };
-  }
-  rmSync(file, { force: true }); // the code lives in the database; a rollback rewrites it
-  const project = loaded.default;
-  if (!project || typeof project !== "object" || typeof project.modules !== "object") {
-    throw new OnebaseError("This isn't a onebase deploy bundle. Push code with onebase deploy.");
-  }
-  if (project.schema && !project.schema.__isOnebaseSchema) {
-    throw new OnebaseError("schema.ts must `export default defineSchema({ ... })`.");
-  }
-  return {
-    schema: project.schema ?? null,
-    modules: project.modules,
-    http: project.http ?? null,
-    auth: project.authConfig ?? null,
-    crons: project.crons?.jobs ?? [],
-    components: project.components ?? null,
-  };
-}
+export { importBundle } from "./project";
 
 /** The frontend as { "/path": base64 }. */
 async function readPublic(dir: string): Promise<Record<string, string>> {

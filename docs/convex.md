@@ -49,7 +49,7 @@ onebase uses Convex's programming model and most of its API. If you know Convex,
 
 Data doesn't migrate automatically. Export it from Convex as JSON and insert it with a mutation. `db.insert` sets `_id` and `_creationTime` itself, so ids change: insert referenced tables first and remap the references, and keep the old values in fields of their own if anything depends on them.
 
-Same code doesn't mean same behavior. Functions now share one thread with no isolates, so a long CPU-bound function delays every other request. [Benchmarks](./benchmarks.md) has what we measured, and what we didn't.
+Same code doesn't mean same behavior. Queries and mutations now share one thread with no isolates, so a long CPU-bound one delays every other request. Actions run on worker threads, but there's no memory limit per function. [Benchmarks](./benchmarks.md) has what we measured, and what we didn't.
 
 ## Components
 

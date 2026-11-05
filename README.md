@@ -64,7 +64,7 @@ In our tests on one machine, onebase used far less memory than self-hosted Conve
 
 **What to keep in mind:**
 
-- **Long-running functions block the server.** Functions share one thread with no isolates, so a 3-second CPU-bound function delayed a ping by 3 seconds.
+- **Long-running queries and mutations block the server.** They share one thread with no isolates, so a 3-second CPU-bound mutation delayed a ping by 3 seconds. Actions run on worker threads, which are stopped when an action runs out of time.
 - **Power loss is untested.** `kill -9` only tests a process crash. With the default `synchronous=NORMAL`, a power cut can lose the most recent commits.
 - **Convex wasn't tuned.** It ran with default settings and limits, on a volume with history that inflates its memory use. We didn't test Convex Cloud.
 - **Convex won on repeated scans** in this comparison, most likely from its query cache. onebase has since added a [cache for repeated reads](docs/functions.md#repeated-reads) on SQLite. In a separate run outside Docker it took a similar scan from about 1,700/s to about 114,000/s, but we haven't run it against Convex.

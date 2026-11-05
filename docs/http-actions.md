@@ -41,3 +41,4 @@ export default http;
 - **Handlers** get the same `ctx` as actions (`runQuery`, `runMutation`, `scheduler`, `storage`, `auth`) and a standard `Request`. They return a standard `Response`.
 - **Auth:** an `Authorization: Bearer` header is verified like any other token (see [Auth](./auth.md)).
 - **Reserved paths:** `/api/*` and `/_onebase/*` belong to onebase. Static files from `public/` are matched after your routes.
+- **Threads:** like other actions, they run on [worker threads](./functions.md#worker-threads). The request body is read in full before the handler starts, and the response body streams back as the handler produces it.

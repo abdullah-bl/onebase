@@ -15,7 +15,9 @@ beforeAll(async () => {
   dataDir = mkdtempSync(join(tmpdir(), "onebase-e2e-"));
   const project = await loadProject(join(import.meta.dir, "../examples/chat/onebase"));
   const { schema, modules, http, crons, authConfig, components } = project;
-  app = await startApp({ schema, modules, http, crons, auth: authConfig, components, dataDir, port: 0, hostname: "127.0.0.1", dev: false, quiet: true });
+  // As `onebase serve` runs it: HTTP actions run on worker threads that load the same folder.
+  const source = { dir: project.dir };
+  app = await startApp({ schema, modules, http, crons, auth: authConfig, components, source, dataDir, port: 0, hostname: "127.0.0.1", dev: false, quiet: true });
   url = `http://127.0.0.1:${app.server.port}`;
 });
 

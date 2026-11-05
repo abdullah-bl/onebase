@@ -30,6 +30,8 @@ export type EmbeddedProject = {
   crons: Crons | null;
   components: ComponentsDefinition | null;
   publicFiles: Record<string, string>;
+  /** The binary's action worker program (its path inside the binary), which has the same project built in. */
+  actionWorkerEntry?: string;
 };
 
 const HELP = `onebase v${VERSION}: a lightweight, Convex-style reactive backend
@@ -308,6 +310,8 @@ async function serveCommand(opts: ReturnType<typeof options>) {
     siteUrl: opts.url,
     dev: opts.dev,
     assets: pub ? directoryAssets(pub) : null,
+    // Action workers load the same files.
+    source: project === empty ? null : { dir: project.dir },
   });
 }
 
@@ -400,14 +404,25 @@ async function buildCommand(opts: ReturnType<typeof options>) {
       i++;
     }
   }
-  lines.push(`await runEmbedded({ ${fields}, publicFiles: { ${publicEntries.join(", ")} } });`);
+  // Both entry points sit in .onebase/, so inside the binary the worker is at ./worker.ts.
+  lines.push(`await runEmbedded({ ${fields}, publicFiles: { ${publicEntries.join(", ")} }, actionWorkerEntry: "./worker.ts" });`);
   const entry = join(dirname(dir), ".onebase", "entry.ts");
   mkdirSync(dirname(entry), { recursive: true });
   writeFileSync(entry, lines.join("\n") + "\n");
+  // Action workers run the same project, built into a second entry point.
+  const worker = join(dirname(entry), "worker.ts");
+  writeFileSync(
+    worker,
+    [
+      `import { serveActions } from ${JSON.stringify(join(import.meta.dir, "engine", "action-thread.ts"))};`,
+      ...imports,
+      `serveActions(() => { const p = { ${fields} }; return { schema: p.schema, modules: p.modules, http: p.http, auth: p.authConfig, crons: [], components: p.components }; });`,
+    ].join("\n") + "\n",
+  );
 
   const out = resolve(opts.out);
   // onebase reads .env files itself (see env.ts), in its own order.
-  const args = [process.execPath, "build", "--compile", "--minify", "--no-compile-autoload-dotenv", entry, "--outfile", out];
+  const args = [process.execPath, "build", "--compile", "--minify", "--no-compile-autoload-dotenv", entry, worker, "--outfile", out];
   if (opts.target) args.push("--target", opts.target);
   const proc = Bun.spawn(args, { stdio: ["inherit", "inherit", "inherit"] });
   if ((await proc.exited) !== 0) throw new Error("bun build failed");
@@ -433,6 +448,8 @@ export async function runEmbedded(project: EmbeddedProject, argv = process.argv.
     siteUrl: opts.url,
     dev: opts.dev,
     assets: Object.keys(project.publicFiles).length ? embeddedAssets(project.publicFiles) : null,
+    source: project.actionWorkerEntry ? { embedded: true } : null,
+    actionWorkerEntry: project.actionWorkerEntry,
   });
 }
 

@@ -3,17 +3,20 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { functionPathSymbol, getFunctionName, isFunctionHandle, type FunctionLike, type FunctionType } from "../api";
-import type { ComponentDefinition, ComponentRoute, ComponentsDefinition, MountOptions } from "../components";
+import type { ComponentsDefinition } from "../components";
 import { parseCron } from "../cron";
 import type { SchemaDefinition } from "../schema";
 import { isRegisteredFunction, type CronJob, type HttpAction, type HttpRouter, type RegisteredFunction, type UserIdentity } from "../server";
 import { ConvexError, describeValue, isPlainObject, validate, type AnyValidator } from "../values";
+import { ActionPool, defaultActionWorkers, defaultWorkerEntry } from "./action-pool";
+import type { CodeSource } from "./action-wire";
+import { indexCode, lookupRoute, type MountCode } from "./code";
 import { buildCatalog, storedTable, TableScope, tableMount, validatesTable, type Catalog } from "./catalog";
 import { CronRunner } from "./crons";
 import { BACKFILL_BATCH, backfilled, coalesce, hookState, readProgress, writeProgress, type HookProgress, type ResolvedHook } from "./hooks";
 import { applySchema, DatabaseImpl, OnebaseError, readerView, writerView, type ReadSet, type VectorSearchQuery, type Write } from "./database";
 import { isIdForTable, newId } from "./dialect";
-import { savepoint, SerialQueue, type Driver, type Exec } from "./driver";
+import { envNumber, savepoint, SerialQueue, type Driver, type Exec } from "./driver";
 import { FileStore, LocalBlobs, type BlobBackend } from "./files";
 import { CallLog, type CallSource } from "./calllog";
 import { CallBudget, DEFAULT_CALL_LIMITS, type CallLimits } from "./limits";
@@ -46,6 +49,8 @@ export type ProjectCode = {
   crons: CronJob[];
   /** components.ts's default export. */
   components: ComponentsDefinition | null;
+  /** Where the code came from, so action workers can load it too (none: actions run on the main thread). */
+  source?: CodeSource | null;
 };
 
 export type DeployResult = {
@@ -60,19 +65,10 @@ export type DeployResult = {
 };
 
 /** A component mounted in components.ts, as the runtime runs it. */
-export type MountRuntime = {
-  name: string;
-  definition: ComponentDefinition<any, any, any>;
-  config: unknown;
-  options: MountOptions;
+export type MountRuntime = MountCode & {
   scope: TableScope;
-  /** The component's function objects → their names in this mount ("components/limiter:limit"). */
-  names: Map<RegisteredFunction, string>;
   /** App tables this mount follows. */
   hooks: ResolvedHook[];
-  /** HTTP routes, served under `httpPrefix` (null: not served). */
-  routes: ComponentRoute[];
-  httpPrefix: string | null;
 };
 
 /** Who is calling: the app (null), a component, or the system (scheduler, crons, dashboard), which may call anything. */
@@ -122,6 +118,15 @@ export type RuntimeOptions = {
   loadTimeoutMs?: number;
   /** How long a query, mutation or action may run (default: DEFAULT_TIME_LIMITS). */
   timeLimits?: Partial<TimeLimits>;
+  /** Where the code above came from, so actions can run on worker threads (none: on the main thread). */
+  source?: CodeSource | null;
+  /**
+   * Worker threads for actions, at most (default: $ONEBASE_ACTION_WORKERS, else one per CPU core up
+   * to 8). 0 runs actions on the main thread. Only code with a `source` runs on workers.
+   */
+  actionWorkers?: number;
+  /** The workers' program (default: onebase's own; a binary from `onebase build` has its own). */
+  actionWorkerEntry?: string | URL;
   /** How much one query or mutation may read and write (default: DEFAULT_CALL_LIMITS). */
   callLimits?: Partial<CallLimits>;
 };
@@ -137,6 +142,18 @@ export const DEFAULT_TIME_LIMITS: TimeLimits = { queryMs: 10_000, mutationMs: 10
  */
 class Deadline {
   expired: OnebaseError | null = null;
+  private listeners: (() => void)[] = [];
+
+  /** Calls `fn` once the deadline passes. */
+  onExpire(fn: () => void) {
+    if (this.expired) fn();
+    else this.listeners.push(fn);
+  }
+
+  expire(error: OnebaseError) {
+    this.expired = error;
+    for (const fn of this.listeners.splice(0)) fn();
+  }
 
   check() {
     if (this.expired) throw this.expired;
@@ -244,6 +261,10 @@ export class Runtime {
   private revokeListeners: ((sessionIds: string[]) => void)[] = [];
   private deployListeners: (() => Promise<void> | void)[] = [];
   private cronRunner: CronRunner | null = null;
+  /** Runs the current code's actions on worker threads; null: they run on the main thread. */
+  actionPool: ActionPool | null = null;
+  private readonly actionWorkers: number;
+  private readonly actionWorkerEntry: string | URL;
   private schedulerStarted = false;
   /** Mutations from this process run one at a time; other instances are handled by the driver. */
   private readonly mutations = new SerialQueue();
@@ -267,6 +288,8 @@ export class Runtime {
     this.log = opts.log ?? consoleLogger;
     this.loadCode = this.dev ? null : opts.loadCode;
     this.loadTimeoutMs = opts.loadTimeoutMs ?? 30_000;
+    this.actionWorkers = opts.actionWorkers ?? envNumber("ONEBASE_ACTION_WORKERS") ?? defaultActionWorkers();
+    this.actionWorkerEntry = opts.actionWorkerEntry ?? defaultWorkerEntry();
     this.timeLimits = { ...DEFAULT_TIME_LIMITS };
     for (const [key, ms] of Object.entries(opts.timeLimits ?? {}) as [keyof TimeLimits, number | undefined][]) {
       if (ms === undefined) continue; // unset: keep the default
@@ -288,6 +311,7 @@ export class Runtime {
       auth: opts.auth ?? null,
       crons: opts.crons ?? [],
       components: opts.components ?? null,
+      source: opts.source ?? null,
     };
     this.setCode(this.prepare(code), null);
   }
@@ -427,49 +451,12 @@ export class Runtime {
 
   /** Collects a project's functions and components and builds its sign-in, without installing anything yet. */
   private prepare(code: ProjectCode): PreparedCode {
-    const functions = new Map<string, RegisteredFunction>();
-    const mounts = new Map<string, MountRuntime>();
-    const componentFunctions: PreparedCode["componentFunctions"] = new Map();
-    for (const [modulePath, exports] of Object.entries(code.modules)) {
-      if (code.components && (modulePath === "components" || modulePath.startsWith("components/"))) {
-        throw new OnebaseError(`${modulePath}: functions can't live in a components/ folder; that name is reserved for the components mounted in components.ts.`);
-      }
-      for (const [exportName, value] of Object.entries(exports)) {
-        if (isRegisteredFunction(value)) functions.set(`${modulePath}:${exportName}`, value);
-      }
-    }
-    for (const [name, m] of Object.entries(code.components?.mounts ?? {})) {
-      const mount: MountRuntime = {
-        name,
-        definition: m.definition,
-        config: m.config,
-        options: m.options ?? {},
-        scope: TableScope.component(name),
-        names: new Map(),
-        hooks: [],
-        routes: m.definition.http?.(m.config) ?? [],
-        httpPrefix: m.options?.httpPrefix === false ? null : (m.options?.httpPrefix ?? `/${name}`),
-      };
-      const exposed = new Set((m.options?.expose ?? []).map(String));
-      const walk = (tree: Record<string, unknown>, path: string[]) => {
-        for (const [key, value] of Object.entries(tree)) {
-          if (!isRegisteredFunction(value)) {
-            walk(value as Record<string, unknown>, [...path, key]);
-            continue;
-          }
-          const fullName = `components/${[name, ...path].join("/")}:${key}`;
-          // Clients reach only what the app exposed; everything else goes through the app's functions.
-          functions.set(fullName, { ...value, visibility: exposed.has([...path, key].join(".")) ? "public" : "internal" });
-          componentFunctions.set(fullName, { mount, internal: value.visibility === "internal" });
-          mount.names.set(value, fullName);
-        }
-      };
-      walk(m.definition.functions, []);
+    const { functions, componentFunctions, mounts } = indexCode(code, (mount): MountRuntime => ({ ...mount, scope: TableScope.component(mount.name), hooks: [] }));
+    for (const mount of mounts.values()) {
       mount.hooks = this.resolveHooks(mount, code.schema, functions);
       if (mount.httpPrefix && /^\/(api|_admin|_onebase)(\/|$)/.test(mount.httpPrefix)) {
-        throw new OnebaseError(`Component "${name}": httpPrefix "${mount.httpPrefix}" is taken by onebase itself; pick another.`);
+        throw new OnebaseError(`Component "${mount.name}": httpPrefix "${mount.httpPrefix}" is taken by onebase itself; pick another.`);
       }
-      mounts.set(name, mount);
     }
     const crons = [...code.crons, ...[...mounts.values()].flatMap((mount) => this.componentCrons(mount))];
     const catalog = buildCatalog(code.schema, [...mounts.values()].map((m) => ({ mount: m.name, schema: m.definition.schema })));
@@ -510,20 +497,7 @@ export class Runtime {
    * prefix (so the app can always override one).
    */
   lookupHttp(method: string, pathname: string): { handler: HttpAction; mount: MountRuntime | null } | null {
-    const own = this.http?.lookup(method, pathname);
-    if (own) return { handler: own, mount: null };
-    for (const mount of this.mounts.values()) {
-      const prefix = mount.httpPrefix;
-      if (!prefix || !mount.routes.length || (pathname !== prefix && !pathname.startsWith(prefix + "/"))) continue;
-      const rest = pathname.slice(prefix.length) || "/";
-      const exact = mount.routes.find((r) => r.method === method && r.path === rest);
-      const prefixed = mount.routes
-        .filter((r) => r.method === method && r.pathPrefix && rest.startsWith(r.pathPrefix))
-        .sort((a, b) => b.pathPrefix!.length - a.pathPrefix!.length)[0];
-      const route = exact ?? prefixed;
-      if (route) return { handler: route.handler, mount };
-    }
-    return null;
+    return lookupRoute(this.http, this.mounts.values(), method, pathname);
   }
 
   /** A mount's table hooks, checked: they follow app tables and run the component's own functions. */
@@ -569,6 +543,13 @@ export class Runtime {
     this.functions.clear();
     for (const [name, fn] of prepared.functions) this.functions.set(name, fn);
     this.deployment = deployment;
+    // Actions already running on the old code's workers finish there.
+    this.actionPool?.retire();
+    const source = prepared.code.source;
+    this.actionPool =
+      source && this.actionWorkers > 0 && !this.stopped
+        ? new ActionPool({ size: this.actionWorkers, entry: this.actionWorkerEntry, source, log: this.log, functions: () => prepared.functions.keys() })
+        : null;
   }
 
   /** Swaps in new code, restarts crons, and lets the HTTP layer re-run live queries. */
@@ -1341,8 +1322,9 @@ export class Runtime {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const expired = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
-        deadline.expired = new OnebaseError(`${name} didn't finish within the ${kind} time limit (${formatMs(ms)}).`);
-        reject(deadline.expired);
+        const error = new OnebaseError(`${name} didn't finish within the ${kind} time limit (${formatMs(ms)}).`);
+        reject(error);
+        deadline.expire(error);
       }, ms);
     });
     try {
@@ -1361,11 +1343,20 @@ export class Runtime {
   ) {
     const name = `${request.method} ${new URL(request.url).pathname}`;
     const handle = (ref: unknown) => this.createHandle(ref, mount);
-    return this.calls.track(name, "http", "http", () =>
-      this.withinLimit("action", name, (deadline) =>
+    const pool = this.actionPool;
+    return this.calls.track(name, "http", "http", async () => {
+      // The limit starts once a worker is ready: starting one isn't the action's fault.
+      const thread = pool && (await pool.acquire());
+      if (thread) {
+        const call = { identity: this.identityFor(mount, identity), mount: mount?.name ?? null };
+        return this.withinLimit("action", name, (deadline) =>
+          pool!.runHttp(thread, request, call, { ctx: this.actionCtx(identity, mount, deadline), handle }, deadline),
+        );
+      }
+      return this.withinLimit("action", name, (deadline) =>
         currentFunction.run({ type: "action", name, handle }, async () => handler(this.actionCtx(identity, mount, deadline), request)),
-      ),
-    );
+      );
+    });
   }
 
   // ---- Entry points ----
@@ -1491,9 +1482,21 @@ export class Runtime {
 
   async runAction(ref: FunctionLike, args: unknown, opts: CallOptions = {}): Promise<unknown> {
     const { name, fn, mount } = this.resolve(ref, "action", opts.allowInternal ?? false, this.callerOf(opts));
-    return this.calls.track(name, "action", opts.source ?? "function", () =>
-      this.withinLimit("action", name, (deadline) => this.invoke(name, fn, this.actionCtx(opts.identity ?? null, mount, deadline), args)),
-    );
+    const identity = opts.identity ?? null;
+    const pool = this.actionPool;
+    return this.calls.track(name, "action", opts.source ?? "function", async () => {
+      if (!pool) return this.withinLimit("action", name, (deadline) => this.invoke(name, fn, this.actionCtx(identity, mount, deadline), args));
+      const checked = this.checkArgs(name, fn, args);
+      // The limit starts once a worker is ready: starting one isn't the action's fault.
+      const thread = await pool.acquire();
+      if (!thread) return this.withinLimit("action", name, (deadline) => this.invoke(name, fn, this.actionCtx(identity, mount, deadline), checked));
+      const call = { name, args: checked, identity: this.identityFor(mount, identity), mount: mount?.name ?? null };
+      const handle = (ref: unknown) => this.createHandle(ref, mount);
+      const value = await this.withinLimit("action", name, (deadline) =>
+        pool.runAction(thread, call, { ctx: this.actionCtx(identity, mount, deadline), handle }, deadline),
+      );
+      return this.checkReturn(name, fn, value);
+    });
   }
 
   /** Runs any function by name, whatever its type. */
@@ -1659,6 +1662,7 @@ export class Runtime {
 
   stop() {
     this.stopped = true;
+    this.actionPool?.stop();
     this.cronRunner?.stop();
     if (this.schedulerTimer) clearTimeout(this.schedulerTimer);
     if (this.heartbeat) clearInterval(this.heartbeat);

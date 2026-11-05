@@ -1,7 +1,8 @@
 // Loads a functions directory (default ./onebase) from disk.
 
 import { plugin } from "bun";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import * as auth from "./auth";
 import * as components from "./components";
@@ -11,7 +12,9 @@ import * as rateLimiter from "./components/rate-limiter";
 import * as shardedCounter from "./components/sharded-counter";
 import * as workQueue from "./components/work-queue";
 import type { AuthConfig } from "./engine/jwt";
-import type { Modules } from "./engine/runtime";
+import { OnebaseError } from "./engine/database";
+import { rememberModule } from "./engine/deployments";
+import type { Modules, ProjectCode } from "./engine/runtime";
 import type { SchemaDefinition } from "./schema";
 import * as server from "./server";
 import type { Crons, HttpRouter } from "./server";
@@ -172,4 +175,58 @@ export async function loadProject(dirInput: string, onError?: (err: ProjectLoadE
     project.sources[modulePath] = file;
   }
   return project;
+}
+
+let bundleDir: string | null = null;
+
+/**
+ * Server side: loads a bundle from bundleProject. Each deployment is a new file, so a new module.
+ * Loads through require() where possible: unlike import(), its module cache can be emptied (see
+ * releaseModules), so a replaced deployment's code can actually be freed. Bundles that need
+ * top-level await can't be required and fall back to import(), which keeps them for the process's
+ * lifetime.
+ */
+export async function importBundle(source: string, id: string): Promise<ProjectCode> {
+  registerVirtualModules();
+  bundleDir ??= mkdtempSync(join(tmpdir(), "onebase-deploys-"));
+  const file = join(bundleDir, `${id}.js`);
+  writeFileSync(file, source);
+  let loaded: { default?: any };
+  try {
+    loaded = require(file) as { default?: any };
+    rememberModule(id, require.resolve(file));
+  } catch {
+    loaded = (await import(file)) as { default?: any };
+  }
+  rmSync(file, { force: true }); // the code lives in the database; a rollback rewrites it
+  const project = loaded.default;
+  if (!project || typeof project !== "object" || typeof project.modules !== "object") {
+    throw new OnebaseError("This isn't a onebase deploy bundle. Push code with onebase deploy.");
+  }
+  if (project.schema && !project.schema.__isOnebaseSchema) {
+    throw new OnebaseError("schema.ts must `export default defineSchema({ ... })`.");
+  }
+  return {
+    source: { bundle: source, id },
+    schema: project.schema ?? null,
+    modules: project.modules,
+    http: project.http ?? null,
+    auth: project.authConfig ?? null,
+    crons: project.crons?.jobs ?? [],
+    components: project.components ?? null,
+  };
+}
+
+/** A functions directory, loaded as the runtime runs it. */
+export async function loadProjectCode(dir: string): Promise<ProjectCode> {
+  const project = await loadProject(dir);
+  return {
+    source: { dir: project.dir },
+    schema: project.schema,
+    modules: project.modules,
+    http: project.http,
+    auth: project.authConfig,
+    crons: project.crons?.jobs ?? [],
+    components: project.components,
+  };
 }

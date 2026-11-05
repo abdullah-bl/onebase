@@ -113,7 +113,7 @@ const failure = (call: Promise<unknown>): Promise<Error> =>
     },
     (err: Error) => err,
   );
-const stored = async () => (await runtime.withReader((tx) => tx.get("SELECT COUNT(*) AS n FROM documents"))).n as number;
+const stored = async () => (await runtime.withReader((tx) => tx.get("SELECT COUNT(*) AS n FROM documents")))!.n as number;
 /** Inserts `n` notes, in mutations under the write limit. */
 const seed = async (n: number) => {
   for (let left = n; left > 0; left -= LIMITS.documentsWritten) {

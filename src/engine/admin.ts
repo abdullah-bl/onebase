@@ -37,8 +37,8 @@ function sameDigest(a: Uint8Array, b: Uint8Array): boolean {
 
 const HTML = (version: string) => `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>onebase dashboard</title><meta name="robots" content="noindex">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='5' fill='%2314b886'/%3E%3Ccircle cx='16' cy='16' r='10.5' fill='none' stroke='%2314b886' stroke-width='2.4' opacity='.6'/%3E%3C/svg%3E">
+<title>OneBase dashboard</title><meta name="robots" content="noindex">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='5' fill='%232563eb'/%3E%3Ccircle cx='16' cy='16' r='10.5' fill='none' stroke='%232563eb' stroke-width='2.4' opacity='.6'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/_admin/app.css?v=${version}">
 <script>try{var t=localStorage.getItem("ob-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
 </head><body><div id="app"></div><script type="module" src="/_admin/app.js?v=${version}"></script></body></html>`;

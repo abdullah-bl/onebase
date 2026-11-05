@@ -528,7 +528,7 @@ export function OverviewView({ go }: { go: Go }) {
         <div>
           <h1>Overview</h1>
           <p class="muted">
-            {overview ? <>onebase v{overview.version} · {overview.driver.kind}{uptime !== undefined && ` · up ${duration(uptime)}`}</> : "Loading…"}
+            {overview ? <>OneBase v{overview.version} · {overview.driver.kind}{uptime !== undefined && ` · up ${duration(uptime)}`}</> : "Loading…"}
           </p>
         </div>
         <div class="toolbar">

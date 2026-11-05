@@ -119,7 +119,10 @@ function groupByComponent(tables: Table[]): [string | null, Table[]][] {
   return [...groups].filter(([, list]) => list.length);
 }
 
-export function DataView({ table: selected, go }: { table?: string; go: (route: string) => void }) {
+/** Shortens an id for a reference cell; the full id is in the link title. */
+const shortId = (id: string) => (id.length > 14 ? `${id.slice(0, 6)}…${id.slice(-4)}` : id);
+
+export function DataView({ table: selected, doc, go }: { table?: string; doc?: string; go: (route: string) => void }) {
   const [tables, setTables] = useState<Table[] | null>(null);
   const [rows, setRows] = useState<Doc[]>([]);
   const [cursor, setCursor] = useState<string | null>(null);
@@ -132,6 +135,8 @@ export function DataView({ table: selected, go }: { table?: string; go: (route: 
   const [flash, setFlash] = useState(false);
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const loaded = useRef(PAGE);
+  // A document id from the route (#/data/<table>/<id>), used by the next load instead of the filter box.
+  const pendingDoc = useRef<string | null>(doc ?? null);
 
   const table = tables?.find((t) => t.name === selected) ?? null;
 
@@ -140,7 +145,8 @@ export function DataView({ table: selected, go }: { table?: string; go: (route: 
   const load = async (more = false) => {
     if (!selected) return;
     try {
-      const idLike = filterText.trim();
+      const idLike = (pendingDoc.current ?? filterText).trim();
+      pendingDoc.current = null;
       const body =
         idLike && !idLike.startsWith("{")
           ? { table: selected, id: idLike }
@@ -149,6 +155,7 @@ export function DataView({ table: selected, go }: { table?: string; go: (route: 
       const next = more ? [...rows, ...res.page] : res.page;
       loaded.current = Math.min(Math.max(next.length, PAGE), 500);
       setRows(next);
+      if (!more && doc && res.page[0]?._id === doc) setEditing(res.page[0]);
       setCursor(res.continueCursor);
       setDone(res.isDone);
       setError(null);
@@ -162,12 +169,17 @@ export function DataView({ table: selected, go }: { table?: string; go: (route: 
   }, []);
 
   useEffect(() => {
+    pendingDoc.current = doc ?? "";
+    setFilterText(doc ?? "");
+  }, [doc]);
+
+  useEffect(() => {
     loaded.current = PAGE;
     setRows([]);
     setPicked(new Set());
     setEditing(null);
     void load();
-  }, [selected, order, filter]);
+  }, [selected, order, filter, doc]);
 
   // Refresh when this table changes, whoever changed it.
   const loadRef = useRef(load);
@@ -200,6 +212,33 @@ export function DataView({ table: selected, go }: { table?: string; go: (route: 
     for (const r of rows.slice(0, 50)) for (const k of Object.keys(r)) if (!k.startsWith("_")) keys.add(k);
     return [...keys].slice(0, 10);
   }, [rows, table]);
+
+  // Fields declared as v.id("table") link to the document they point to.
+  const refs = useMemo(() => {
+    const out = new Map<string, string>();
+    const fields = table?.validator?.kind === "object" ? table.validator.fields : {};
+    for (const [k, f] of Object.entries<any>(fields ?? {})) {
+      if (f?.kind !== "id") continue;
+      const own = f.tableName as string;
+      const scoped = table?.component ? `${table.component}.${own}` : own;
+      out.set(k, tables?.some((t) => t.name === scoped) ? scoped : own);
+    }
+    return out;
+  }, [table, tables]);
+
+  const cell = (c: string, value: unknown) => {
+    if (value === undefined) return <span class="muted">–</span>;
+    const ref = refs.get(c);
+    if (ref && typeof value === "string") {
+      const href = ref === "_storage" ? "#/files" : `#/data/${encodeURIComponent(ref)}/${encodeURIComponent(value)}`;
+      return (
+        <a class="ref" href={href} title={`${value} in ${ref}`} onClick={(e) => e.stopPropagation()}>
+          <span>{ref === "_storage" ? "file" : ref}</span><code>{shortId(value)}</code>
+        </a>
+      );
+    }
+    return preview(value);
+  };
 
   // Ids that have left the table (or the loaded rows) don't count as selected.
   const pickedRows = rows.filter((r) => picked.has(r._id));
@@ -238,6 +277,7 @@ export function DataView({ table: selected, go }: { table?: string; go: (route: 
   };
 
   const clearFilter = () => {
+    if (doc) return go(`data/${selected}`);
     setFilterText("");
     setFilter(null);
     setError(null);
@@ -361,7 +401,7 @@ export function DataView({ table: selected, go }: { table?: string; go: (route: 
                         </td>
                         <td><code class="id">{r._id}</code></td>
                         {columns.map((c) => (
-                          <td class={typeof r[c] === "string" ? "" : "mono"}>{r[c] === undefined ? <span class="muted">–</span> : preview(r[c])}</td>
+                          <td class={typeof r[c] === "string" ? "" : "mono"}>{cell(c, r[c])}</td>
                         ))}
                         <td class="muted nowrap" title={fullTime(r._creationTime)}>{ago(r._creationTime)}</td>
                       </tr>

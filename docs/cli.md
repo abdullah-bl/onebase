@@ -16,6 +16,7 @@ onebase <command> [flags]
 | `codegen` | Write `onebase/_generated/` (`api.ts`, `server.ts`, `dataModel.ts`) |
 | `doctor` | Check the schema, functions, crons and imports for common mistakes; exits 1 on errors |
 | `deploy` | Push functions (and `public/`) to a running server with no restart; `--dry-run` checks only, `--rollback` goes back one (see [Deployment](./deployment.md#onebase-deploy)) |
+| `upgrade` | Replace this binary with the latest release, or `upgrade 0.3.0`, after checking it (see [Upgrading onebase](./deployment.md#upgrading-onebase)); `--check` only looks |
 | `build` | Compile functions and frontend into one executable |
 | `backup` | Take one SQLite snapshot to `--backup` now |
 | `backups` | List snapshots in `--backup` |
@@ -47,6 +48,7 @@ Each flag can also be set with an environment variable, which can come from a [.
 | `--trust-proxy` | off / `$ONEBASE_TRUST_PROXY=1` | Take the client IP from `X-Forwarded-For` |
 | `--no-dashboard` | dashboard on / `$ONEBASE_DASHBOARD=off` | Don't serve the dashboard or admin API at `/_admin` (this also turns off deploys) |
 | `--no-deploy` | deploys on / `$ONEBASE_DEPLOY=off` | Refuse `onebase deploy` and run the local code instead of what was pushed |
+| `--check` | | `upgrade`: only say whether a newer release exists |
 | `--dry-run` | | `deploy`: check the code against the server's data without changing anything |
 | `--rollback` | | `deploy`: go back to the previous deployment |
 | `--env-file <path>` | `.env` files for the command | Read only this file; repeat for several |

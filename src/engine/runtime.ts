@@ -23,6 +23,8 @@ import { CallBudget, DEFAULT_CALL_LIMITS, type CallLimits } from "./limits";
 import { currentFunction, installGuards } from "./guard";
 import { AuthError, AuthService, SESSION_PREFIX } from "./auth";
 import { DeviceService } from "./device";
+import { checkStorage } from "./storage";
+import { compareVersions, compatibleVersions, VERSION } from "../version";
 import { isMcpToken, McpService } from "./mcp";
 import { isMcpTool, type McpDefinition } from "../mcp";
 import { createAuthenticate, type AuthConfig, type AuthenticateCtx } from "./jwt";
@@ -54,7 +56,18 @@ export type ProjectCode = {
   components: ComponentsDefinition | null;
   /** Where the code came from, so action workers can load it too (none: actions run on the main thread). */
   source?: CodeSource | null;
+  /** The onebase version a pushed bundle was built with (unknown for older bundles). */
+  builtWith?: string | null;
 };
+
+/** A warning when code built with onebase `builtWith` may not run right on this server. */
+export function versionWarning(builtWith: string | null | undefined, server = VERSION): string | null {
+  if (!builtWith || compatibleVersions(builtWith, server)) return null;
+  return (
+    `This code was built with onebase ${builtWith}, but the server runs ${server}. ` +
+    `Deploy from a project on onebase ${server}, or run the server on ${builtWith}.`
+  );
+}
 
 export type DeployResult = {
   id: string;
@@ -330,13 +343,22 @@ export class Runtime {
    */
   async init(): Promise<{ created: string[]; dropped: string[] }> {
     await this.driver.init();
+    // First: an older onebase must not touch a database a newer one has migrated.
+    const storage = await checkStorage(this.driver, { log: (m) => this.log.info(m) });
+    if (storage.previous && compareVersions(storage.previous, VERSION) < 0) this.log.info(`Upgraded from onebase ${storage.previous} to ${VERSION}.`);
+    if (storage.previous && compareVersions(storage.previous, VERSION) > 0) {
+      this.log.warn(`This database was last opened by onebase ${storage.previous}, newer than this ${VERSION}. It runs, but go back to ${storage.previous} when you can.`);
+    }
     this.handleKey = await this.loadHandleKey();
     let applied: { result: { created: string[]; dropped: string[] }; warnings: string[] } | null = null;
     while (!applied) {
       const stored = this.loadCode ? await this.driver.read((tx) => activeDeployment(tx)) : null;
       if (stored) {
         try {
-          this.setCode(await this.load(stored), toDeployment(stored));
+          const prepared = await this.load(stored);
+          this.setCode(prepared, toDeployment(stored));
+          const mismatch = versionWarning(prepared.code.builtWith);
+          if (mismatch) this.log.warn(`Deployment ${stored.id}: ${mismatch}`);
           releaseModules(stored.id); // anything left from an earlier deployment is replaced
         } catch (err) {
           throw new OnebaseError(
@@ -662,7 +684,15 @@ export class Runtime {
    * A dry run only checks: it ships the schema as data (with the function count) and never runs
    * the pushed code, so checking a bundle is safe even when its top level has side effects.
    */
-  async deploy(input: { code: string; assets?: Record<string, string> | null; dryRun?: boolean; schema?: unknown; functions?: unknown }): Promise<DeployResult> {
+  async deploy(input: {
+    code: string;
+    assets?: Record<string, string> | null;
+    dryRun?: boolean;
+    schema?: unknown;
+    functions?: unknown;
+    /** The pushing CLI's onebase version. */
+    onebaseVersion?: unknown;
+  }): Promise<DeployResult> {
     if (typeof input.code !== "string" || !input.code) throw new OnebaseError("A deploy needs the bundle's code.");
     if (input.assets && Object.values(input.assets).some((v) => typeof v !== "string")) {
       throw new OnebaseError('assets must map paths to base64 strings: { "/index.html": "PCFkb2N0eXBl..." }.');
@@ -678,8 +708,9 @@ export class Runtime {
       code: input.code,
       assets: input.assets && Object.keys(input.assets).length ? JSON.stringify(input.assets) : null,
     };
+    const cli = typeof input.onebaseVersion === "string" ? input.onebaseVersion : null;
     return this.deploys.run(() =>
-      this.activate(stored, { save: true, dryRun: input.dryRun === true, schema: input.schema as string | null, functions: Number(input.functions) }),
+      this.activate(stored, { save: true, dryRun: input.dryRun === true, schema: input.schema as string | null, functions: Number(input.functions), cli }),
     );
   }
 
@@ -715,9 +746,15 @@ export class Runtime {
 
   private async activate(
     stored: StoredDeployment,
-    opts: { save: boolean; dryRun: boolean; schema: string | null; functions: number },
+    opts: { save: boolean; dryRun: boolean; schema: string | null; functions: number; cli?: string | null },
   ): Promise<DeployResult> {
     const prepared = opts.dryRun ? null : await this.load(stored);
+    // A dry run doesn't load the bundle, so it goes by the version the CLI sent.
+    const builtWith = opts.dryRun ? opts.cli : prepared!.code.builtWith;
+    const mismatch =
+      opts.save && !opts.cli
+        ? `The onebase CLI that pushed this didn't send its version, so it's older than this server (${VERSION}). Update it, so a version mismatch can be caught.`
+        : versionWarning(builtWith);
     const schema = opts.dryRun ? this.dryRunSchema(opts.schema) : prepared!.catalog;
     const apply = async (tx: Exec) => {
       const warnings = await this.checkDocuments(tx, schema, !opts.dryRun);
@@ -736,6 +773,7 @@ export class Runtime {
       this.log.info(`Deployment ${stored.id} is live: ${prepared!.functions.size} function(s).`);
     }
     if (!opts.dryRun && indexes.created.length) await this.driver.optimize?.();
+    if (mismatch) warnings.unshift(mismatch);
     for (const w of warnings) this.log.warn(w);
     return {
       id: stored.id,

@@ -19,7 +19,8 @@ import { serveAsset } from "./engine/deployments";
 import { importBundle } from "./project";
 import type { CodeSource } from "./engine/action-wire";
 
-export const VERSION = "0.2.0";
+export { VERSION } from "./version";
+import { VERSION } from "./version";
 
 export type AppOptions = {
   /** Serve the dashboard at /_admin (default true). */

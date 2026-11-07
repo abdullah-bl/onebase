@@ -216,6 +216,7 @@ export async function importBundle(source: string, id: string): Promise<ProjectC
     auth: project.authConfig ?? null,
     crons: project.crons?.jobs ?? [],
     components: project.components ?? null,
+    builtWith: typeof project.onebaseVersion === "string" ? project.onebaseVersion : null,
   };
 }
 

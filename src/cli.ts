@@ -8,6 +8,7 @@ import { directoryAssets, embeddedAssets, startApp, VERSION } from "./app";
 import { backupNow, listBackups, restore } from "./backup";
 import { codegen } from "./codegen";
 import { deploy } from "./deploy";
+import { upgrade } from "./upgrade";
 import { doctor, printFindings } from "./doctor";
 import { SqliteDriver } from "./engine/driver";
 import { LocalBlobs } from "./engine/files";
@@ -40,6 +41,7 @@ Usage:
   onebase serve    Run the server
   onebase dev      Run the server, regenerate types and restart on changes
   onebase deploy   Push functions (and ./public) to a running server, with no restart
+  onebase upgrade  Replace this binary with the latest release (or: upgrade 0.3.0; --check to only look)
   onebase codegen  Write <dir>/_generated (typed api, server, dataModel)
   onebase doctor   Check schema and functions for common mistakes
   onebase build    Compile functions + frontend into one executable (from source)
@@ -69,6 +71,7 @@ Options (each $NAME can also come from a .env file):
   --force           restore: overwrite an existing database
   --no-dashboard    Don't serve the dashboard or admin API at /_admin, which also turns off deploys ($ONEBASE_DASHBOARD=off)
   --no-deploy       Refuse onebase deploy and run the local code, not what was pushed ($ONEBASE_DEPLOY=off)
+  --check           upgrade: only say whether a newer release exists
   --dry-run         deploy: check the code against the server's data without changing anything
   --rollback        deploy: go back to the previous deployment
   --env-file <path> Read this .env file instead of the defaults (repeatable)
@@ -125,6 +128,7 @@ function options(argv: string[]) {
       "no-dashboard": { type: "boolean" },
       "no-deploy": { type: "boolean" },
       "dry-run": { type: "boolean", default: false },
+      check: { type: "boolean", default: false },
       rollback: { type: "boolean", default: false },
       "env-file": { type: "string", multiple: true },
       out: { type: "string", default: "./app" },
@@ -148,6 +152,7 @@ function options(argv: string[]) {
     // Default to ./onebase, but pick up ./convex in a project ported from Convex.
     dir: givenDir ?? (!existsSync("./onebase") && existsSync("./convex") ? "./convex" : "./onebase"),
     givenDir: givenDir !== undefined,
+    args: positionals.slice(1),
     data: values.data ?? env.ONEBASE_DATA ?? "./onebase_data",
     public: values.public ?? env.ONEBASE_PUBLIC,
     port,
@@ -480,6 +485,9 @@ export async function main(argv = process.argv.slice(2)) {
         dryRun: opts["dry-run"],
         rollback: opts.rollback,
       });
+      return;
+    case "upgrade":
+      await upgrade({ version: opts.args[0], check: opts.check, compiled: COMPILED });
       return;
     case "build":
       return buildCommand(opts);

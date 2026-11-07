@@ -6,7 +6,7 @@ A lightweight, Convex-style reactive backend: TypeScript functions, a typed docu
 - **Full Node/npm everywhere:** queries, mutations and actions all run in Bun. There is no `"use node"` split.
 - **Convex-shaped API:** `query`, `mutation`, `action`, `v.*`, `ctx.db`, `api.module.fn`, `useQuery`. Code and LLM knowledge carry over.
 - **Forgiving and explicit:** errors say how to fix the problem, indexes are picked automatically for filters, and `onebase doctor` checks your project.
-- **Batteries included:** sign-in with passwords and OAuth, full-text search, optimistic updates, scheduler, cron jobs, file storage, JWT auth (Clerk, Auth0, any OIDC), HTTP routes and pagination.
+- **Batteries included:** sign-in with passwords, OAuth and device codes (for TVs and CLIs), full-text search, optimistic updates, scheduler, cron jobs, file storage, JWT auth (Clerk, Auth0, any OIDC), HTTP routes and pagination.
 - **Components:** mount packages with their own tables, like the built-in rate limiter, aggregate (counts, sums and ranks in O(log n)), sharded counter and work queue, and call them as `ctx.components.limiter.limit({ ... })`, in your transaction. Components can follow your tables through table hooks, with no triggers to wire up.
 - **MCP server built in:** define tools in `onebase/mcp.ts`, and users connect Claude, ChatGPT or Cursor with one URL. OAuth 2.1 sign-in, a consent page you own, scopes and API keys are included. See [MCP](docs/mcp.md).
 - **Dashboard built in** at `/_admin`: browse and edit data, run functions, live logs, jobs and files.

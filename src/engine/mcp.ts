@@ -25,6 +25,10 @@ export const isMcpToken = (token: string) => token.startsWith("ob_mcp");
 
 /** Newest first; the first is what we answer with when a client asks for one we don't know. */
 export const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26"];
+const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
+/** The client id agents may use for the device flow without registering. */
+export const PUBLIC_DEVICE_CLIENT = "mcp-agent";
+
 const REQUEST_TTL = 10 * 60_000;
 const CODE_TTL = 5 * 60_000;
 const DAY = 86_400_000;
@@ -187,6 +191,7 @@ export class McpService {
       if (rest === "oauth/register" && req.method === "POST") return await this.register(req);
       if (rest === "oauth/authorize" && req.method === "GET") return await this.authorizeStart(url);
       if (rest === "oauth/token" && req.method === "POST") return await this.token(req);
+      if (rest === "oauth/device" && req.method === "POST") return await this.deviceStart(req);
       if (rest === "oauth/revoke" && req.method === "POST") return await this.revokeToken(req);
       if (rest === "request" && req.method === "GET") return await this.describeRequest(url);
       if (rest === "authorize" && req.method === "POST") return await this.authorize(req);
@@ -224,7 +229,8 @@ export class McpService {
       registration_endpoint: `${this.site}/api/mcp/oauth/register`,
       revocation_endpoint: `${this.site}/api/mcp/oauth/revoke`,
       response_types_supported: ["code"],
-      grant_types_supported: ["authorization_code", "refresh_token"],
+      grant_types_supported: ["authorization_code", "refresh_token", ...(this.config.deviceUrl ? [DEVICE_GRANT] : [])],
+      ...(this.config.deviceUrl ? { device_authorization_endpoint: `${this.site}/api/mcp/oauth/device` } : {}),
       code_challenge_methods_supported: ["S256"],
       token_endpoint_auth_methods_supported: ["none"],
       revocation_endpoint_auth_methods_supported: ["none"],
@@ -233,10 +239,26 @@ export class McpService {
     };
   }
 
-  private unauthorized(error?: string, description?: string): Response {
+  /**
+   * For an agent that was only given the URL (and fetched it): how to connect. MCP clients use the
+   * discovery documents instead; this is for agents that can make HTTP requests and nothing more.
+   */
+  private instructions() {
+    const steps = this.config.deviceUrl
+      ? [
+          `POST ${this.site}/api/mcp/oauth/device with client_id=${PUBLIC_DEVICE_CLIENT} (form-encoded; add scope=... to ask for less).`,
+          "Show the user the user_code and verification_uri_complete from the answer, and ask them to approve you there.",
+          `Every \`interval\` seconds, POST ${this.site}/api/mcp/oauth/token with grant_type=${DEVICE_GRANT}, device_code=<device_code> and client_id=${PUBLIC_DEVICE_CLIENT}, until it returns an access_token instead of authorization_pending (slow_down means wait longer).`,
+          `Then send MCP JSON-RPC messages with POST ${this.resource} and Authorization: Bearer <access_token>. The token is short-lived; connect again when it expires.`,
+        ]
+      : [`Ask the user for an API key from ${this.config.name}, and send it as Authorization: Bearer <key> with POST ${this.resource}.`];
+    return { server: this.config.name, mcp: this.resource, steps };
+  }
+
+  private unauthorized(error?: string, description?: string, extra: Record<string, unknown> = {}): Response {
     const params = [`resource_metadata="${this.site}/.well-known/oauth-protected-resource/mcp"`];
     if (error) params.push(`error="${error}"`, `error_description="${(description ?? "").replace(/["\\]/g, "")}"`);
-    return json({ error: error ?? "unauthorized", error_description: description ?? "Connect with OAuth or an API key: Authorization: Bearer <token>." }, 401, {
+    return json({ error: error ?? "unauthorized", error_description: description ?? "Connect with OAuth or an API key: Authorization: Bearer <token>.", ...extra }, 401, {
       "WWW-Authenticate": `Bearer ${params.join(", ")}`,
     });
   }
@@ -244,11 +266,12 @@ export class McpService {
   // ---- The MCP endpoint ----
 
   private async endpoint(req: Request): Promise<Response> {
+    const token = bearer(req);
+    if (req.method === "GET" && !token) return this.unauthorized(undefined, undefined, this.instructions());
     if (req.method !== "POST") {
       // No server-to-client stream: every answer comes back on the POST that asked.
       return json({ error: "Send MCP messages with POST." }, 405, { Allow: "POST, OPTIONS" });
     }
-    const token = bearer(req);
     if (!token) return this.unauthorized();
     const caller = await this.caller(token);
     if (!caller) return this.unauthorized("invalid_token", "This token has expired or was revoked. Connect again.");
@@ -381,14 +404,19 @@ export class McpService {
     await tx.run(`DELETE FROM _mcp_connections WHERE ${where}`, params);
   }
 
-  private async issue(tx: Exec, connectionId: string, scopes: string[]) {
+  /** Tokens for a connection. Without `refresh` (the device flow) there's only the access token. */
+  private async issue(tx: Exec, connectionId: string, scopes: string[], refresh = true) {
     const now = Date.now();
     const access = MCP_ACCESS_PREFIX + randomToken();
-    const refresh = MCP_REFRESH_PREFIX + randomToken();
     await tx.run("INSERT INTO _mcp_tokens (token_hash, connection_id, kind, expires, used) VALUES (?, ?, 'access', ?, 0)", [sha256(access), connectionId, now + this.accessMs]);
-    await tx.run("INSERT INTO _mcp_tokens (token_hash, connection_id, kind, expires, used) VALUES (?, ?, 'refresh', ?, 0)", [sha256(refresh), connectionId, now + this.refreshMs]);
+    const tokens: Record<string, unknown> = { access_token: access, token_type: "Bearer", expires_in: Math.round(this.accessMs / 1000), scope: scopes.join(" ") };
+    if (refresh) {
+      const token = MCP_REFRESH_PREFIX + randomToken();
+      await tx.run("INSERT INTO _mcp_tokens (token_hash, connection_id, kind, expires, used) VALUES (?, ?, 'refresh', ?, 0)", [sha256(token), connectionId, now + this.refreshMs]);
+      tokens.refresh_token = token;
+    }
     if (Math.random() < McpService.cleanupChance) await this.cleanup(tx);
-    return { access_token: access, token_type: "Bearer", expires_in: Math.round(this.accessMs / 1000), refresh_token: refresh, scope: scopes.join(" ") };
+    return tokens;
   }
 
   static cleanupChance = 0.05;
@@ -530,7 +558,64 @@ export class McpService {
     const body = await this.body(req);
     if (body.grant_type === "authorization_code") return json(await this.redeem(body));
     if (body.grant_type === "refresh_token") return json(await this.refresh(body));
-    throw new OAuthError("unsupported_grant_type", "grant_type must be authorization_code or refresh_token.");
+    if (body.grant_type === DEVICE_GRANT && this.config.deviceUrl) return json(await this.deviceToken(body));
+    throw new OAuthError("unsupported_grant_type", `grant_type must be authorization_code, refresh_token${this.config.deviceUrl ? ` or ${DEVICE_GRANT}` : ""}.`);
+  }
+
+  // ---- OAuth: device flow (RFC 8628) ----
+
+  /** POST /api/mcp/oauth/device: codes for an agent that can't open a browser. */
+  private async deviceStart(req: Request): Promise<Response> {
+    if (!this.config.deviceUrl) throw new OAuthError("unsupported_grant_type", "This app doesn't offer device pairing: connect with OAuth or an API key.");
+    const body = await this.body(req);
+    const clientId = typeof body.client_id === "string" ? body.client_id : PUBLIC_DEVICE_CLIENT;
+    const client = clientId === PUBLIC_DEVICE_CLIENT ? null : await this.client(clientId);
+    if (clientId !== PUBLIC_DEVICE_CLIENT && !client) throw new OAuthError("invalid_client", `Unknown client_id; register first, or use client_id=${PUBLIC_DEVICE_CLIENT}.`, 401);
+    const named = typeof body.client_name === "string" && body.client_name.trim() ? body.client_name.trim().slice(0, 100) : null;
+    const codes = await this.runtime.device.start({
+      kind: "mcp",
+      name: client?.name ?? named ?? "An AI agent",
+      scopes: this.grantable(body.scope),
+      clientId: client?.id ?? null,
+      url: this.config.deviceUrl,
+    });
+    return json({
+      device_code: codes.deviceCode,
+      user_code: codes.userCode,
+      verification_uri: codes.verificationUri,
+      verification_uri_complete: codes.verificationUriComplete,
+      expires_in: codes.expiresIn,
+      interval: codes.interval,
+    });
+  }
+
+  /**
+   * The device_code grant. Agents connected this way get a short-lived access token and no refresh
+   * token: they often can't keep a secret between runs, so they pair again instead.
+   */
+  private async deviceToken(body: Record<string, any>) {
+    const result = await this.runtime.device.poll(body.device_code);
+    if (result.status === "pending") throw new OAuthError("authorization_pending", "The user hasn't answered yet.");
+    if (result.status === "slow_down") throw new OAuthError("slow_down", `Poll at most every ${result.interval} seconds.`);
+    if (result.status === "denied") throw new OAuthError("access_denied", "The user declined.");
+    const grant = result.status === "approved" ? result.grant : null;
+    if (!grant || grant.kind !== "mcp") throw new OAuthError("expired_token", "This device code has expired. Start again.");
+    if ((grant.clientId ?? PUBLIC_DEVICE_CLIENT) !== (body.client_id ?? PUBLIC_DEVICE_CLIENT)) throw new OAuthError("invalid_grant", "This device code was issued to another client.");
+    const identity = grant.identity;
+    const conn: ConnectionData = { clientName: grant.name, scopes: grant.scopes ?? [], identity };
+    const id = newId();
+    const now = Date.now();
+    return this.runtime.withWriter(async (tx) => {
+      await tx.run("INSERT INTO _mcp_connections (id, user_id, client_id, kind, data, created, last_used) VALUES (?, ?, ?, 'oauth', ?, ?, ?)", [
+        id,
+        identity.subject,
+        grant.clientId ?? null,
+        JSON.stringify(conn),
+        now,
+        now,
+      ]);
+      return this.issue(tx, id, conn.scopes, false);
+    });
   }
 
   private async redeem(body: Record<string, any>) {

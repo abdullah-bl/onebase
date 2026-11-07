@@ -22,6 +22,7 @@ import { CallLog, type CallSource } from "./calllog";
 import { CallBudget, DEFAULT_CALL_LIMITS, type CallLimits } from "./limits";
 import { currentFunction, installGuards } from "./guard";
 import { AuthError, AuthService, SESSION_PREFIX } from "./auth";
+import { DeviceService } from "./device";
 import { isMcpToken, McpService } from "./mcp";
 import { isMcpTool, type McpDefinition } from "../mcp";
 import { createAuthenticate, type AuthConfig, type AuthenticateCtx } from "./jwt";
@@ -244,6 +245,8 @@ export class Runtime {
   /** Built-in sign-in, when auth.config.ts lists methods. */
   auth: AuthService | null = null;
   private authenticate: Authenticate | null = null;
+  /** Device pairing codes, for built-in sign-in and MCP. */
+  readonly device = new DeviceService(this);
   /** The MCP server, when onebase/mcp.ts defines one. */
   mcp: McpService | null = null;
   private crons: CronJob[] = [];

@@ -206,6 +206,11 @@ export type AuthConfig = {
   redirects?: string[];
   /** Days a session lasts without being used (default 30). */
   sessionDays?: number;
+  /**
+   * Device sign-in (RFC 8628): your page where a signed-in user approves a TV, CLI or other device
+   * by its code, e.g. "/device". It's opened as `<deviceUrl>?code=<user code>`.
+   */
+  deviceUrl?: string;
   /** External JWT issuers (Clerk, Auth0, WorkOS, any OIDC provider). */
   providers?: AuthProvider[];
   /** Custom verification for anything else (API keys, your own tokens). Return null for anonymous. */

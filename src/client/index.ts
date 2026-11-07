@@ -83,6 +83,15 @@ export type McpRequest = {
   scopes: { scope: string; description: string }[];
 };
 
+/** A device waiting for approval, as the approval page shows it. */
+export type DeviceRequest = {
+  kind: "session" | "mcp";
+  /** What the device calls itself; it can claim any name. */
+  name: string;
+  scopes: { scope: string; description: string }[];
+  created: number;
+};
+
 /** A connected agent (OAuth) or an API key. */
 export type McpConnection = { id: string; kind: "oauth" | "key"; name: string; clientName: string; scopes: string[]; created: number; lastUsed: number };
 
@@ -488,15 +497,61 @@ export class OnebaseClient {
       this.mcpRequest("POST", "keys", args),
   };
 
-  private async mcpRequest<T = any>(method: "GET" | "POST", path: string, body?: unknown): Promise<T> {
+  /**
+   * Device pairing, on the page where a signed-in user approves a device by its code
+   * (auth.config.ts's or defineMcp's deviceUrl, opened as `?code=WDJB-MJHT`).
+   */
+  readonly device = {
+    /** What's asking: `kind` "session" (a device signing in) or "mcp" (an AI agent), the name it gave, and the scopes. */
+    request: (code: string): Promise<DeviceRequest> => this.signedInRequest("GET", `/api/auth/device/request?code=${encodeURIComponent(code)}`),
+    /** The user's answer. The device finds out on its next poll. */
+    approve: (args: { code: string; approve: boolean; scopes?: string[] }): Promise<{ ok: true }> =>
+      this.signedInRequest("POST", "/api/auth/device/approve", args),
+  };
+
+  /**
+   * Signs this client in through another device, for TVs, CLIs and anything without a sign-in
+   * page: `onCode` gets a short code and a URL to show the user, and the promise resolves once they
+   * approve it there (on a device where they're signed in). Needs deviceUrl in auth.config.ts.
+   */
+  async signInWithDevice(opts: {
+    name?: string;
+    onCode: (code: { userCode: string; verificationUri: string; verificationUriComplete: string; expiresIn: number }) => void;
+    signal?: AbortSignal;
+  }): Promise<{ userId: string }> {
+    const start = await this.authRequest("device/start", { name: opts.name });
+    opts.onCode({ userCode: start.userCode, verificationUri: start.verificationUri, verificationUriComplete: start.verificationUriComplete, expiresIn: start.expiresIn });
+    let interval = Number(start.interval) || 5;
+    for (;;) {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(resolve, interval * 1000);
+        opts.signal?.addEventListener("abort", () => (clearTimeout(timer), reject(opts.signal!.reason ?? new Error("Aborted"))), { once: true });
+      });
+      const res = await this.authRequest("device/poll", { deviceCode: start.deviceCode });
+      if (res.status === "approved") {
+        this.useSession(res.token);
+        return { userId: res.userId };
+      }
+      if (res.status === "slow_down") interval = Number(res.interval) || interval + 5;
+      else if (res.status === "denied") throw new Error("The sign-in was declined.");
+      else if (res.status === "expired") throw new Error("The code expired before it was approved. Start again.");
+    }
+  }
+
+  private mcpRequest<T = any>(method: "GET" | "POST", path: string, body?: unknown): Promise<T> {
+    return this.signedInRequest(method, `/api/mcp/${path}`, body);
+  }
+
+  /** An HTTP call as the signed-in user. */
+  private async signedInRequest<T = any>(method: "GET" | "POST", path: string, body?: unknown): Promise<T> {
     const token = await this.fetchToken?.();
-    const res = await fetch(`${this.httpUrl}/api/mcp/${path}`, {
+    const res = await fetch(`${this.httpUrl}${path}`, {
       method,
       headers: { ...(body ? { "Content-Type": "application/json" } : {}), ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       body: body ? JSON.stringify(body) : undefined,
     });
     const data = (await res.json().catch(() => ({}))) as { error?: string; error_description?: string };
-    if (!res.ok) throw new Error(data.error_description ?? data.error ?? `MCP request failed (HTTP ${res.status}).`);
+    if (!res.ok) throw new Error(data.error_description ?? data.error ?? `Request failed (HTTP ${res.status}).`);
     return data as T;
   }
 

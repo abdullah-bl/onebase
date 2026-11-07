@@ -213,6 +213,51 @@ oauth({
 
 **Linking accounts:** an OAuth sign-in with a new account joins an existing user only when both the provider and that user have verified the email address. Otherwise it creates a new user. This stops someone from signing up with another person's email and later sharing their account.
 
+### Device sign-in
+
+A TV, a CLI or anything else without a good way to type a password can sign in through another device where the user is already signed in (RFC 8628). The device shows a short code such as `WDJB-MJHT`, and the user approves it on a page in your app. Turn it on with that page's address:
+
+```ts
+// onebase/auth.config.ts
+export default {
+  methods: [password()],
+  deviceUrl: "/device", // opened as /device?code=WDJB-MJHT
+};
+```
+
+On the device:
+
+```ts
+const client = new OnebaseClient("https://api.example.com");
+await client.signInWithDevice({
+  name: "Living room TV",
+  onCode: ({ userCode, verificationUriComplete }) => console.log(`Go to ${verificationUriComplete} and check the code is ${userCode}`),
+});
+// Signed in: the client has a normal session, like after signIn().
+```
+
+On the approval page, as the signed-in user:
+
+```js
+const code = new URL(location.href).searchParams.get("code"); // or a field the user types it into
+const request = await client.device.request(code); // { kind: "session" | "mcp", name, scopes }
+await client.device.approve({ code, approve: true });
+```
+
+- **Codes:** a user code is 8 letters from 19 consonants, with nothing that looks alike, and it ignores case, spaces and dashes. It lasts 10 minutes and works once.
+- **Wrong entries:** each user gets 10 wrong codes an hour before the lookup is locked.
+- **Polling:** the device polls every 5 seconds. Polling sooner returns `slow_down` and adds 5 seconds to the wait.
+- **What to show:** make the user check that the code on the page matches the one on their device, and show the `name` as a claim, not a fact. The most likely attack is someone sending a user their own code to approve.
+- **Built-in accounts only:** approving a device needs a built-in account, because the device gets a built-in session. MCP agents (`kind: "mcp"`) can be approved by any signed-in user.
+- **MCP:** the same page approves AI agents that pair this way. See [MCP](./mcp.md#agents-without-a-browser).
+
+| Endpoint | |
+|---|---|
+| `POST /api/auth/device/start` `{ name? }` | `{ deviceCode, userCode, verificationUri, verificationUriComplete, expiresIn, interval }` |
+| `POST /api/auth/device/poll` `{ deviceCode }` | `{ status: "pending" \| "slow_down" \| "denied" \| "expired" }`, then `{ status: "approved", token, userId }` |
+| `GET /api/auth/device/request?code=` (signed in) | what's asking |
+| `POST /api/auth/device/approve` `{ code, approve, scopes? }` (signed in) | `{ ok: true }` |
+
 ### Sessions and security
 
 - **Sessions** last 30 days from their last use (`sessionDays` in `auth.config.ts`). Signing out ends the session at once, including for open WebSocket connections on every server instance. Open connections also re-check their identity about once a minute, so a session that expires (or whose user is deleted) signs its connection out without waiting for a reconnect. `POST /api/auth/signout` with `{ "everywhere": true }` ends all of a user's sessions.

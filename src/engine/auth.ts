@@ -94,6 +94,8 @@ export class AuthService {
   private readonly oauth = new Map<string, OAuthMethod>();
   private readonly sessionMs: number;
   private readonly redirects: string[];
+  /** auth.config.ts's deviceUrl: where users approve devices (null: device sign-in is off). */
+  readonly deviceUrl: string | null;
   private dummyHash: Promise<string> | null = null;
 
   constructor(
@@ -111,6 +113,10 @@ export class AuthService {
     }
     this.sessionMs = (config.sessionDays ?? 30) * DAY;
     this.redirects = config.redirects ?? [];
+    if (config.deviceUrl !== undefined && (typeof config.deviceUrl !== "string" || !/^(\/|https?:\/\/)/.test(config.deviceUrl))) {
+      throw new Error('auth.config.ts: deviceUrl must be a path like "/device" or a full https:// URL.');
+    }
+    this.deviceUrl = config.deviceUrl ?? null;
   }
 
   get ids(): string[] {
@@ -158,6 +164,11 @@ export class AuthService {
         .catch(() => {});
     }
     return identityFor(user, row.id);
+  }
+
+  /** A new session for a user, e.g. a device that was just approved. */
+  sessionFor(userId: string): Promise<string> {
+    return this.runtime.withWriter((tx) => this.createSession(tx, userId));
   }
 
   private async createSession(tx: Exec, userId: string): Promise<string> {

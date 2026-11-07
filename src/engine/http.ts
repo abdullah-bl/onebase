@@ -356,7 +356,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
       if (path.startsWith("/api/")) {
         if (req.method === "OPTIONS") return new Response(null, { headers: cors(req) });
         const kind = path.slice(5);
-        const counted = req.method === "POST" && ["query", "mutation", "action", "run", "storage/upload", "auth/signin"].includes(kind);
+        const counted = req.method === "POST" && ["query", "mutation", "action", "run", "storage/upload", "auth/signin", "auth/device/start", "auth/device/approve"].includes(kind);
         const limit = counted ? limited(clientIp(req, server)) : null;
         if (limit) {
           return json(req, { status: "error", errorMessage: limit.message }, 429, { "Retry-After": String(Math.ceil(limit.retryMs / 1000)) });
@@ -372,6 +372,11 @@ export function serve(opts: ServeOptions): Server<SocketData> {
         if (path.startsWith("/api/storage/") && req.method === "GET") {
           const res = await runtime.serveFile(path.slice("/api/storage/".length), req);
           if (!res) return new Response("File not found", { status: 404, headers: cors(req) });
+          for (const [k, v] of Object.entries(cors(req))) res.headers.set(k, v);
+          return res;
+        }
+        if (path.startsWith("/api/auth/device/")) {
+          const res = (await runtime.device.handle(req, url))!;
           for (const [k, v] of Object.entries(cors(req))) res.headers.set(k, v);
           return res;
         }

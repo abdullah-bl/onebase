@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Approve a device</title>
+    <style>
+      :root { color-scheme: light dark; --bg: #fafafa; --fg: #1a1a1a; --muted: #777; --line: #e3e3e3; --accent: #3b5bdb; --card: #fff; --danger: #e03131; }
+      @media (prefers-color-scheme: dark) { :root { --bg: #141414; --fg: #eee; --muted: #999; --line: #2c2c2c; --accent: #748ffc; --card: #1d1d1d; } }
+      * { box-sizing: border-box; }
+      body { margin: 0; font: 15px/1.45 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+      main { max-width: 440px; margin: 48px auto; padding: 16px; }
+      .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
+      h1 { font-size: 18px; margin: 0 0 4px; }
+      .muted { color: var(--muted); font-size: 13px; }
+      form { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }
+      input { padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--fg); font: inherit; }
+      #code { font: 600 20px/1.2 ui-monospace, monospace; letter-spacing: 0.1em; text-transform: uppercase; text-align: center; }
+      label.scope { display: flex; gap: 8px; align-items: baseline; padding: 6px 0; }
+      .buttons { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+      button { font: inherit; cursor: pointer; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--fg); }
+      button.primary { border: 0; background: var(--accent); color: #fff; }
+      #error { color: var(--danger); font-size: 13px; min-height: 1.2em; margin-top: 8px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="card">
+        <div id="signin" hidden>
+          <h1>Sign in to continue</h1>
+          <p class="muted">A device wants to use your account. Sign in first.</p>
+          <form id="signinForm">
+            <input id="email" type="email" placeholder="you@example.com" required />
+            <input id="password" type="password" placeholder="Password" required />
+            <button class="primary">Sign in</button>
+          </form>
+        </div>
+        <div id="enter" hidden>
+          <h1>Enter the code on your device</h1>
+          <form id="codeForm">
+            <input id="code" placeholder="WDJB-MJHT" autocomplete="off" autocapitalize="characters" required />
+            <button class="primary">Continue</button>
+          </form>
+        </div>
+        <div id="confirm" hidden>
+          <h1 id="title"></h1>
+          <p class="muted">Only allow this if you started it yourself and the code matches what your device shows: <strong id="shown"></strong></p>
+          <div id="scopes"></div>
+          <div class="buttons">
+            <button id="deny">Deny</button>
+            <button id="allow" class="primary">Allow</button>
+          </div>
+        </div>
+        <div id="done" hidden>
+          <h1 id="doneTitle"></h1>
+          <p class="muted">You can close this page and go back to your device.</p>
+        </div>
+        <div id="error"></div>
+      </div>
+    </main>
+    <script type="module">
+      import { OnebaseClient } from "/_onebase/client.js";
+
+      if (window.top !== window.self) throw new Error("This page can't be framed.");
+
+      const $ = (id) => document.getElementById(id);
+      const fail = (msg) => ($("error").textContent = msg ?? "");
+      const client = new OnebaseClient();
+      let code = new URL(location.href).searchParams.get("code") ?? "";
+      const step = (id) => ["signin", "enter", "confirm", "done"].forEach((s) => ($(s).hidden = s !== id));
+
+      $("signinForm").onsubmit = async (e) => {
+        e.preventDefault();
+        try {
+          await client.signIn("password", { flow: "signIn", email: $("email").value, password: $("password").value });
+        } catch (err) {
+          fail(err.message);
+        }
+      };
+
+      $("code").value = code;
+      $("codeForm").onsubmit = (e) => {
+        e.preventDefault();
+        code = $("code").value;
+        lookup();
+      };
+
+      async function lookup() {
+        fail();
+        try {
+          const request = await client.device.request(code);
+          $("title").textContent =
+            request.kind === "mcp" ? `Allow the AI agent “${request.name}” to use your notes?` : `Sign “${request.name}” in to your account?`;
+          $("shown").textContent = code.toUpperCase();
+          $("scopes").replaceChildren(
+            ...request.scopes.map(({ scope, description }) => {
+              const label = Object.assign(document.createElement("label"), { className: "scope" });
+              label.append(Object.assign(document.createElement("input"), { type: "checkbox", checked: true, value: scope }), description);
+              return label;
+            }),
+          );
+          step("confirm");
+        } catch (err) {
+          step("enter");
+          fail(err.message);
+        }
+      }
+
+      async function answer(approve) {
+        try {
+          const scopes = [...document.querySelectorAll("#scopes input:checked")].map((box) => box.value);
+          await client.device.approve({ code, approve, scopes });
+          $("doneTitle").textContent = approve ? "Done: your device is connected." : "Declined.";
+          step("done");
+        } catch (err) {
+          fail(err.message);
+        }
+      }
+      $("allow").onclick = () => answer(true);
+      $("deny").onclick = () => answer(false);
+
+      function show() {
+        const auth = client.authState;
+        if (auth.isLoading) return;
+        if (!auth.isAuthenticated) return step("signin");
+        if (code) lookup();
+        else step("enter");
+      }
+      client.onAuthChange(show);
+      show();
+    </script>
+  </body>
+</html>

@@ -10,6 +10,8 @@ export default defineMcp({
   version: "1.0.0",
   instructions: "The user's private notes. Search before adding, so you don't create duplicates.",
   consentUrl: "/connect.html",
+  // Agents that can't open a browser pair with a code instead, approved on the same page as devices.
+  deviceUrl: "/device.html",
   scopes: {
     read: "Read and search your notes",
     write: "Add and pin notes",

@@ -237,6 +237,8 @@ export const searchNotes = tool({
 
 A tool is an internal action. Its `ctx.auth` is the approving user, so `ctx.runQuery(api...)` reuses your functions and their ownership checks. On the consent page call `client.mcp.request(id)`, then `client.mcp.authorize({ request, approve })` and `location.assign(redirect)`. A settings page uses `client.mcp.connections()`, `.revoke(id)` and `.createKey({ name })`. MCP tokens only work at `/mcp`.
 
+Device pairing: set `deviceUrl` in auth.config.ts (and in defineMcp, for agents). A device calls `client.signInWithDevice({ name, onCode })`, and your page approves with `client.device.request(code)` and `client.device.approve({ code, approve })`.
+
 ## Components
 
 Mount packages with their own tables in `onebase/components.ts`, then call them from functions:

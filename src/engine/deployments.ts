@@ -97,6 +97,16 @@ export function rememberModule(id: string, resolvedPath: string): void {
   loadedModules.set(id, resolvedPath);
 }
 
+/** Drops one deployment's bundle module from the module cache, so loading it again runs it again. */
+export function forgetModule(id: string): void {
+  const path = loadedModules.get(id);
+  if (!path) return;
+  try {
+    delete require.cache[path];
+  } catch {}
+  loadedModules.delete(id);
+}
+
 /**
  * Drops replaced deployments' bundle modules from the module cache, so their memory can be freed
  * once no call is using them. (Bun's import() cache never releases a module; require()'s can be

@@ -272,6 +272,7 @@ await ctx.components.limiter.limit({ name: "send", key: userId, throws: true });
 - `auth.config.ts` can also export a custom `authenticate(token)`.
 - Components are mounted with `defineComponents` in `components.ts` and called as `ctx.components.x.fn(args)`, not through `convex.config.ts` and `ctx.runMutation(components.x.lib.fn)`.
 - `ctx.db.get("table", id)`, `patch("table", id, value)`, `replace` and `delete` also take the table first, as in current Convex.
+- Environment variables: read `process.env`. Set them on a server with `onebase env set NAME value` (like `npx convex env set`) or the dashboard; locally, use `.env.local`.
 - Not supported yet: `ctx.db.system`.
 
 Run `onebase doctor` after changes: it checks the schema, indexes, imports and common mistakes, and prints the fix for each.

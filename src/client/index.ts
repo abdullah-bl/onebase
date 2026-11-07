@@ -75,6 +75,17 @@ type Pending = {
   /** True when restored from a previous session's outbox: no caller is waiting for it. */
   restored?: boolean;
 };
+/** A connection request, as the consent page shows it. */
+export type McpRequest = {
+  server: { name: string };
+  /** `name` is whatever the agent registered with; `redirectHost` is where approval sends the user, which it can't fake. */
+  client: { id: string; name: string; redirectHost: string };
+  scopes: { scope: string; description: string }[];
+};
+
+/** A connected agent (OAuth) or an API key. */
+export type McpConnection = { id: string; kind: "oauth" | "key"; name: string; clientName: string; scopes: string[]; created: number; lastUsed: number };
+
 type TokenFetcher = () => Promise<string | null | undefined> | string | null | undefined;
 /** `subject` is who made the call; absent while unknown (made before the server confirmed who is asking). */
 type OutboxEntry = { path: string; args: unknown; subject?: string | null; ref?: object };
@@ -454,6 +465,39 @@ export class OnebaseClient {
     } finally {
       this.exchanging = false;
     }
+  }
+
+  /**
+   * MCP: approve agents and manage their access, as the signed-in user. For the consent page that
+   * defineMcp({ consentUrl }) points to, and a "Connected agents" settings page.
+   */
+  readonly mcp = {
+    /** What the agent asking at `<consentUrl>?request=<id>` wants: its name, where it returns to, and the scopes. */
+    request: (id: string): Promise<McpRequest> => this.mcpRequest("GET", `request?id=${encodeURIComponent(id)}`),
+    /**
+     * The user's answer. Send the browser to the returned `redirect` afterwards: it takes the agent
+     * its code (or the refusal). `scopes` narrows what's granted to some of those requested.
+     */
+    authorize: (args: { request: string; approve: boolean; scopes?: string[] }): Promise<{ redirect: string }> => this.mcpRequest("POST", "authorize", args),
+    /** The user's connected agents and API keys. */
+    connections: async (): Promise<McpConnection[]> => (await this.mcpRequest<{ connections: McpConnection[] }>("GET", "connections")).connections,
+    /** Disconnects an agent or deletes an API key; its tokens stop working at once. */
+    revoke: (id: string): Promise<{ removed: boolean }> => this.mcpRequest("POST", "connections/revoke", { id }),
+    /** A key for agents set up by hand (Authorization: Bearer <key>). It's shown only this once. */
+    createKey: (args: { name: string; scopes?: string[] }): Promise<{ id: string; key: string; name: string; scopes: string[] }> =>
+      this.mcpRequest("POST", "keys", args),
+  };
+
+  private async mcpRequest<T = any>(method: "GET" | "POST", path: string, body?: unknown): Promise<T> {
+    const token = await this.fetchToken?.();
+    const res = await fetch(`${this.httpUrl}/api/mcp/${path}`, {
+      method,
+      headers: { ...(body ? { "Content-Type": "application/json" } : {}), ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = (await res.json().catch(() => ({}))) as { error?: string; error_description?: string };
+    if (!res.ok) throw new Error(data.error_description ?? data.error ?? `MCP request failed (HTTP ${res.status}).`);
+    return data as T;
   }
 
   private async authRequest(path: string, body: unknown, token?: string): Promise<any> {

@@ -349,6 +349,10 @@ export function serve(opts: ServeOptions): Server<SocketData> {
         if (server.upgrade(req, { data })) return undefined;
         return new Response("Expected a WebSocket upgrade", { status: 400 });
       }
+      if (runtime.mcp) {
+        const res = await runtime.mcp.handle(req, url, () => limited(clientIp(req, server)));
+        if (res) return res;
+      }
       if (path.startsWith("/api/")) {
         if (req.method === "OPTIONS") return new Response(null, { headers: cors(req) });
         const kind = path.slice(5);

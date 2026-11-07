@@ -15,6 +15,7 @@ Every onebase server includes a dashboard at **`/_admin`**. It's built into the 
 | **Logs** | The last 1,000 calls, live: duration, source, errors and each call's `console.log` output. Filter by function, type, source or text |
 | **Scheduler** | Pending, failed and finished jobs (run now, cancel, retry) and every cron with its next and last run (run now) |
 | **Files** | Uploaded files with previews; upload, copy an id, delete |
+| **Environment** | Your app's environment variables: add, edit, remove or paste a `.env` file, applied without a redeploy (see [Environment variables on a running server](./deployment.md#environment-variables-on-a-running-server)). Values are hidden until you show them |
 
 ## Signing in
 
@@ -85,6 +86,6 @@ You can also set `ONEBASE_DASHBOARD=off`. `/_admin` then returns 404.
 
 ## Security notes
 
-- **Admin key:** treat it like a database password. Anyone with it can read and change all data, and push code with [`onebase deploy`](./deployment.md#onebase-deploy).
+- **Admin key:** treat it like a database password. Anyone with it can read and change all data and environment variables, and push code with [`onebase deploy`](./deployment.md#onebase-deploy).
 - **Exposure:** the dashboard is served on the same port as your API. If you don't want it reachable from the internet, block `/_admin` at your reverse proxy, or run with `--no-dashboard` and keep a separate internal instance with the dashboard on.
 - **Rotating the key:** delete `admin.key` and restart, or change `ONEBASE_ADMIN_KEY`.

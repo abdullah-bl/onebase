@@ -34,7 +34,7 @@ These need no change:
 ## Differences to handle
 
 - **Auth:** a Convex `auth.config.ts` with JWT providers (Clerk, Auth0, WorkOS, any OIDC provider) works as is. Convex Auth (`@convex-dev/auth`) maps to onebase's built-in sign-in; read `docs/auth.md`. Spread `authTables` into the schema and replace `useAuthActions` imports with `onebase/react`.
-- **Environment variables:** read `process.env` as usual. onebase loads `.env` and `.env.local` itself.
+- **Environment variables:** read `process.env` as usual. onebase loads `.env` and `.env.local` itself. On a server, `npx convex env set NAME value` becomes `onebase env set NAME value` (also `list`, `get`, `remove`, and `set --from-file .env`); the dashboard has an Environment page too.
 - **Deploy:** `npx convex deploy` becomes `npx onebase deploy --url <server>`, or `onebase build` for a single binary. Read `docs/deployment.md`.
 - **Not supported:** `ctx.db.system` and `v.int64` / `v.bytes`. See SKILL.md, "Stop and ask".
 

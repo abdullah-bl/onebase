@@ -8,6 +8,7 @@ import { directoryAssets, embeddedAssets, startApp, VERSION } from "./app";
 import { backupNow, listBackups, restore } from "./backup";
 import { codegen } from "./codegen";
 import { deploy } from "./deploy";
+import { upgrade } from "./upgrade";
 import { doctor, printFindings } from "./doctor";
 import { SqliteDriver } from "./engine/driver";
 import { LocalBlobs } from "./engine/files";
@@ -45,6 +46,7 @@ Usage:
   onebase dev      Run the server, regenerate types and restart on changes
   onebase deploy   Push functions (and ./public) to a running server, with no restart
   onebase env      Set, list and remove a running server's environment variables (onebase env help)
+  onebase upgrade  Replace this binary with the latest release (or: upgrade 0.3.0; --check to only look)
   onebase codegen  Write <dir>/_generated (typed api, server, dataModel)
   onebase doctor   Check schema and functions for common mistakes
   onebase build    Compile functions + frontend into one executable (from source)
@@ -75,6 +77,7 @@ Options (each $NAME can also come from a .env file):
   --no-dashboard    Don't serve the dashboard or admin API at /_admin, which also turns off deploys ($ONEBASE_DASHBOARD=off)
   --no-deploy       Refuse onebase deploy and run the local code, not what was pushed ($ONEBASE_DEPLOY=off)
   --from-file <f>   env set: set every variable in this .env file
+  --check           upgrade: only say whether a newer release exists
   --dry-run         deploy: check the code against the server's data without changing anything
   --rollback        deploy: go back to the previous deployment
   --env-file <path> Read this .env file instead of the defaults (repeatable)
@@ -131,6 +134,7 @@ function options(argv: string[]) {
       "no-dashboard": { type: "boolean" },
       "no-deploy": { type: "boolean" },
       "dry-run": { type: "boolean", default: false },
+      check: { type: "boolean", default: false },
       rollback: { type: "boolean", default: false },
       "env-file": { type: "string", multiple: true },
       "from-file": { type: "string" },
@@ -496,6 +500,9 @@ export async function main(argv = process.argv.slice(2)) {
       return;
     case "env":
       return envCommand({ args: opts.args, url: opts.url, key: process.env.ONEBASE_DEPLOY_KEY?.trim(), fromFile: opts["from-file"] });
+    case "upgrade":
+      await upgrade({ version: opts.args[0], check: opts.check, compiled: COMPILED });
+      return;
     case "build":
       return buildCommand(opts);
     case "backup":

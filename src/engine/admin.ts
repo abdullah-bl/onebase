@@ -268,9 +268,9 @@ export function createAdmin(opts: { runtime: Runtime; key: string; assets: Dashb
 
     // `onebase deploy`: the bundle's code, the frontend as { "/path": base64 } (or null), dryRun,
     // and for a dry run the schema and function count as data (so the pushed code is never run).
-    deploy: ({ code, assets = null, dryRun = false, schema = null, functions }) => {
+    deploy: ({ code, assets = null, dryRun = false, schema = null, functions, onebaseVersion }) => {
       if (assets !== null && !isPlainObject(assets)) throw new OnebaseError("assets must be an object of { \"/path\": base64 }.");
-      return runtime.deploy({ code, assets, dryRun: dryRun === true, schema, functions });
+      return runtime.deploy({ code, assets, dryRun: dryRun === true, schema, functions, onebaseVersion });
     },
 
     rollback: () => runtime.rollback(),

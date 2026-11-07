@@ -9,6 +9,7 @@ import { buildCatalog } from "./engine/catalog";
 import type { DeployResult, ProjectCode } from "./engine/runtime";
 import { projectEntry } from "./project";
 import { isRegisteredFunction } from "./server";
+import { VERSION } from "./version";
 
 /**
  * Bundles the functions in `dir` and the npm packages they import into one ES module. The
@@ -19,7 +20,8 @@ export async function bundleProject(dirInput: string): Promise<{ code: string; f
   const { imports, fields, files } = await projectEntry(dir);
   const entry = join(dirname(dir), ".onebase", "deploy.ts");
   mkdirSync(dirname(entry), { recursive: true });
-  writeFileSync(entry, `${imports.join("\n")}\nexport default { ${fields} };\n`);
+  // The version goes with the code, so a server can tell what it was built against.
+  writeFileSync(entry, `${imports.join("\n")}\nexport default { ${fields}, onebaseVersion: ${JSON.stringify(VERSION)} };\n`);
   let result: Bun.BuildOutput;
   try {
     result = await Bun.build({
@@ -167,6 +169,7 @@ export async function deploy(opts: DeployOptions): Promise<DeployResult> {
     code: bundle.code,
     assets,
     dryRun: opts.dryRun ?? false,
+    onebaseVersion: VERSION,
     ...(opts.dryRun ? await dryRunFacts(join(dirname(dir), ".onebase", "deploy.ts")) : {}),
   });
   for (const w of r.warnings) log(`\x1b[33mwarn\x1b[0m ${w}`);

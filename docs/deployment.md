@@ -239,10 +239,29 @@ CMD ["onebase", "serve"]
 
 Pass settings with `docker run --env-file .env`, or mount a `.env` into `/app`. To ship code with `onebase deploy` instead of baking it into the image, leave out the two `COPY` lines for `onebase/` and `public/`. The deployment lives in the database on the volume, so it survives a new container.
 
+## Upgrading onebase
+
+A new onebase release is a new binary (or image). Your data, deployments and settings stay in the database and `onebase_data`, so upgrading is: back up, replace the binary, restart.
+
+```bash
+onebase upgrade --check   # is there a newer release?
+onebase backup            # or stop the server and copy onebase_data (Postgres/MySQL: their own dump)
+onebase upgrade           # or: onebase upgrade 0.3.0
+systemctl restart onebase # or however you run it
+```
+
+`onebase upgrade` downloads the release for your platform from [GitHub](https://github.com/abdullah-bl/onebase/releases), checks it against the release's `SHA256SUMS`, makes sure it runs, and only then swaps it in. The old binary stays next to it as `onebase.old`. The running server keeps the old version until it restarts, and clients reconnect by themselves after a restart, replaying any mutations they queued meanwhile.
+
+- **Docker:** pull the newer image and recreate the container: `docker compose pull && docker compose up -d`. The deployment and data live on the volume.
+- **Several instances** (Postgres, MySQL or Turso): restart them one at a time, so some instance always serves. Don't run two processes on one SQLite file: restarting is a few seconds of downtime there.
+- **Going back:** `mv onebase.old onebase` and restart. onebase records in the database which version opened it and in which storage format. A release that changes the format migrates the database when it starts (it says so in its log and release notes); an older onebase then refuses to start on it, with a message saying which version it needs, instead of misreading the data. To go back past such a release, restore the backup.
+- **Pushed code:** `onebase deploy` sends the onebase version your project uses, and the server warns when it doesn't match its own (another minor version before 1.0, another major after), on deploys, dry runs and at startup. Update the project's onebase and redeploy after upgrading a server: `bun add github:abdullah-bl/onebase#v<version>` (or a new binary), then `onebase deploy`.
+
 ## Production checklist
 
 - **Public URL:** set `--url`, so file URLs point at your public domain.
 - **Durable data:** keep `onebase_data` on persistent disk, and add `--backup` (or use Postgres or Turso).
+- **Before upgrading:** take a backup, and read the release notes. See [Upgrading onebase](#upgrading-onebase).
 - **Before deploying:** run `onebase doctor` (`onebase deploy` runs it for you), and try a risky schema change with `onebase deploy --dry-run`.
 - **Behind a proxy:** pass `--trust-proxy` so `--rate-limit` counts real client IPs.
 - **Dashboard:** keep the admin key secret, or block `/_admin` at the proxy (see [Dashboard](./dashboard.md)).

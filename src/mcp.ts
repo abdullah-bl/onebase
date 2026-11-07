@@ -85,6 +85,12 @@ export type McpConfig = {
    * full URL. It's opened as `<consentUrl>?request=<id>`. Without it only API keys work.
    */
   consentUrl?: string;
+  /**
+   * Device pairing for agents that can't open a browser: your page where a signed-in user enters
+   * the agent's code ("/device"), opened as `<deviceUrl>?code=<user code>`. Without it the device
+   * flow is off. It can be the same page as auth.config.ts's deviceUrl.
+   */
+  deviceUrl?: string;
   /** Named permissions users grant an agent, with a sentence each for the consent page: { read: "Read your notes" }. */
   scopes?: Record<string, string>;
   /** How long an access token lasts, in seconds (default 3600). Refresh tokens rotate on every use. */
@@ -102,8 +108,11 @@ export function defineMcp(config: McpConfig): McpDefinition {
     if (!/^[A-Za-z0-9_.:-]{1,64}$/.test(scope)) throw new Error(`defineMcp: scope "${scope}" must be 1-64 letters, digits or _ . : -.`);
     if (typeof text !== "string" || !text.trim()) throw new Error(`defineMcp: scope "${scope}" needs a description for the consent page.`);
   }
-  if (config.consentUrl !== undefined && (typeof config.consentUrl !== "string" || !/^(\/|https?:\/\/)/.test(config.consentUrl))) {
-    throw new Error('defineMcp({ consentUrl }) must be a path like "/connect" or a full https:// URL.');
+  for (const key of ["consentUrl", "deviceUrl"] as const) {
+    const url = config[key];
+    if (url !== undefined && (typeof url !== "string" || !/^(\/|https?:\/\/)/.test(url))) {
+      throw new Error(`defineMcp({ ${key} }) must be a path like "/connect" or a full https:// URL.`);
+    }
   }
   for (const key of ["accessTokenSeconds", "refreshTokenDays"] as const) {
     const n = config[key];

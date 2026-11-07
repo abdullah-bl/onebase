@@ -114,6 +114,20 @@ An API key is a bearer token for agents you set up by hand:
 claude mcp add --transport http notes https://your-app.com/mcp --header "Authorization: Bearer ob_mcpk_..."
 ```
 
+## Agents without a browser
+
+Some agents can't open a sign-in page: a script, a CI job, or an agent that was only given the URL. They can pair with a code instead (the OAuth device flow, RFC 8628) when you set `deviceUrl`:
+
+```ts
+export default defineMcp({ name: "Notes", consentUrl: "/connect.html", deviceUrl: "/device.html", scopes: { ... } });
+```
+
+1. The agent posts to `/api/mcp/oauth/device` with `client_id=mcp-agent`, or the `client_id` it registered.
+2. It shows the user the code and a link, and polls the token endpoint with `grant_type=urn:ietf:params:oauth:grant-type:device_code`.
+3. The user approves it on your `deviceUrl` page with `client.device.request(code)` and `client.device.approve({ code, approve, scopes })`. This can be the page `auth.config.ts`'s `deviceUrl` points to. See [Device sign-in](./auth.md#device-sign-in).
+
+Agents connected this way get an access token only, with no refresh token, because they often can't keep a secret safe between runs. They pair again when it expires. A `GET /mcp` without a token returns these steps as JSON, so an agent given only the URL knows what to do.
+
 ## How it fits together
 
 | Endpoint | |
@@ -125,6 +139,7 @@ claude mcp add --transport http notes https://your-app.com/mcp --header "Authori
 | `GET /api/mcp/oauth/authorize` | Checks the request and redirects to your `consentUrl` |
 | `POST /api/mcp/oauth/token` | `authorization_code` (with the PKCE `code_verifier`) and `refresh_token` |
 | `POST /api/mcp/oauth/revoke` | Token revocation (RFC 7009) |
+| `POST /api/mcp/oauth/device` | Device authorization (RFC 8628), when `deviceUrl` is set |
 | `GET /api/mcp/request`, `POST /api/mcp/authorize` | What `client.mcp.request` and `client.mcp.authorize` call |
 | `GET /api/mcp/connections`, `POST /api/mcp/connections/revoke`, `POST /api/mcp/keys` | The settings calls |
 
@@ -140,7 +155,6 @@ claude mcp add --transport http notes https://your-app.com/mcp --header "Authori
 
 - **Streaming:** answers come back as a single JSON response, and `GET /mcp` returns 405.
 - **Other MCP features:** resources, prompts, sampling and change notifications.
-- **Device flow:** agents that can't open a browser (RFC 8628) aren't supported. Use an API key.
 - **Confidential clients:** clients that authenticate with a client secret can't register.
 
 ## Testing

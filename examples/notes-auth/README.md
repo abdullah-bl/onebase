@@ -20,6 +20,7 @@ Open the printed URL (http://localhost:8090), sign up with any email and a passw
 - **User-scoped full-text search** — a `searchIndex` with `filterFields: ["owner"]`, so `q.search("body", text).eq("owner", userId)` searches only your notes.
 - **Pagination** — `paginate(paginationOpts)` with `paginationOptsValidator`; the frontend grows `numItems` for "Load more", so the page stays live.
 - **An MCP server** — `onebase/mcp.ts` turns the notes functions into tools for AI agents, with `read` and `write` scopes; `public/connect.html` is the consent page, and the main page lists connected agents and creates API keys. Add `http://localhost:8090/mcp` in an MCP client (or the MCP Inspector) to try it.
+- **Device sign-in** — `deviceUrl` in `auth.config.ts` and `mcp.ts`: a CLI calls `client.signInWithDevice({ onCode })`, and the user approves its code on `public/device.html`. Agents without a browser pair the same way.
 - **The client auth surface** — `client.signIn("password", { flow, email, password })`, `client.onAuthChange`, `client.signOut()` in plain JavaScript, with the session kept in `localStorage` across reloads.
 
 ## Files
@@ -32,4 +33,5 @@ onebase/
   mcp.ts           defineMcp + four tools (recentNotes, searchNotes, addNote, pinNote)
 public/index.html  sign-in form + notes UI + connected agents, no build step
 public/connect.html  the page where a user approves an agent
+public/device.html   the page where a user approves a device or agent by its code
 ```

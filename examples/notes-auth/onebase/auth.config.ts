@@ -4,4 +4,6 @@ import { password } from "onebase/auth";
 // and password hashes live in the app's own database.
 export default {
   methods: [password()],
+  // A TV or CLI can sign in with a code the user approves on public/device.html.
+  deviceUrl: "/device.html",
 };

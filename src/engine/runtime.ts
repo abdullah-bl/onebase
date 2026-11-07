@@ -21,7 +21,9 @@ import { FileStore, LocalBlobs, type BlobBackend } from "./files";
 import { CallLog, type CallSource } from "./calllog";
 import { CallBudget, DEFAULT_CALL_LIMITS, type CallLimits } from "./limits";
 import { currentFunction, installGuards } from "./guard";
-import { AuthService, SESSION_PREFIX } from "./auth";
+import { AuthError, AuthService, SESSION_PREFIX } from "./auth";
+import { isMcpToken, McpService } from "./mcp";
+import { isMcpTool, type McpDefinition } from "../mcp";
 import { createAuthenticate, type AuthConfig, type AuthenticateCtx } from "./jwt";
 import {
   activeDeployment,
@@ -88,6 +90,7 @@ type PreparedCode = {
   crons: CronJob[];
   auth: AuthService | null;
   authenticate: Authenticate | null;
+  mcp: McpService | null;
 };
 
 export type RuntimeOptions = {
@@ -241,6 +244,8 @@ export class Runtime {
   /** Built-in sign-in, when auth.config.ts lists methods. */
   auth: AuthService | null = null;
   private authenticate: Authenticate | null = null;
+  /** The MCP server, when onebase/mcp.ts defines one. */
+  mcp: McpService | null = null;
   private crons: CronJob[] = [];
   /** The `onebase deploy` push being run, if any. */
   deployment: Deployment | null = null;
@@ -469,7 +474,19 @@ export class Runtime {
       crons,
       auth: code.auth?.methods?.length ? new AuthService(this, code.auth) : null,
       authenticate: this.customAuthenticate ?? (code.auth ? createAuthenticate(code.auth) : null),
+      mcp: this.prepareMcp(code, functions),
     };
+  }
+
+  /** onebase/mcp.ts's server, with every tool() in the app; null when the app serves no MCP. */
+  private prepareMcp(code: ProjectCode, functions: Map<string, RegisteredFunction>): McpService | null {
+    const definition = code.modules.mcp?.default as McpDefinition | undefined;
+    const hasTools = [...functions].some(([name, fn]) => isMcpTool(fn) && !name.startsWith("components/"));
+    if (definition?.__onebase !== "mcp") {
+      if (hasTools) throw new OnebaseError('The app defines MCP tools, but onebase/mcp.ts has no `export default defineMcp({ name: "..." })` (from "onebase/mcp").');
+      return null;
+    }
+    return new McpService(this, definition, functions);
   }
 
   /** A mount's cron jobs, named "components/<mount>/<name>" so they can't clash with the app's. */
@@ -539,6 +556,7 @@ export class Runtime {
     this.http = prepared.code.http;
     this.auth = prepared.auth;
     this.authenticate = prepared.authenticate;
+    this.mcp = prepared.mcp;
     this.crons = prepared.crons;
     this.functions.clear();
     for (const [name, fn] of prepared.functions) this.functions.set(name, fn);
@@ -820,6 +838,8 @@ export class Runtime {
   async identify(token: string | null | undefined): Promise<UserIdentity | null> {
     if (!token) return null;
     if (this.auth && token.startsWith(SESSION_PREFIX)) return this.auth.identifySession(token);
+    // An agent's token is good for its tools at /mcp and nothing else.
+    if (isMcpToken(token)) throw new AuthError("This is an MCP token: it only works at /mcp.", 401);
     if (!this.authenticate) {
       throw new OnebaseError(
         "A client sent an auth token, but auth.config.ts has no sign-in methods, providers or authenticate(token, ctx) to check it.",

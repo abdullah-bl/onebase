@@ -16,6 +16,7 @@ onebase/
   http.ts            optional HTTP routes (webhooks)
   crons.ts           optional scheduled jobs
   auth.config.ts     optional auth providers
+  mcp.ts             optional MCP server for AI agents (defineMcp + tools)
   _generated/        written by `onebase codegen` / `onebase dev`; never edit
 ```
 
@@ -215,6 +216,26 @@ const like = useMutation(api.posts.like).withOptimisticUpdate((store, { id }) =>
   if (posts) store.setQuery(api.posts.list, {}, posts.map((p) => (p._id === id ? { ...p, likes: p.likes + 1 } : p)));
 });
 ```
+
+## MCP (tools for AI agents)
+
+`onebase/mcp.ts` makes the app an MCP server at `/mcp`. Users connect an agent with that URL and approve it on your `consentUrl` page (OAuth 2.1 is built in), or use an API key.
+
+```ts
+import { defineMcp, tool } from "onebase/mcp";
+export default defineMcp({ name: "Notes", consentUrl: "/connect.html", scopes: { read: "Read your notes" } });
+
+export const searchNotes = tool({
+  description: "Searches the user's notes.", // the agent reads this
+  scope: "read",
+  annotations: { readOnlyHint: true },
+  args: { text: v.string() },
+  returns: v.object({ notes: v.array(v.string()) }), // checked: limits what reaches the agent
+  handler: async (ctx, { text }) => ({ notes: (await ctx.runQuery(api.notes.search, { text })).map((n) => n.body) }),
+});
+```
+
+A tool is an internal action. Its `ctx.auth` is the approving user, so `ctx.runQuery(api...)` reuses your functions and their ownership checks. On the consent page call `client.mcp.request(id)`, then `client.mcp.authorize({ request, approve })` and `location.assign(redirect)`. A settings page uses `client.mcp.connections()`, `.revoke(id)` and `.createKey({ name })`. MCP tokens only work at `/mcp`.
 
 ## Components
 

@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Connect an agent</title>
+    <style>
+      :root { color-scheme: light dark; --bg: #fafafa; --fg: #1a1a1a; --muted: #777; --line: #e3e3e3; --accent: #3b5bdb; --card: #fff; --danger: #e03131; }
+      @media (prefers-color-scheme: dark) { :root { --bg: #141414; --fg: #eee; --muted: #999; --line: #2c2c2c; --accent: #748ffc; --card: #1d1d1d; } }
+      * { box-sizing: border-box; }
+      body { margin: 0; font: 15px/1.45 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+      main { max-width: 440px; margin: 48px auto; padding: 16px; }
+      .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
+      h1 { font-size: 18px; margin: 0 0 4px; }
+      .muted { color: var(--muted); font-size: 13px; }
+      form { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }
+      input[type="email"], input[type="password"] { padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--fg); font: inherit; }
+      label.scope { display: flex; gap: 8px; align-items: baseline; padding: 6px 0; }
+      .buttons { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+      button { font: inherit; cursor: pointer; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--fg); }
+      button.primary { border: 0; background: var(--accent); color: #fff; }
+      #error { color: var(--danger); font-size: 13px; min-height: 1.2em; margin-top: 8px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="card">
+        <div id="signin" hidden>
+          <h1>Sign in to continue</h1>
+          <p class="muted">An agent wants to use your notes. Sign in first.</p>
+          <form id="signinForm">
+            <input id="email" type="email" placeholder="you@example.com" required />
+            <input id="password" type="password" placeholder="Password" required />
+            <button class="primary">Sign in</button>
+          </form>
+        </div>
+        <div id="consent" hidden>
+          <h1 id="title"></h1>
+          <p class="muted" id="where"></p>
+          <div id="scopes"></div>
+          <div class="buttons">
+            <button id="deny">Deny</button>
+            <button id="allow" class="primary">Allow</button>
+          </div>
+        </div>
+        <div id="error"></div>
+      </div>
+    </main>
+    <script type="module">
+      import { OnebaseClient } from "/_onebase/client.js";
+
+      // Approving inside someone else's frame could be clickjacked: only run as the top window.
+      // (If you can set headers, send Content-Security-Policy: frame-ancestors 'none' instead.)
+      if (window.top !== window.self) throw new Error("This page can't be framed.");
+
+      const $ = (id) => document.getElementById(id);
+      const fail = (msg) => ($("error").textContent = msg);
+      const requestId = new URL(location.href).searchParams.get("request");
+      const client = new OnebaseClient();
+
+      $("signinForm").onsubmit = async (e) => {
+        e.preventDefault();
+        try {
+          await client.signIn("password", { flow: "signIn", email: $("email").value, password: $("password").value });
+        } catch (err) {
+          fail(err.message);
+        }
+      };
+
+      async function show() {
+        const auth = client.authState;
+        if (auth.isLoading) return;
+        $("signin").hidden = auth.isAuthenticated;
+        $("consent").hidden = !auth.isAuthenticated;
+        if (!auth.isAuthenticated) return;
+        if (!requestId) return fail("This page needs ?request=… from an agent.");
+        try {
+          const request = await client.mcp.request(requestId);
+          $("title").textContent = `Allow “${request.client.name}” to use ${request.server.name}?`;
+          // The name is whatever the agent registered with; where it returns to can't be faked.
+          $("where").textContent = `You'll be sent back to ${request.client.redirectHost}.`;
+          $("scopes").replaceChildren(
+            ...request.scopes.map(({ scope, description }) => {
+              const label = Object.assign(document.createElement("label"), { className: "scope" });
+              const box = Object.assign(document.createElement("input"), { type: "checkbox", checked: true, value: scope });
+              label.append(box, description);
+              return label;
+            }),
+          );
+        } catch (err) {
+          $("consent").hidden = true;
+          fail(err.message);
+        }
+      }
+      client.onAuthChange(show);
+      show();
+
+      async function answer(approve) {
+        try {
+          const scopes = [...document.querySelectorAll("#scopes input:checked")].map((box) => box.value);
+          const { redirect } = await client.mcp.authorize({ request: requestId, approve, scopes });
+          location.assign(redirect);
+        } catch (err) {
+          fail(err.message);
+        }
+      }
+      $("allow").onclick = () => answer(true);
+      $("deny").onclick = () => answer(false);
+    </script>
+  </body>
+</html>

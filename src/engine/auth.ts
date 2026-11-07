@@ -39,7 +39,7 @@ export class AuthError extends OnebaseError {
 }
 
 export const sha256 = (text: string) => new Bun.CryptoHasher("sha256").update(text).digest("base64url");
-const randomToken = () => Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
+export const randomToken = () => Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
 
 /** An 8-digit code, easy to type from an email. */
 function randomCode(): string {
@@ -56,7 +56,7 @@ function isUniqueViolation(err: unknown): boolean {
   return e?.errno === "23505" || /UNIQUE constraint|SQLITE_CONSTRAINT|duplicate key/i.test(String(e?.code ?? "") + String(e?.message ?? ""));
 }
 
-function identityFor(user: Record<string, any>, sessionId: string): UserIdentity {
+export function identityFor(user: Record<string, any>, sessionId: string): UserIdentity {
   return defined({
     subject: user._id,
     issuer: "onebase",

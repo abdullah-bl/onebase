@@ -18,6 +18,7 @@
     "./server": "./src/server.ts",
     "./values": "./src/values.ts",
     "./auth": "./src/auth.ts",
+    "./mcp": "./src/mcp.ts",
     "./components": "./src/components/index.ts",
     "./components/*": "./src/components/*/index.ts",
     "./browser": "./src/client/index.ts",

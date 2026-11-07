@@ -37,6 +37,12 @@
       form#add button { align-self: flex-end; padding: 8px 14px; border: 0; border-radius: 8px; background: var(--accent); color: #fff; }
       #error { color: var(--danger); font-size: 13px; min-height: 1.2em; }
       .hint { color: var(--muted); font-size: 12px; }
+      #agents { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 12px; }
+      #agents h2 { font-size: 15px; margin: 0 0 4px; }
+      #agents code, #agents pre { font-size: 12px; overflow-wrap: anywhere; white-space: pre-wrap; }
+      #agents pre { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+      #agents li { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+      #agents li button, #newKey { border: 0; background: none; color: var(--accent); padding: 0; }
     </style>
   </head>
   <body>
@@ -67,6 +73,16 @@
           <textarea id="body" placeholder="Write a note…" required></textarea>
           <button>Add note</button>
         </form>
+        <section id="agents">
+          <h2>Connected agents</h2>
+          <p class="hint">
+            Add <code id="mcpUrl"></code> as an MCP server in Claude, ChatGPT, Cursor or Claude Code, and approve it when asked. Agents can read your
+            notes, and add and pin them if you allow it.
+          </p>
+          <ul id="connections"></ul>
+          <button id="newKey">Create an API key</button>
+          <pre id="keyOut" hidden></pre>
+        </section>
       </div>
     </main>
     <script type="module">
@@ -115,7 +131,10 @@
         const signedIn = !auth.isLoading && auth.isAuthenticated;
         $("auth").hidden = signedIn;
         $("app").hidden = !signedIn;
-        if (signedIn) subscribe();
+        if (signedIn) {
+          subscribe();
+          loadAgents();
+        }
       }
       client.onAuthChange(renderAuth);
       renderAuth();
@@ -183,6 +202,42 @@
       $("more").onclick = () => {
         pageSize += 5;
         subscribe();
+      };
+
+      // ---- Connected agents (MCP) ----
+      const mcpUrl = `${location.origin}/mcp`;
+      $("mcpUrl").textContent = mcpUrl;
+
+      async function loadAgents() {
+        try {
+          const connections = await client.mcp.connections();
+          $("connections").replaceChildren(
+            ...connections.map((c) => {
+              const li = document.createElement("li");
+              const label = document.createElement("span");
+              label.textContent = `${c.name} · ${c.kind === "key" ? "API key" : "agent"} · ${c.scopes.join(", ") || "no scopes"}`;
+              const revoke = Object.assign(document.createElement("button"), { textContent: c.kind === "key" ? "Delete" : "Disconnect" });
+              revoke.onclick = async () => {
+                await client.mcp.revoke(c.id);
+                loadAgents();
+              };
+              li.append(label, revoke);
+              return li;
+            }),
+          );
+        } catch (err) {
+          error(err.message);
+        }
+      }
+
+      $("newKey").onclick = async () => {
+        const name = prompt("Name for the key", "My agent");
+        if (!name) return;
+        const { key } = await client.mcp.createKey({ name });
+        // Shown once: only its hash is stored.
+        $("keyOut").hidden = false;
+        $("keyOut").textContent = `claude mcp add --transport http notes ${mcpUrl} --header "Authorization: Bearer ${key}"`;
+        loadAgents();
       };
 
       $("add").onsubmit = async (e) => {

@@ -104,6 +104,12 @@ const authDdl = (time: string) => [
   "CREATE INDEX IF NOT EXISTS _auth_sessions_user ON _auth_sessions(user_id)",
   `CREATE TABLE IF NOT EXISTS _auth_codes (code_hash TEXT PRIMARY KEY, kind TEXT NOT NULL, data TEXT NOT NULL, expires ${time} NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS _auth_attempts ("key" TEXT PRIMARY KEY, count INTEGER NOT NULL, window_start ${time} NOT NULL)`,
+  // MCP: registered agents, approved connections, and their tokens (hashed).
+  `CREATE TABLE IF NOT EXISTS _mcp_clients (id TEXT PRIMARY KEY, data TEXT NOT NULL, created ${time} NOT NULL)`,
+  `CREATE TABLE IF NOT EXISTS _mcp_connections (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, client_id TEXT, kind TEXT NOT NULL, data TEXT NOT NULL, created ${time} NOT NULL, last_used ${time} NOT NULL)`,
+  "CREATE INDEX IF NOT EXISTS _mcp_connections_user ON _mcp_connections(user_id)",
+  `CREATE TABLE IF NOT EXISTS _mcp_tokens (token_hash TEXT PRIMARY KEY, connection_id TEXT NOT NULL, kind TEXT NOT NULL, expires ${time} NOT NULL, used INTEGER NOT NULL)`,
+  "CREATE INDEX IF NOT EXISTS _mcp_tokens_connection ON _mcp_tokens(connection_id)",
 ];
 
 const sign = (n: number) => (n < 0 ? -1 : n > 0 ? 1 : 0);
@@ -424,6 +430,9 @@ export const mysqlDialect: Dialect = {
     `CREATE TABLE IF NOT EXISTS _auth_sessions (id ${MY_KEY} PRIMARY KEY, token_hash ${MY_KEY} NOT NULL UNIQUE, user_id ${MY_KEY} NOT NULL, created DOUBLE NOT NULL, expires DOUBLE NOT NULL, last_used DOUBLE NOT NULL, KEY _auth_sessions_user (user_id)) ${MY_TABLE}`,
     `CREATE TABLE IF NOT EXISTS _auth_codes (code_hash ${MY_KEY} PRIMARY KEY, kind ${MY_KEY} NOT NULL, data TEXT NOT NULL, expires DOUBLE NOT NULL) ${MY_TABLE}`,
     `CREATE TABLE IF NOT EXISTS _auth_attempts ("key" ${MY_KEY} PRIMARY KEY, count INTEGER NOT NULL, window_start DOUBLE NOT NULL) ${MY_TABLE}`,
+    `CREATE TABLE IF NOT EXISTS _mcp_clients (id ${MY_KEY} PRIMARY KEY, data TEXT NOT NULL, created DOUBLE NOT NULL) ${MY_TABLE}`,
+    `CREATE TABLE IF NOT EXISTS _mcp_connections (id ${MY_KEY} PRIMARY KEY, user_id ${MY_KEY} NOT NULL, client_id ${MY_KEY}, kind VARCHAR(16) NOT NULL, data TEXT NOT NULL, created DOUBLE NOT NULL, last_used DOUBLE NOT NULL, KEY _mcp_connections_user (user_id)) ${MY_TABLE}`,
+    `CREATE TABLE IF NOT EXISTS _mcp_tokens (token_hash ${MY_KEY} PRIMARY KEY, connection_id ${MY_KEY} NOT NULL, kind VARCHAR(16) NOT NULL, expires DOUBLE NOT NULL, used INTEGER NOT NULL, KEY _mcp_tokens_connection (connection_id)) ${MY_TABLE}`,
     `CREATE TABLE IF NOT EXISTS _commits (id ${MY_KEY} PRIMARY KEY, at DOUBLE NOT NULL, payload LONGTEXT NOT NULL, KEY _commits_at (at)) ${MY_TABLE}`,
   ],
   // Nothing to build (see above); DO 0 is MySQL's no-op statement.

@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import * as auth from "./auth";
 import * as components from "./components";
+import * as mcp from "./mcp";
 import type { ComponentsDefinition } from "./components";
 import * as aggregate from "./components/aggregate";
 import * as rateLimiter from "./components/rate-limiter";
@@ -55,6 +56,7 @@ export function registerVirtualModules() {
       build.module("onebase/values", () => ({ exports: values, loader: "object" }));
       build.module("onebase/auth", () => ({ exports: auth, loader: "object" }));
       build.module("onebase/components", () => ({ exports: components, loader: "object" }));
+      build.module("onebase/mcp", () => ({ exports: mcp, loader: "object" }));
       for (const [name, exports] of Object.entries(BUILT_IN_COMPONENTS)) {
         build.module(`onebase/components/${name}`, () => ({ exports, loader: "object" }));
       }

@@ -358,6 +358,44 @@ a.ref:hover code { text-decoration: underline; text-underline-offset: 0.2em; }
 .toast { padding: 10px 14px; border-radius: 10px; background: var(--text); color: var(--bg); box-shadow: var(--shadow); font-size: 13.5px; animation: slide 0.16s ease; max-width: 420px; }
 .toast.t-error { background: var(--err); color: #fff; }
 
+/* ---------- editing a cell in place ---------- */
+.tbl td.editable { cursor: text; }
+.tbl td.editable:hover { box-shadow: inset 0 0 0 1px var(--border-2); }
+.tbl td.editing { padding: 3px 6px; overflow: visible; }
+.cell-edit { display: flex; align-items: center; gap: 6px; }
+.cell-edit input[type="text"], .cell-edit select { width: 100%; min-width: 140px; height: 28px; font: 12.5px var(--mono); }
+.cell-edit input.invalid { border-color: var(--err); }
+.cell-edit label { display: inline-flex; align-items: center; gap: 6px; font: 12.5px var(--mono); }
+
+/* ---------- schema diagram ---------- */
+.schema-scroll { overflow: auto; border: 1px solid var(--border); border-radius: 12px; background: var(--soft); background-image: radial-gradient(var(--border) 1px, transparent 1px); background-size: 18px 18px; }
+.schema-canvas { position: relative; display: flex; flex-wrap: wrap; align-items: flex-start; gap: 40px 72px; padding: 28px; min-width: min-content; }
+.schema-lines { position: absolute; inset: 0; pointer-events: none; overflow: visible; z-index: 0; }
+.schema-line { fill: none; stroke: var(--border-2); stroke-width: 1.5; transition: stroke 0.15s ease, opacity 0.15s ease; }
+.schema-line.active { stroke: var(--accent); stroke-width: 2; }
+.schema-line.dim { opacity: 0.25; }
+.schema-table { position: relative; z-index: 1; width: 280px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); box-shadow: var(--shadow); transition: opacity 0.15s ease; }
+.schema-table.orphan { border-style: dashed; }
+.schema-table.dim { opacity: 0.35; }
+.schema-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 9px 12px; border-bottom: 1px solid var(--border); font-size: 12px; }
+.schema-name { padding: 0; border: 0; background: none; cursor: pointer; font: 600 13.5px var(--mono); color: var(--text); text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.schema-name:hover { color: var(--accent); text-decoration: underline; }
+.schema-comp { color: var(--muted); font-weight: 400; }
+.schema-note { margin: 0; padding: 4px 12px; font-size: 12px; color: var(--warn); border-bottom: 1px solid var(--border); }
+.schema-fields, .schema-indexes { margin: 0; padding: 4px 0; list-style: none; }
+.schema-field { display: flex; justify-content: space-between; gap: 12px; padding: 3px 12px; font: 12.5px var(--mono); }
+.schema-field > span { flex: none; color: var(--text); }
+.schema-field em { color: var(--muted); font-style: normal; }
+.schema-field code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12px; }
+.schema-field.system > span { color: var(--muted); }
+.schema-field.ref code { color: var(--accent); }
+.schema-indexes { border-top: 1px solid var(--border); }
+.schema-indexes li { display: flex; align-items: baseline; gap: 8px; padding: 3px 12px; font-size: 12px; min-width: 0; }
+.schema-indexes li code { font-size: 12px; }
+.schema-indexes li .muted { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); }
+.schema-kind { flex: none; padding: 0 5px; border-radius: 4px; background: var(--soft); color: var(--muted); font: 500 10.5px var(--mono); text-transform: uppercase; }
+.schema-legend { margin-top: 10px; font-size: 12.5px; }
+
 /* ---------- environment variables ---------- */
 .env-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) auto auto; gap: 8px; align-items: center; }
 .env-row input, .env-bulk { min-width: 0; font-family: var(--mono); font-size: 13px; }

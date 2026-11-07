@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import { call, on } from "../api";
 import { Empty, Icon, ago, errorText, fullTime, preview, sample, throttle, toast, typeText } from "../ui";
+import { CellEditor, cellKind } from "./cell-edit";
 
 type Table = {
   name: string;
@@ -134,6 +135,10 @@ export function DataView({ table: selected, doc, go }: { table?: string; doc?: s
   const [editing, setEditing] = useState<Doc | "new" | null>(null);
   const [flash, setFlash] = useState(false);
   const [picked, setPicked] = useState<Set<string>>(new Set());
+  /** The cell being edited in place. */
+  const [cellEdit, setCellEdit] = useState<{ id: string; field: string } | null>(null);
+  // A single click on an editable cell opens the document a moment later, unless it was a double-click.
+  const openTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const loaded = useRef(PAGE);
   // A document id from the route (#/data/<table>/<id>), used by the next load instead of the filter box.
   const pendingDoc = useRef<string | null>(doc ?? null);
@@ -178,6 +183,7 @@ export function DataView({ table: selected, doc, go }: { table?: string; doc?: s
     setRows([]);
     setPicked(new Set());
     setEditing(null);
+    setCellEdit(null);
     void load();
   }, [selected, order, filter, doc]);
 
@@ -238,6 +244,25 @@ export function DataView({ table: selected, doc, go }: { table?: string; doc?: s
       );
     }
     return preview(value);
+  };
+
+  const fieldValidator = (c: string) => (table?.inSchema && table.validator?.kind === "object" ? (table.validator.fields?.[c] ?? null) : null);
+
+  const saveCell = async (row: Doc, field: string, value: unknown): Promise<boolean> => {
+    try {
+      await call("patch", { id: row._id, fields: { [field]: value } });
+      setRows((list) => list.map((r) => (r._id === row._id ? { ...r, [field]: value } : r)));
+      setCellEdit(null);
+      return true;
+    } catch (e) {
+      toast(errorText(e), "error");
+      return false;
+    }
+  };
+
+  const openSoon = (r: Doc) => {
+    if (openTimer.current) clearTimeout(openTimer.current);
+    openTimer.current = setTimeout(() => setEditing(r), 220);
   };
 
   // Ids that have left the table (or the loaded rows) don't count as selected.
@@ -342,7 +367,8 @@ export function DataView({ table: selected, doc, go }: { table?: string; doc?: s
                 <p class="muted">
                   {table.inSchema
                     ? `Indexes: ${table.indexes.map((i) => i.name).join(", ")}` +
-                      (table.searchIndexes.length ? ` · Search: ${table.searchIndexes.map((i) => `${i.name} (${i.searchField})`).join(", ")}` : "")
+                      (table.searchIndexes.length ? ` · Search: ${table.searchIndexes.map((i) => `${i.name} (${i.searchField})`).join(", ")}` : "") +
+                      " · Double-click a value to edit it"
                     : table.component
                       ? `Component "${table.component}" isn't mounted in components.ts anymore; these documents are kept until you delete them.`
                       : "This table has documents but isn't in schema.ts."}
@@ -400,9 +426,43 @@ export function DataView({ table: selected, doc, go }: { table?: string; doc?: s
                           <input type="checkbox" aria-label={`Select ${r._id}`} checked={picked.has(r._id)} onChange={() => togglePick(r._id)} />
                         </td>
                         <td><code class="id">{r._id}</code></td>
-                        {columns.map((c) => (
-                          <td class={typeof r[c] === "string" ? "" : "mono"}>{cell(c, r[c])}</td>
-                        ))}
+                        {columns.map((c) => {
+                          const kind = cellKind(fieldValidator(c), r[c]);
+                          // A field outside the schema can't be added this way; an unset optional one can.
+                          const editable = kind && (r[c] !== undefined || table.inSchema);
+                          if (cellEdit?.id === r._id && cellEdit.field === c && kind) {
+                            return (
+                              <td class="editing" onClick={(e) => e.stopPropagation()}>
+                                <CellEditor kind={kind} value={r[c]} onSave={(v) => saveCell(r, c, v)} onCancel={() => setCellEdit(null)} />
+                              </td>
+                            );
+                          }
+                          return (
+                            <td
+                              class={`${typeof r[c] === "string" ? "" : "mono"} ${editable ? "editable" : ""}`}
+                              title={editable ? "Double-click to edit" : undefined}
+                              onClick={
+                                editable
+                                  ? (e) => {
+                                      e.stopPropagation();
+                                      if (e.detail === 1) openSoon(r);
+                                    }
+                                  : undefined
+                              }
+                              onDblClick={
+                                editable
+                                  ? (e) => {
+                                      e.stopPropagation();
+                                      if (openTimer.current) clearTimeout(openTimer.current);
+                                      setCellEdit({ id: r._id, field: c });
+                                    }
+                                  : undefined
+                              }
+                            >
+                              {cell(c, r[c])}
+                            </td>
+                          );
+                        })}
                         <td class="muted nowrap" title={fullTime(r._creationTime)}>{ago(r._creationTime)}</td>
                       </tr>
                     ))}

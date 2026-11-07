@@ -17,6 +17,7 @@ import { dashboardAssets } from "./dashboard/bundle.generated";
 import { createAdmin, loadAdminKey } from "./engine/admin";
 import { serveAsset } from "./engine/deployments";
 import { importBundle } from "./project";
+import { processEnvVars, readEnvVars } from "./engine/env-vars";
 import type { CodeSource } from "./engine/action-wire";
 
 export const VERSION = "0.2.0";
@@ -28,6 +29,11 @@ export type AppOptions = {
   deploys?: boolean;
   schema: SchemaDefinition<any> | null;
   modules: Modules;
+  /**
+   * Imports the code instead of taking it above, once the database is open, so code that reads
+   * environment variables when it loads sees the ones set with `onebase env set`.
+   */
+  load?: () => Promise<AppCode>;
   http?: HttpRouter | null;
   /** auth.config.ts: sign-in methods, external providers and/or authenticate(token, ctx). */
   auth?: AuthConfig | null;
@@ -71,6 +77,9 @@ export type AppOptions = {
   quiet?: boolean;
 };
 
+/** The project's code, as startApp takes it. */
+export type AppCode = Pick<AppOptions, "schema" | "modules" | "http" | "auth" | "crons" | "components">;
+
 /** Serves files from a directory, falling back to index.html for client-side routes. */
 export function directoryAssets(dirInput: string): AssetResolver {
   const root = resolve(dirInput);
@@ -97,16 +106,23 @@ export function embeddedAssets(files: Record<string, string>): AssetResolver {
 export async function startApp(opts: AppOptions) {
   const driver = createDriver(opts.db ?? join(opts.dataDir, "db.sqlite"));
   const blobs = opts.files ? new S3Blobs(parseS3Url(opts.files)) : new LocalBlobs(join(opts.dataDir, "files"));
+  let code: AppCode = opts;
+  if (opts.load) {
+    await driver.init();
+    processEnvVars().apply(await driver.read(readEnvVars));
+    code = await opts.load();
+  }
   const runtime = new Runtime({
     driver,
+    driverReady: Boolean(opts.load),
     blobs,
-    schema: opts.schema,
-    modules: opts.modules,
-    http: opts.http,
-    auth: opts.auth,
+    schema: code.schema,
+    modules: code.modules,
+    http: code.http,
+    auth: code.auth,
     authenticate: opts.authenticate,
-    crons: opts.crons?.jobs ?? [],
-    components: opts.components ?? null,
+    crons: code.crons?.jobs ?? [],
+    components: code.components ?? null,
     dev: opts.dev,
     log: consoleLogger,
     loadCode: opts.deploys === false ? null : importBundle,

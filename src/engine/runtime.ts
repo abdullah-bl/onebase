@@ -26,9 +26,11 @@ import { DeviceService } from "./device";
 import { isMcpToken, McpService } from "./mcp";
 import { isMcpTool, type McpDefinition } from "../mcp";
 import { createAuthenticate, type AuthConfig, type AuthenticateCtx } from "./jwt";
+import { checkEnvVar, processEnvVars, readEnvVars, writeEnvVars, type EnvVars, type StoredEnvVar } from "./env-vars";
 import {
   activeDeployment,
   activeDeploymentId,
+  forgetModule,
   getDeployment,
   previousDeployment,
   releaseModules,
@@ -133,6 +135,22 @@ export type RuntimeOptions = {
   actionWorkerEntry?: string | URL;
   /** How much one query or mutation may read and write (default: DEFAULT_CALL_LIMITS). */
   callLimits?: Partial<CallLimits>;
+  /** Applies stored environment variables to process.env (default: the process's one). */
+  envVars?: EnvVars;
+  /** The caller already ran driver.init() (to read stored variables before loading the code). */
+  driverReady?: boolean;
+};
+
+/** What an environment variable change did. */
+export type EnvChange = {
+  /** Names whose stored value changed. */
+  changed: string[];
+  /** Changed names the server's own environment sets, so the stored value has no effect. */
+  overridden: string[];
+  /** How the code picked up the change: reloaded (a deployment), re-prepared (local code: values read at load need a restart), or nothing to do. */
+  reload: "deployment" | "local" | "none";
+  /** Set when the deployment failed to reload with the new values; the old code keeps running. */
+  error?: string;
 };
 
 /** How long one call may run, in ms; 0 means no limit. */
@@ -287,6 +305,10 @@ export class Runtime {
   /** Signs function handles; loaded from the database by init(). */
   private handleKey: Buffer | null = null;
   private stopped = false;
+  private readonly envVars: EnvVars;
+  private readonly driverReady: boolean;
+  /** The code being run, so a change of environment variables can prepare it again. */
+  private current!: PreparedCode;
 
   constructor(opts: RuntimeOptions) {
     installGuards();
@@ -295,6 +317,8 @@ export class Runtime {
     this.dev = opts.dev ?? false;
     this.log = opts.log ?? consoleLogger;
     this.loadCode = this.dev ? null : opts.loadCode;
+    this.envVars = opts.envVars ?? processEnvVars();
+    this.driverReady = opts.driverReady ?? false;
     this.loadTimeoutMs = opts.loadTimeoutMs ?? 30_000;
     this.actionWorkers = opts.actionWorkers ?? envNumber("ONEBASE_ACTION_WORKERS") ?? defaultActionWorkers();
     this.actionWorkerEntry = opts.actionWorkerEntry ?? defaultWorkerEntry();
@@ -329,8 +353,11 @@ export class Runtime {
    * instances. A deployment pushed with `onebase deploy` replaces the code given to the constructor.
    */
   async init(): Promise<{ created: string[]; dropped: string[] }> {
-    await this.driver.init();
+    if (!this.driverReady) await this.driver.init();
     this.handleKey = await this.loadHandleKey();
+    // Before a deployment loads, so its top level sees them. Local code was loaded already
+    // (startApp reads them first when it can); prepare it again in case they changed anything.
+    if (this.envVars.apply(await this.driver.read(readEnvVars)).length) this.setCode(this.prepare(this.current.code), null);
     let applied: { result: { created: string[]; dropped: string[] }; warnings: string[] } | null = null;
     while (!applied) {
       const stored = this.loadCode ? await this.driver.read((tx) => activeDeployment(tx)) : null;
@@ -550,6 +577,7 @@ export class Runtime {
   }
 
   private setCode(prepared: PreparedCode, deployment: Deployment | null) {
+    this.current = prepared;
     this.schema = prepared.code.schema;
     this.catalog = prepared.catalog;
     this.mounts.clear();
@@ -574,11 +602,11 @@ export class Runtime {
   }
 
   /** Swaps in new code, restarts crons, and lets the HTTP layer re-run live queries. */
-  private async install(prepared: PreparedCode, deployment: Deployment) {
+  private async install(prepared: PreparedCode, deployment: Deployment | null) {
     this.setCode(prepared, deployment);
     // The replaced deployment's module is dropped from the module cache, so its memory can be
     // freed once the calls already running with it finish.
-    releaseModules(deployment.id);
+    releaseModules(deployment?.id ?? null);
     if (this.schedulerStarted) {
       this.cronRunner?.stop();
       this.cronRunner = null;
@@ -779,6 +807,63 @@ export class Runtime {
   }
 
   /** Strictly increasing creation times keep ordering and cursors unambiguous. */
+  // ---- Environment variables ----
+
+  /** The stored variables, and whether the server's own environment overrides each one. */
+  async listEnvVars(): Promise<{ name: string; value: string; updated: number; overridden: boolean }[]> {
+    const stored = await this.driver.read(readEnvVars);
+    return stored.map((v) => ({ ...v, overridden: this.envVars.overridden(v.name) }));
+  }
+
+  /**
+   * Stores `set` and removes `remove` in one transaction, then applies them here and on every
+   * other instance, without a redeploy: the running deployment loads again so code that reads a
+   * variable when it loads sees the new value, and action threads restart.
+   */
+  async setEnvVars(set: Record<string, string>, remove: string[] = []): Promise<EnvChange> {
+    for (const [name, value] of Object.entries(set)) checkEnvVar(name, value);
+    for (const name of remove) checkEnvVar(name);
+    const both = remove.filter((name) => Object.hasOwn(set, name));
+    if (both.length) throw new OnebaseError(`${both.join(", ")}: set and removed at once. Pick one.`);
+    const { changed, stored } = await this.withWriter(async (tx) => {
+      const changed = await writeEnvVars(tx, set, remove, Date.now());
+      if (changed.length && this.driver.shared && this.driver.publish) await this.driver.publish(tx, JSON.stringify({ o: this.instanceId, e: true }));
+      return { changed, stored: await readEnvVars(tx) };
+    });
+    const overridden = changed.filter((name) => this.envVars.overridden(name));
+    if (!changed.length) return { changed, overridden, reload: "none" };
+    return { changed, overridden, ...(await this.refreshEnv(stored)) };
+  }
+
+  /**
+   * Applies the stored variables (`stored`, as a write just left them, or read from the database)
+   * to process.env and, if any changed, reloads the code with them.
+   */
+  private refreshEnv(stored?: StoredEnvVar[]): Promise<Pick<EnvChange, "reload" | "error">> {
+    return this.deploys.run(async () => {
+      if (!this.envVars.apply(stored ?? (await this.driver.read(readEnvVars))).length) return { reload: "none" as const };
+      const running = this.deployment;
+      if (running && this.loadCode) {
+        try {
+          const stored = await this.driver.read((tx) => getDeployment(tx, running.id));
+          if (!stored) throw new OnebaseError(`deployment ${running.id} is no longer stored`);
+          forgetModule(running.id); // so loading it runs its top level again
+          await this.install(await this.load(stored), toDeployment(stored));
+          this.log.info(`Environment variables changed: deployment ${running.id} reloaded.`);
+          return { reload: "deployment" as const };
+        } catch (err) {
+          const error = err instanceof Error ? err.message : String(err);
+          this.log.error(`Environment variables changed, but deployment ${running.id} failed to reload with them; it keeps running as it was. ${error}`);
+          return { reload: "deployment" as const, error };
+        }
+      }
+      // Local code can't be imported again; preparing it again rebuilds sign-in and restarts action threads.
+      await this.install(this.prepare(this.current.code), null);
+      this.log.info("Environment variables changed. Code that read them when it loaded sees the new values after a restart.");
+      return { reload: "local" as const };
+    });
+  }
+
   nextCreationTime(): number {
     const now = Date.now();
     this.lastCreationTime = now > this.lastCreationTime ? now : this.lastCreationTime + 0.001;
@@ -813,7 +898,7 @@ export class Runtime {
   }
 
   private async onRemoteCommit(message: string) {
-    let parsed: { o: string; w?: Write[]; t?: string[]; s?: boolean; r?: string[]; d?: string };
+    let parsed: { o: string; w?: Write[]; t?: string[]; s?: boolean; r?: string[]; d?: string; e?: boolean };
     try {
       parsed = JSON.parse(message);
     } catch {
@@ -821,6 +906,7 @@ export class Runtime {
     }
     if (parsed.o === this.instanceId) return;
     if (parsed.d) return this.onRemoteDeploy(parsed.d);
+    if (parsed.e) return void this.refreshEnv().catch((err) => this.log.error(`Couldn't apply environment variables from another instance: ${err instanceof Error ? err.message : String(err)}`));
     if (parsed.s) this.pokeScheduler();
     if (parsed.r?.length) this.notifyRevoked(parsed.r);
     if (parsed.w || parsed.t) await this.notifyCommit(parsed.w ? { writes: parsed.w } : { tables: parsed.t ?? [] });

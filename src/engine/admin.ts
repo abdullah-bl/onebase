@@ -276,6 +276,15 @@ export function createAdmin(opts: { runtime: Runtime; key: string; assets: Dashb
 
     rollback: () => runtime.rollback(),
 
+    // Environment variables (the dashboard and `onebase env`). Applied without a redeploy.
+    envList: () => runtime.listEnvVars(),
+    /** { set: { NAME: "value" }, remove: ["NAME"] }, in one transaction. */
+    envSet: ({ set = {}, remove = [] }) => {
+      if (!isPlainObject(set)) throw new OnebaseError('set must be an object of { NAME: "value" }.');
+      if (!Array.isArray(remove)) throw new OnebaseError('remove must be an array of names.');
+      return runtime.setEnvVars(set as Record<string, string>, remove);
+    },
+
     /** A one-time token for POST /api/storage/upload, so the dashboard can upload like a client does. */
     uploadToken: () => runtime.withWriter((tx) => runtime.files.createUploadToken(tx)),
 

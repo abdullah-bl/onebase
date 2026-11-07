@@ -16,6 +16,7 @@ import { CALL_LIMIT_ENV } from "./engine/limits";
 import type { AuthConfig } from "./engine/jwt";
 import type { Modules } from "./engine/runtime";
 import { loadEnv, withoutBunEnv } from "./env";
+import { envCommand } from "./env-command";
 import { loadProject, projectEntry, type Project } from "./project";
 import type { ComponentsDefinition } from "./components";
 import type { SchemaDefinition } from "./schema";
@@ -23,12 +24,15 @@ import type { Crons, HttpRouter } from "./server";
 
 /** A project compiled into the binary by `onebase build`. */
 export type EmbeddedProject = {
-  schema: SchemaDefinition<any> | null;
-  modules: Modules;
-  http: HttpRouter | null;
-  authConfig: AuthConfig | null;
-  crons: Crons | null;
-  components: ComponentsDefinition | null;
+  /** Imports the project's code: called once the database is open, so stored environment variables are set first. */
+  load: () => Promise<{
+    schema: SchemaDefinition<any> | null;
+    modules: Modules;
+    http: HttpRouter | null;
+    authConfig: AuthConfig | null;
+    crons: Crons | null;
+    components: ComponentsDefinition | null;
+  }>;
   publicFiles: Record<string, string>;
   /** The binary's action worker program (its path inside the binary), which has the same project built in. */
   actionWorkerEntry?: string;
@@ -40,6 +44,7 @@ Usage:
   onebase serve    Run the server
   onebase dev      Run the server, regenerate types and restart on changes
   onebase deploy   Push functions (and ./public) to a running server, with no restart
+  onebase env      Set, list and remove a running server's environment variables (onebase env help)
   onebase codegen  Write <dir>/_generated (typed api, server, dataModel)
   onebase doctor   Check schema and functions for common mistakes
   onebase build    Compile functions + frontend into one executable (from source)
@@ -69,6 +74,7 @@ Options (each $NAME can also come from a .env file):
   --force           restore: overwrite an existing database
   --no-dashboard    Don't serve the dashboard or admin API at /_admin, which also turns off deploys ($ONEBASE_DASHBOARD=off)
   --no-deploy       Refuse onebase deploy and run the local code, not what was pushed ($ONEBASE_DEPLOY=off)
+  --from-file <f>   env set: set every variable in this .env file
   --dry-run         deploy: check the code against the server's data without changing anything
   --rollback        deploy: go back to the previous deployment
   --env-file <path> Read this .env file instead of the defaults (repeatable)
@@ -127,6 +133,7 @@ function options(argv: string[]) {
       "dry-run": { type: "boolean", default: false },
       rollback: { type: "boolean", default: false },
       "env-file": { type: "string", multiple: true },
+      "from-file": { type: "string" },
       out: { type: "string", default: "./app" },
       target: { type: "string" },
       dev: { type: "boolean", default: false },
@@ -152,8 +159,9 @@ function options(argv: string[]) {
     public: values.public ?? env.ONEBASE_PUBLIC,
     port,
     host: values.host ?? env.ONEBASE_HOST ?? "0.0.0.0",
-    // For deploy, --url is the server to push to; its own public URL is a server setting.
-    url: values.url ?? (command === "deploy" ? env.ONEBASE_DEPLOY_URL : env.ONEBASE_URL),
+    // For deploy and env, --url is the server to call; its own public URL is a server setting.
+    url: values.url ?? (command === "deploy" || command === "env" ? env.ONEBASE_DEPLOY_URL : env.ONEBASE_URL),
+    args: positionals.slice(1),
     db: values.db ?? env.ONEBASE_DB ?? env.DATABASE_URL,
     files: values.files ?? env.ONEBASE_FILES,
     backup: values.backup ?? env.ONEBASE_BACKUP,
@@ -294,15 +302,16 @@ function publicDir(explicit: string | undefined): string | null {
 async function serveCommand(opts: ReturnType<typeof options>) {
   // A server that only runs what `onebase deploy` pushes needs no functions folder.
   const empty: Project = { dir: resolve(opts.dir), schema: null, modules: {}, http: null, crons: null, authConfig: null, components: null, sources: {} };
-  const project = !opts.givenDir && !existsSync(opts.dir) && !opts.dev ? empty : await loadProject(opts.dir);
+  const local = opts.givenDir || existsSync(opts.dir) || opts.dev;
   const pub = publicDir(opts.public);
   await startApp({
-    schema: project.schema,
-    modules: project.modules,
-    http: project.http,
-    auth: project.authConfig,
-    crons: project.crons,
-    components: project.components,
+    schema: null,
+    modules: {},
+    // Loaded once the database is open, so stored environment variables are set first.
+    load: async () => {
+      const project = local ? await loadProject(opts.dir) : empty;
+      return { schema: project.schema, modules: project.modules, http: project.http, auth: project.authConfig, crons: project.crons, components: project.components };
+    },
     dataDir: opts.data,
     ...serverOptions(opts),
     port: opts.port,
@@ -311,7 +320,7 @@ async function serveCommand(opts: ReturnType<typeof options>) {
     dev: opts.dev,
     assets: pub ? directoryAssets(pub) : null,
     // Action workers load the same files.
-    source: project === empty ? null : { dir: project.dir },
+    source: local ? { dir: resolve(opts.dir) } : null,
   });
 }
 
@@ -393,7 +402,7 @@ async function buildCommand(opts: ReturnType<typeof options>) {
   await codegen(dir);
   const { imports, fields, files } = await projectEntry(dir);
   const pub = publicDir(opts.public);
-  const lines: string[] = [`import { runEmbedded } from ${JSON.stringify(import.meta.path)};`, ...imports];
+  const lines: string[] = [`import { runEmbedded } from ${JSON.stringify(import.meta.path)};`];
   const publicEntries: string[] = [];
   if (pub) {
     const root = resolve(pub);
@@ -405,7 +414,11 @@ async function buildCommand(opts: ReturnType<typeof options>) {
     }
   }
   // Both entry points sit in .onebase/, so inside the binary the worker is at ./worker.ts.
-  lines.push(`await runEmbedded({ ${fields}, publicFiles: { ${publicEntries.join(", ")} }, actionWorkerEntry: "./worker.ts" });`);
+  // The project is imported lazily, after stored environment variables are applied.
+  const lazy = imports.map((line) => line.replace(/^import \* as (\w+) from (.+);$/, "const $1 = await import($2);"));
+  lines.push(
+    `await runEmbedded({ load: async () => { ${lazy.join(" ")} return { ${fields} }; }, publicFiles: { ${publicEntries.join(", ")} }, actionWorkerEntry: "./worker.ts" });`,
+  );
   const entry = join(dirname(dir), ".onebase", "entry.ts");
   mkdirSync(dirname(entry), { recursive: true });
   writeFileSync(entry, lines.join("\n") + "\n");
@@ -435,12 +448,12 @@ export async function runEmbedded(project: EmbeddedProject, argv = process.argv.
   const opts = options(argv);
   if (opts.help) return console.log(HELP);
   await startApp({
-    schema: project.schema,
-    modules: project.modules,
-    http: project.http,
-    auth: project.authConfig,
-    crons: project.crons,
-    components: project.components,
+    schema: null,
+    modules: {},
+    load: async () => {
+      const p = await project.load();
+      return { schema: p.schema, modules: p.modules, http: p.http, auth: p.authConfig, crons: p.crons, components: p.components };
+    },
     dataDir: opts.data,
     ...serverOptions(opts),
     port: opts.port,
@@ -481,6 +494,8 @@ export async function main(argv = process.argv.slice(2)) {
         rollback: opts.rollback,
       });
       return;
+    case "env":
+      return envCommand({ args: opts.args, url: opts.url, key: process.env.ONEBASE_DEPLOY_KEY?.trim(), fromFile: opts["from-file"] });
     case "build":
       return buildCommand(opts);
     case "backup":

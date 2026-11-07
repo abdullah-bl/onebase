@@ -204,6 +204,7 @@ const ICONS: Record<string, string> = {
   scheduler: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM12 7v5l3.5 3.5",
   files: "M14 3H6v18h12V7zM14 3v4h4",
   schema: "M3 4h7v6H3zM14 14h7v6h-7zM10 7h3a2 2 0 0 1 2 2v5",
+  env: "M15 3.5a5.5 5.5 0 1 0 0 11 5.5 5.5 0 0 0 0-11zM11.1 12.9L3.5 20.5M6.5 17.5l2.5 2.5M9 15l2 2",
   search: "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14zM20 20l-4-4",
   theme: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM12 3v18M12 8h6M12 12h9M12 16h6",
   signout: "M10 4H4v16h6M15 8l4 4-4 4M19 12H9",

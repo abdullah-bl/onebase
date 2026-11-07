@@ -38,6 +38,7 @@ onebase uses Convex's programming model and most of its API. If you know Convex,
 | Components | `convex.config.ts`, `ctx.runMutation(components.x.lib.fn)` | `components.ts`, `ctx.components.x.fn()`; Convex component packages don't run unmodified yet |
 | Function handles | `createFunctionHandle` | ✓ (signed, so they can't be forged) |
 | Dashboard | ✓ | ✓ (built in, at `/_admin`) |
+| Environment variables | `npx convex env set` / dashboard | `onebase env set` / dashboard; `.env` files also work |
 
 ## Porting a project
 

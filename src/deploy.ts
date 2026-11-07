@@ -117,7 +117,7 @@ export async function adminCall(url: string, key: string, name: string, body: un
   } catch {}
   if (res.status === 401) throw new Error(`The server rejected the deploy key. ${KEY_HINT}`);
   if (!reply || (res.status === 404 && !reply.error)) {
-    throw new Error(`${url} doesn't look like a onebase server with deploys (HTTP ${res.status}). Is the URL right, and is the dashboard on (no --no-dashboard)?`);
+    throw new Error(`${url} doesn't look like a onebase server with its admin API (HTTP ${res.status}). Is the URL right, and is the dashboard on (no --no-dashboard)?`);
   }
   if (!reply.ok) throw new Error(reply.error ?? `HTTP ${res.status}`);
   return reply.value;
@@ -125,20 +125,27 @@ export async function adminCall(url: string, key: string, name: string, body: un
 
 const kb = (bytes: number) => (bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(1)} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`);
 
+/** The server URL to call (without a trailing /), after checking a key was given. */
+export function adminTarget(url: string | undefined, key: string | undefined, warn: (msg: string) => void): string {
+  if (!url) throw new Error("Where to? Pass --url https://your-server or set ONEBASE_DEPLOY_URL (for example in .env.local).");
+  if (!key) throw new Error(`Set ONEBASE_DEPLOY_KEY (for example in .env.local, which git ignores). ${KEY_HINT}`);
+  const clean = url.replace(/\/$/, "");
+  const { hostname, protocol } = new URL(clean);
+  if (protocol === "http:" && !["localhost", "127.0.0.1", "[::1]"].includes(hostname) && !hostname.endsWith(".localhost")) {
+    warn(`\x1b[33mwarn\x1b[0m ${clean} is plain HTTP, so the deploy key travels unencrypted. Use https:// in production.`);
+  }
+  return clean;
+}
+
 /** The `onebase deploy` command. */
 export async function deploy(opts: DeployOptions): Promise<DeployResult> {
   const log = opts.log ?? console.log;
-  if (!opts.url) throw new Error("Where to? Pass --url https://your-server or set ONEBASE_DEPLOY_URL (for example in .env.local).");
-  if (!opts.key) throw new Error(`Set ONEBASE_DEPLOY_KEY (for example in .env.local, which git ignores). ${KEY_HINT}`);
-  const url = opts.url.replace(/\/$/, "");
-  const { hostname, protocol } = new URL(url);
-  if (protocol === "http:" && !["localhost", "127.0.0.1", "[::1]"].includes(hostname) && !hostname.endsWith(".localhost")) {
-    log(`\x1b[33mwarn\x1b[0m ${url} is plain HTTP, so the deploy key travels unencrypted. Use https:// in production.`);
-  }
+  const url = adminTarget(opts.url, opts.key, log);
+  const key = opts.key!;
   const start = performance.now();
 
   if (opts.rollback) {
-    const r: DeployResult = await adminCall(url, opts.key, "rollback", {});
+    const r: DeployResult = await adminCall(url, key, "rollback", {});
     log(`\x1b[32m✓\x1b[0m Rolled back ${url} to ${r.id} (pushed ${new Date(r.created).toLocaleString()}): ${r.functions} function(s).`);
     return r;
   }
@@ -158,7 +165,7 @@ export async function deploy(opts: DeployOptions): Promise<DeployResult> {
   const frontend = assets ? ` and ${Object.keys(assets).length} static file(s) from ${relative(process.cwd(), opts.public!) || "."}/ (${kb(assetBytes)})` : "";
   log(`${opts.dryRun ? "Checking" : "Deploying"} ${what}${frontend} to ${url}…`);
 
-  const r: DeployResult = await adminCall(url, opts.key, "deploy", {
+  const r: DeployResult = await adminCall(url, key, "deploy", {
     code: bundle.code,
     assets,
     dryRun: opts.dryRun ?? false,

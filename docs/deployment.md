@@ -71,7 +71,7 @@ Things to know:
 
 - **Where it's kept:** in the database. A restart keeps running the deployment, backups include it, and with [several instances](./databases.md) on Postgres or Turso they all switch to it together. The other instances switch a moment after the deploy commits (under a second), and until then they check writes against the old schema. So with several instances, a write that lands on another instance in that moment isn't checked against a validator the deploy tightened.
 - **It replaces the local code:** a deployment runs instead of the server's `onebase/` folder or the code built into the binary. Start with `--no-deploy` (or `ONEBASE_DEPLOY=off`; `0`, `false` and `no` work too) to run the local code and refuse pushes. `onebase dev` servers always refuse them.
-- **Secrets stay on the server:** a deploy ships code, not environment variables. Functions read `process.env` on the server, so put API keys in the server's `.env`.
+- **Secrets stay on the server:** a deploy ships code, not environment variables. Functions read `process.env` on the server: set API keys with [`onebase env set`](#environment-variables-on-a-running-server) or the dashboard, or put them in the server's `.env`.
 - **The key:** `ONEBASE_DEPLOY_KEY` is the server's [admin key](./dashboard.md): `ONEBASE_ADMIN_KEY` there, or the contents of its `onebase_data/admin.key`. Anyone with it can run code on the server. Deploy over `https://`.
 - **The admin API:** deploys go to `/_admin/api/deploy`, so `--no-dashboard` turns them off too. If you block `/_admin` at the proxy, deploy through an SSH tunnel (`--url http://localhost:8090`) or allow that path from your CI's addresses.
 - **The frontend:** its files are stored in the database and served from memory. Keep large media in [file storage](./file-storage.md) or a CDN. A deployment without a `public/` folder leaves the server serving its own `--public`.
@@ -156,6 +156,27 @@ onebase reads `.env` files from the directory you run it in, so a server needs n
 - **Your functions** see the same variables in `process.env`.
 - **`onebase dev`** restarts when a `.env` file changes.
 - **Keep secrets out of git:** the `.local` files are for secrets, and the usual `.gitignore` excludes them. On a server, a plain `.env` next to the data is fine.
+
+### Environment variables on a running server
+
+Set your app's variables (API keys and the like) from your machine or the dashboard's **Environment** page, without editing files on the server or redeploying. It works like `npx convex env`:
+
+```bash
+onebase env set STRIPE_KEY sk_live_…        # or STRIPE_KEY=sk_live_…
+echo "$SECRET" | onebase env set WEBHOOK_SECRET   # no value: read from stdin, so it stays out of shell history
+onebase env set --from-file .env.production # every NAME=value in a file
+onebase env list                            # NAME=value lines
+onebase env get STRIPE_KEY
+onebase env remove STRIPE_KEY
+```
+
+It talks to `ONEBASE_DEPLOY_URL` with `ONEBASE_DEPLOY_KEY`, like [`onebase deploy`](#onebase-deploy).
+
+- **Applied at once:** functions see the new value in `process.env` on their next call, on every instance. Action threads restart with it. A running [deployment](#onebase-deploy) loads again, so code that reads a variable when it loads (a client created at the top of a file, `github()` in `auth.config.ts`) gets the new value too, and live queries re-run. If the deployment fails to load with the new values, it keeps running as it was and the command says why.
+- **Local code:** a server running its own `onebase/` folder (or a binary's built-in code) can't load it again. Values read inside a function apply at once; values read when the code loads apply after a restart. At startup, stored values are set before the code loads.
+- **The server's own environment wins:** a variable set in the server's environment or `.env` files overrides a stored one with the same name. `onebase env list` and the dashboard mark those as overridden, so a change that can't take effect doesn't go unnoticed.
+- **Not for server settings:** `ONEBASE_*` names are refused, since the server reads them when it starts. Set those in its environment.
+- **Where they're kept:** in the database (the `_env` table), as plain text, so [backups](./backups.md) include them. Anyone with the admin key can read them. Names are letters, digits and `_`; values can be up to 64 KB.
 
 ## Behind a reverse proxy
 

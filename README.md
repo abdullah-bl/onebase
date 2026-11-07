@@ -9,7 +9,8 @@ A lightweight, Convex-style reactive backend: TypeScript functions, a typed docu
 - **Batteries included:** sign-in with passwords, OAuth and device codes (for TVs and CLIs), full-text search, optimistic updates, scheduler, cron jobs, file storage, JWT auth (Clerk, Auth0, any OIDC), HTTP routes and pagination.
 - **Components:** mount packages with their own tables, like the built-in rate limiter, aggregate (counts, sums and ranks in O(log n)), sharded counter and work queue, and call them as `ctx.components.limiter.limit({ ... })`, in your transaction. Components can follow your tables through table hooks, with no triggers to wire up.
 - **MCP server built in:** define tools in `onebase/mcp.ts`, and users connect Claude, ChatGPT or Cursor with one URL. OAuth 2.1 sign-in, a consent page you own, scopes and API keys are included. See [MCP](docs/mcp.md).
-- **Dashboard built in** at `/_admin`: browse and edit data, run functions, live logs, jobs and files.
+- **Dashboard built in** at `/_admin`: browse and edit data, run functions, live logs, jobs, files and environment variables.
+- **Environment variables without redeploys:** `onebase env set STRIPE_KEY …` (like `npx convex env set`) or the dashboard. Changes apply on every instance at once.
 - **Your choice of database:** SQLite by default; Postgres, MySQL or Turso (libSQL) when you need several instances. Files on disk or in S3/R2/MinIO, and SQLite backups to S3.
 - **Single file deploy**, PocketBase style.
 

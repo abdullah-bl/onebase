@@ -16,6 +16,7 @@ onebase <command> [flags]
 | `codegen` | Write `onebase/_generated/` (`api.ts`, `server.ts`, `dataModel.ts`) |
 | `doctor` | Check the schema, functions, crons and imports for common mistakes; exits 1 on errors |
 | `deploy` | Push functions (and `public/`) to a running server with no restart; `--dry-run` checks only, `--rollback` goes back one (see [Deployment](./deployment.md#onebase-deploy)) |
+| `env` | Set, list and remove a running server's environment variables without a redeploy, like `npx convex env` (see [env](#env)) |
 | `upgrade` | Replace this binary with the latest release, or `upgrade 0.3.0`, after checking it (see [Upgrading onebase](./deployment.md#upgrading-onebase)); `--check` only looks |
 | `build` | Compile functions and frontend into one executable |
 | `backup` | Take one SQLite snapshot to `--backup` now |
@@ -35,7 +36,7 @@ Each flag can also be set with an environment variable, which can come from a [.
 | `--public <path>` | `./public` if present / `$ONEBASE_PUBLIC` | Static frontend; unknown paths fall back to `index.html`. `deploy` ships it. |
 | `--port <n>` | `8090` / `$PORT` | |
 | `--host <addr>` | `0.0.0.0` / `$ONEBASE_HOST` | |
-| `--url <url>` | `http://localhost:<port>` / `$ONEBASE_URL` | Public URL, used in file URLs. For `deploy`: the server to push to (`$ONEBASE_DEPLOY_URL`). |
+| `--url <url>` | `http://localhost:<port>` / `$ONEBASE_URL` | Public URL, used in file URLs. For `deploy` and `env`: the server to call (`$ONEBASE_DEPLOY_URL`). |
 | `--db <url>` | `<data>/db.sqlite` / `$ONEBASE_DB` / `$DATABASE_URL` | SQLite path, `postgres://…`, `mysql://…`, or `libsql://…` / `https://…` |
 | `--files <s3url>` | local `<data>/files` / `$ONEBASE_FILES` | `s3://bucket/prefix` |
 | `--backup <s3url>` | / `$ONEBASE_BACKUP` | `s3://bucket/prefix` |
@@ -52,6 +53,7 @@ Each flag can also be set with an environment variable, which can come from a [.
 | `--dry-run` | | `deploy`: check the code against the server's data without changing anything |
 | `--rollback` | | `deploy`: go back to the previous deployment |
 | `--env-file <path>` | `.env` files for the command | Read only this file; repeat for several |
+| `--from-file <path>` | | `env set`: set every `NAME=value` in this file |
 | `--out <file>` | `./app` | `build`: output file |
 | `--target <t>` | current platform | `build`: `bun-linux-x64`, `bun-linux-arm64`, `bun-darwin-arm64`, `bun-darwin-x64`, `bun-windows-x64` |
 
@@ -62,13 +64,28 @@ Each flag can also be set with an environment variable, which can come from a [.
 | `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_ENDPOINT`, `S3_REGION` | S3 credentials for `--files` and `--backup` (`AWS_*` equivalents also work) |
 | `TURSO_AUTH_TOKEN` / `LIBSQL_AUTH_TOKEN` | Token for `--db libsql://…` |
 | `ONEBASE_ADMIN_KEY` | Dashboard and deploy key (default: generated into `<data>/admin.key`) |
-| `ONEBASE_DEPLOY_URL`, `ONEBASE_DEPLOY_KEY` | `deploy`: the server, and its admin key. Keep them in `.env.local`. |
+| `ONEBASE_DEPLOY_URL`, `ONEBASE_DEPLOY_KEY` | `deploy` and `env`: the server, and its admin key. Keep them in `.env.local`. |
 | `ONEBASE_QUERY_TIMEOUT`, `ONEBASE_MUTATION_TIMEOUT`, `ONEBASE_ACTION_TIMEOUT` | How long a call may run (default `10s`, `10s`, `10m`; `off` for no limit). See [Time limits](./functions.md#time-limits). |
 | `ONEBASE_MAX_READS`, `ONEBASE_MAX_WRITES`, `ONEBASE_MAX_WRITE_MB`, `ONEBASE_MAX_DOCUMENT_MB` | How much one query or mutation may read and write (default `256000`, `128000`, `128`, `16`; `off` for no limit). See [Read and write limits](./functions.md#read-and-write-limits). |
 | `ONEBASE_QUERY_CACHE_MB` | Memory for repeated query results on SQLite (default `64`; `0` to run every read). See [Repeated reads](./functions.md#repeated-reads). |
 | `ONEBASE_VECTOR_MEMORY_MB` | Memory for SQLite's vector indexes (default `2048`; `0` to search them in SQL). See [Vector search](./vector-search.md#memory-and-threads-on-sqlite). |
 | `ONEBASE_ACTION_WORKERS` | Worker threads for actions (default: one per CPU core, up to 8; `0` runs actions on the main thread). See [Worker threads](./functions.md#worker-threads). |
 | `ONEBASE_VECTOR_WORKERS` | Threads for searching SQLite's vector indexes (default: up to 8, one less than the CPU cores; `0` for the main thread only) |
+
+## env
+
+Your app's environment variables on a running server, stored in its database and applied without a redeploy:
+
+```bash
+onebase env set OPENAI_API_KEY sk-…          # also OPENAI_API_KEY=sk-…
+cat key.txt | onebase env set OPENAI_API_KEY # no value: read from stdin
+onebase env set --from-file .env.production  # every NAME=value in the file
+onebase env list                             # NAME=value, one per line
+onebase env get OPENAI_API_KEY
+onebase env remove OPENAI_API_KEY            # also rm, unset; several names at once
+```
+
+A variable in the server's own environment wins over a stored one, and the command warns when that happens. See [Environment variables on a running server](./deployment.md#environment-variables-on-a-running-server).
 
 ## doctor
 

@@ -7,6 +7,7 @@ import { AuthError, call, connected, getKey, on, setKey, startEvents } from "./a
 import { Palette } from "./palette";
 import { Icon, Toasts, errorText, useLive } from "./ui";
 import { DataView } from "./views/data";
+import { EnvView } from "./views/env";
 import { FilesView } from "./views/files";
 import { FunctionsView } from "./views/functions";
 import { LogsView } from "./views/logs";
@@ -20,6 +21,7 @@ const NAV = [
   { id: "logs", label: "Logs" },
   { id: "scheduler", label: "Scheduler" },
   { id: "files", label: "Files" },
+  { id: "env", label: "Environment" },
 ];
 
 /** The sidebar's problem counts. Its own component, so a refresh doesn't re-render the open page. */
@@ -172,6 +174,7 @@ function App() {
         {page === "logs" && <LogsView scope={rest[0]} fn={rest[1]} go={go} />}
         {page === "scheduler" && <SchedulerView state={rest[0]} go={go} />}
         {page === "files" && <FilesView />}
+        {page === "env" && <EnvView />}
         {!NAV.some((n) => n.id === page) && <OverviewView go={go} />}
       </main>
       {palette && (

@@ -12,6 +12,7 @@
 // answer a ping), otherwise when the others finish.
 
 import { availableParallelism } from "node:os";
+import { SHARE_ENV } from "node:worker_threads";
 import type { UserIdentity } from "../server";
 import { addLine, callLines, type LogLine } from "./calllog";
 import { decodeRefs, fromWire, toWire, type CodeSource, type FromThread, type ToThread, type WireFilter } from "./action-wire";
@@ -78,7 +79,9 @@ class Thread {
     onMessage: (thread: Thread, message: FromThread) => void,
     onExit: (thread: Thread, reason: string) => void,
   ) {
-    this.worker = new Worker(entry);
+    // SHARE_ENV: without it a worker sees only the environment the process started with, not
+    // .env files or variables set later from the dashboard.
+    this.worker = new Worker(entry, { env: SHARE_ENV } as WorkerOptions);
     (this.worker as any).unref(); // an idle worker mustn't keep the process alive
     let settle!: (ok: boolean) => void;
     this.ready = new Promise((resolve) => (settle = resolve));

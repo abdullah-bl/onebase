@@ -7,6 +7,7 @@ import { AuthError, call, connected, getKey, on, setKey, startEvents } from "./a
 import { Palette } from "./palette";
 import { Icon, Toasts, errorText, useLive } from "./ui";
 import { DataView } from "./views/data";
+import { SchemaView } from "./views/schema";
 import { FilesView } from "./views/files";
 import { FunctionsView } from "./views/functions";
 import { LogsView } from "./views/logs";
@@ -16,6 +17,7 @@ import { SchedulerView } from "./views/scheduler";
 const NAV = [
   { id: "overview", label: "Overview" },
   { id: "data", label: "Data" },
+  { id: "schema", label: "Schema" },
   { id: "functions", label: "Functions" },
   { id: "logs", label: "Logs" },
   { id: "scheduler", label: "Scheduler" },
@@ -172,6 +174,7 @@ function App() {
         {page === "logs" && <LogsView scope={rest[0]} fn={rest[1]} go={go} />}
         {page === "scheduler" && <SchedulerView state={rest[0]} go={go} />}
         {page === "files" && <FilesView />}
+        {page === "schema" && <SchemaView go={go} />}
         {!NAV.some((n) => n.id === page) && <OverviewView go={go} />}
       </main>
       {palette && (

@@ -3,7 +3,7 @@
 
 import { functionPathSymbol } from "../api";
 import type { UserIdentity } from "../server";
-import { ConvexError } from "../values";
+import { OneBaseError } from "../values";
 import { OnebaseError } from "./database";
 
 /** Where a worker gets the code it runs: the same code the main thread runs. */
@@ -58,15 +58,15 @@ export type FromThread =
   | { t: "pong"; n: number };
 
 export function toWire(err: unknown): WireError {
-  if (err instanceof ConvexError) return { kind: "convex", message: err.message, data: err.data, stack: err.stack };
+  if (err instanceof OneBaseError) return { kind: "convex", message: err.message, data: err.data, stack: err.stack };
   if (err instanceof OnebaseError) return { kind: "onebase", message: err.message, stack: err.stack };
   if (err instanceof Error) return { kind: "error", message: err.message, stack: err.stack };
   return { kind: "error", message: String(err) };
 }
 
-/** The error again, as the class it was thrown as, so `instanceof ConvexError` and `err.data` still work. */
+/** The error again, as the class it was thrown as, so `instanceof OneBaseError` and `err.data` still work. */
 export function fromWire(wire: WireError): Error {
-  const err = wire.kind === "convex" ? new ConvexError(wire.data) : wire.kind === "onebase" ? new OnebaseError(wire.message) : new Error(wire.message);
+  const err = wire.kind === "convex" ? new OneBaseError(wire.data) : wire.kind === "onebase" ? new OnebaseError(wire.message) : new Error(wire.message);
   if (wire.stack) err.stack = wire.stack;
   return err;
 }

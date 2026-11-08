@@ -9,7 +9,7 @@ import { SubscriptionManager, type QueryUpdate } from "../src/engine/sync";
 import { defineSchema, defineTable, internalAction, internalMutation, mutation, paginationOptsValidator, query } from "../src/server";
 
 let releaseStuck = () => {};
-import { ConvexError, v } from "../src/values";
+import { OneBaseError, v } from "../src/values";
 
 const schema = defineSchema({
   channels: defineTable({ name: v.string() }).index("by_name", ["name"]),
@@ -61,7 +61,7 @@ const modules = {
       handler: async (ctx, { channel }) => {
         await ctx.db.insert("messages", { channel, author: "a", body: "1" } as any);
         await ctx.db.insert("messages", { channel, author: "a", body: "2" } as any);
-        throw new ConvexError("nope");
+        throw new OneBaseError("nope");
       },
     }),
     move: mutation({
@@ -183,7 +183,7 @@ for (const D of DRIVERS) describe(D.name, () => {
 
     test("mutations are atomic", async () => {
       const err = await m("messages:sendTwiceThenFail", { channel: "c" }).catch((e) => e);
-      expect(err).toBeInstanceOf(ConvexError);
+      expect(err).toBeInstanceOf(OneBaseError);
       expect(await q("messages:count")).toBe(0);
     });
 

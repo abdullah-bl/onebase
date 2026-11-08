@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startApp } from "../src/app";
-import { OnebaseClient, OnebaseHttpClient, ConvexError } from "../src/client/index";
+import { OnebaseClient, OnebaseHttpClient, OneBaseError } from "../src/client/index";
 import { loadProject } from "../src/project";
 import { api } from "../examples/chat/onebase/_generated/api";
 
@@ -51,9 +51,9 @@ test("live queries over WebSocket", async () => {
   expect(latest[0]).toMatchObject({ author: "alice", body: "hello" });
   expect(seen.at(-1)).toEqual(["hello"]);
 
-  // ConvexError reaches the client with its message; other errors would be hidden in production.
+  // OneBaseError reaches the client with its message; other errors would be hidden in production.
   const err = await alice.mutation(api.messages.send, { channel, author: "alice", body: "   " }).catch((e) => e);
-  expect(err).toBeInstanceOf(ConvexError);
+  expect(err).toBeInstanceOf(OneBaseError);
   expect(err.message).toBe("Message can't be empty");
 
   const invalid = await alice.mutation(api.messages.send, { channel, author: "alice" } as any).catch((e) => e);

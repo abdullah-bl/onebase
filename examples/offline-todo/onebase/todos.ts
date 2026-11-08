@@ -1,4 +1,4 @@
-import { ConvexError, v } from "onebase/values";
+import { OneBaseError, v } from "onebase/values";
 import { mutation, query } from "./_generated/server";
 
 export const list = query({
@@ -28,7 +28,7 @@ export const add = mutation({
   args: { text: v.string() },
   handler: async (ctx, { text }) => {
     const trimmed = text.trim();
-    if (!trimmed) throw new ConvexError("Write something first");
+    if (!trimmed) throw new OneBaseError("Write something first");
     return await ctx.db.insert("todos", { text: trimmed, done: false });
   },
 });
@@ -37,7 +37,7 @@ export const toggle = mutation({
   args: { id: v.id("todos") },
   handler: async (ctx, { id }) => {
     const todo = await ctx.db.get(id);
-    if (!todo) throw new ConvexError("Already deleted");
+    if (!todo) throw new OneBaseError("Already deleted");
     await ctx.db.patch(id, { done: !todo.done });
   },
 });

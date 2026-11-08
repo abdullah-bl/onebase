@@ -7,7 +7,7 @@ import type { ComponentsDefinition } from "../components";
 import { parseCron } from "../cron";
 import type { SchemaDefinition } from "../schema";
 import { isRegisteredFunction, type CronJob, type HttpAction, type HttpRouter, type RegisteredFunction, type UserIdentity } from "../server";
-import { ConvexError, describeValue, isPlainObject, validate, type AnyValidator } from "../values";
+import { OneBaseError, describeValue, isPlainObject, validate, type AnyValidator } from "../values";
 import { ActionPool, defaultActionWorkers, defaultWorkerEntry } from "./action-pool";
 import type { CodeSource } from "./action-wire";
 import { indexCode, lookupRoute, type MountCode } from "./code";
@@ -232,7 +232,7 @@ export const consoleLogger: Logger = {
 
 /** Errors whose message is safe and useful to show to callers. */
 function isUserFacing(err: unknown): boolean {
-  return err instanceof ConvexError || err instanceof OnebaseError;
+  return err instanceof OneBaseError || err instanceof OnebaseError;
 }
 
 export class FunctionError extends Error {
@@ -1121,7 +1121,7 @@ export class Runtime {
 
   /** Converts any thrown error into what a client may see. */
   toClientError(err: unknown, name?: string): FunctionError {
-    if (err instanceof ConvexError) return new FunctionError(err.message, err.data);
+    if (err instanceof OneBaseError) return new FunctionError(err.message, err.data);
     const message = err instanceof Error ? err.message : String(err);
     if (isUserFacing(err) || this.dev) return new FunctionError(message);
     return new FunctionError(`Server Error${name ? ` in ${name}` : ""}`);

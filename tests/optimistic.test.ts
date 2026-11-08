@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startApp } from "../src/app";
 import { OnebaseClient } from "../src/client/index";
-import { ConvexError, defineSchema, defineTable, mutation, query } from "../src/server";
+import { OneBaseError, defineSchema, defineTable, mutation, query } from "../src/server";
 import { v } from "../src/values";
 
 const schema = defineSchema({ counters: defineTable({ name: v.string(), value: v.number() }).index("by_name", ["name"]) });
@@ -18,7 +18,7 @@ const modules = {
       args: { name: v.string(), by: v.number() },
       handler: async (ctx, { name, by }) => {
         await Bun.sleep(30); // long enough to observe the optimistic value
-        if (by < 0) throw new ConvexError("Counters only go up");
+        if (by < 0) throw new OneBaseError("Counters only go up");
         const doc = await get(ctx, name);
         if (doc) await ctx.db.patch(doc._id, { value: doc.value + by });
         else await ctx.db.insert("counters", { name, value: by });

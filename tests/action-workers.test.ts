@@ -26,7 +26,7 @@ const FILES: Record<string, string> = {
   `,
   "notes.ts": `
     import { action, internalMutation, internalQuery, mutation, query, createFunctionHandle } from "onebase/server";
-    import { ConvexError, v } from "onebase/values";
+    import { OneBaseError, v } from "onebase/values";
     import { api, internal } from "./_generated/api";
 
     export const ping = query({ args: {}, handler: async () => "pong" });
@@ -70,14 +70,14 @@ const FILES: Record<string, string> = {
         const hits = await ctx.vectorSearch("docs", "by_embedding", { vector: [0.1, 1], limit: 5, filter: (q) => q.eq("tag", "a") });
         const identity = await ctx.auth.getUserIdentity();
         let caught = null;
-        try { await ctx.runMutation(api.notes.fail, {}); } catch (err) { caught = { isConvex: err instanceof ConvexError, data: err.data }; }
+        try { await ctx.runMutation(api.notes.fail, {}); } catch (err) { caught = { isConvex: err instanceof OneBaseError, data: err.data }; }
         let noDb = null;
         try { ctx.db; } catch (err) { noDb = err.message; }
         return { id: typeof id, texts, secret, nested, handle: handle.startsWith("function://"), viaHandle, blob: await blob.text(), url: url.includes("/api/storage/"), hits: hits.length, identity: identity?.subject ?? null, caught, noDb };
       },
     });
-    export const fail = mutation({ args: {}, handler: async () => { throw new ConvexError({ code: "nope" }); } });
-    export const throws = action({ args: {}, handler: async () => { throw new ConvexError({ code: 42 }); } });
+    export const fail = mutation({ args: {}, handler: async () => { throw new OneBaseError({ code: "nope" }); } });
+    export const throws = action({ args: {}, handler: async () => { throw new OneBaseError({ code: 42 }); } });
     export const exits = action({ args: {}, handler: async () => { process.exit(1); } });
     export const careless = action({
       args: {},
@@ -206,7 +206,7 @@ test("actions run on workers, and ctx works there as on the main thread", async 
   expect(record?.lines).toContainEqual({ level: "log", text: "from the worker hi" });
 });
 
-test("an action's ConvexError reaches the caller with its data", async () => {
+test("an action's OneBaseError reaches the caller with its data", async () => {
   const err = (await failure(runtime.runAction("notes:throws", {}))) as any;
   expect(err.data).toEqual({ code: 42 });
   expect(runtime.toClientError(err).data).toEqual({ code: 42 });

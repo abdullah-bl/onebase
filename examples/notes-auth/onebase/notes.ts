@@ -1,4 +1,4 @@
-import { ConvexError, v } from "onebase/values";
+import { OneBaseError, v } from "onebase/values";
 import { getAuthUserId, paginationOptsValidator } from "onebase/server";
 import { mutation, query } from "./_generated/server";
 import type { MutationCtx, QueryCtx } from "./_generated/server";
@@ -6,7 +6,7 @@ import type { MutationCtx, QueryCtx } from "./_generated/server";
 /** Returns the caller's user id, or throws if they aren't signed in. */
 async function requireUserId(ctx: QueryCtx | MutationCtx) {
   const userId = await getAuthUserId(ctx);
-  if (!userId) throw new ConvexError("Sign in first");
+  if (!userId) throw new OneBaseError("Sign in first");
   return userId;
 }
 
@@ -68,8 +68,8 @@ export const edit = mutation({
   handler: async (ctx, { id, title, body, pinned }) => {
     const userId = await requireUserId(ctx);
     const note = await ctx.db.get(id);
-    if (!note) throw new ConvexError("Note not found");
-    if (note.owner !== userId) throw new ConvexError("Not your note");
+    if (!note) throw new OneBaseError("Note not found");
+    if (note.owner !== userId) throw new OneBaseError("Not your note");
     // patch merges shallowly; fields set to undefined are removed, so only
     // pass the ones that were actually sent.
     const changes: { title?: string; body?: string; pinned?: boolean } = {};
@@ -86,7 +86,7 @@ export const remove = mutation({
     const userId = await requireUserId(ctx);
     const note = await ctx.db.get(id);
     if (!note) return;
-    if (note.owner !== userId) throw new ConvexError("Not your note");
+    if (note.owner !== userId) throw new OneBaseError("Not your note");
     await ctx.db.delete(id);
   },
 });

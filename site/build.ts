@@ -5,23 +5,34 @@
 import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createHighlighter } from "shiki";
+import { COMPONENTS_REPO, componentsCheckout, loadComponents, packageNames, publishedOnNpm, type ComponentDoc } from "./components";
 
 const ROOT = join(import.meta.dir, "..");
 const OUT = join(import.meta.dir, "dist");
 /** Asset URL with a content hash, so a browser never keeps an old stylesheet or script after a change. */
 const asset = (file: string) => `assets/${file}?v=${Bun.hash(readFileSync(join(import.meta.dir, "assets", file))).toString(36)}`;
 const REPO = "https://github.com/abdullah-bl/onebase";
+/** The deployed site's address, for canonical URLs, Open Graph tags and the sitemap. */
+const SITE_URL = (process.env.SITE_URL ?? "https://abdullah-bl.github.io/onebase/").replace(/\/?$/, "/");
+const TAGLINE = "TypeScript functions, a typed document database and live queries. A Convex-style API that runs as a single binary on SQLite, Postgres or Turso.";
 const VERSION = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")).version as string;
+
+// The optional component packages from onebase-components, read from a checkout of it.
+const checkout = componentsCheckout(join(import.meta.dir, ".components"));
+if (!checkout && process.env.CI) throw new Error("site: no onebase-components checkout; the Pages workflow should check it out into site/.components");
+const COMPONENTS: ComponentDoc[] = checkout ? loadComponents(checkout.dir, await publishedOnNpm(packageNames(checkout.dir))) : [];
+const componentBySlug = new Map(COMPONENTS.map((c) => [c.slug, c]));
 
 const NAV: { title: string; pages: string[] }[] = [
   { title: "Getting started", pages: ["index", "getting-started"] },
   { title: "Guides", pages: ["schema", "functions", "database", "search", "vector-search", "client", "client-protocol", "swift", "scheduling", "file-storage", "auth", "http-actions", "mcp"] },
   { title: "Components", pages: ["components", "rate-limiter", "aggregate", "sharded-counter", "work-queue", "migrations", "workflow", "rag", "agent", "presence", "action-cache", "components-authoring"] },
+  ...(COMPONENTS.length ? [{ title: "Component packages", pages: COMPONENTS.map((c) => c.slug) }] : []),
   { title: "Operations", pages: ["deployment", "dashboard", "databases", "backups", "cli"] },
   { title: "Reference", pages: ["convex", "benchmarks", "how-it-works", "llm-guide"] },
 ];
 
-type Page = { slug: string; title: string; heading: string; description: string; markdown: string; html: string; toc: { id: string; text: string; level: number }[] };
+type Page = { slug: string; title: string; heading: string; description: string; markdown: string; html: string; toc: { id: string; text: string; level: number }[]; component?: ComponentDoc };
 
 /** Code themes in the site's own teal: one ink, with keywords, strings, functions and comments told apart. */
 function codeTheme(name: string, type: "light" | "dark", c: Record<string, string>) {
@@ -66,8 +77,16 @@ function parseFrontmatter(src: string) {
   return { meta, body: m ? src.slice(m[0].length) : src };
 }
 
+/** First paragraph of a page as plain text, for a meta description when the page has none. */
+const firstParagraph = (html: string) => stripTags(/<p>([\s\S]*?)<\/p>/.exec(html)?.[1] ?? "").replace(/\s+/g, " ").trim();
+const clip = (s: string, n = 160) => (s.length <= n ? s : s.slice(0, s.lastIndexOf(" ", n - 1)) + "…");
+
+/** Links to a package in onebase-components become links to its page here. */
+const componentLink = new RegExp(`href="${COMPONENTS_REPO.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")}/tree/main/packages/([\\w-]+)/?"`, "g");
+
 function render(slug: string): Page {
-  const src = readFileSync(join(ROOT, "docs", `${slug}.md`), "utf8");
+  const component = componentBySlug.get(slug);
+  const src = component ? component.markdown : readFileSync(join(ROOT, "docs", `${slug}.md`), "utf8");
   const { meta, body } = parseFrontmatter(src);
   let html = Bun.markdown.html(body);
   let heading = meta.title ?? slug;
@@ -99,6 +118,7 @@ function render(slug: string): Page {
 
   html = html
     .replace(/href="\.\/([\w-]+)\.md(#[\w-]+)?"/g, (_m, page: string, hash = "") => `href="./${page === "index" ? "index" : page}.html${hash}"`)
+    .replace(componentLink, (m, pkg: string) => (componentBySlug.has(pkg) ? `href="./${pkg}.html"` : m))
     .replace(/<a href="(https?:\/\/[^"]+)"/g, '<a href="$1" target="_blank" rel="noopener"')
     .split(/(<pre[\s\S]*?<\/pre>)/)
     .map((part) => (part.startsWith("<pre") ? part : part.replace(/✓/g, '<span class="yes" role="img" aria-label="Yes"></span>'))) // taste-skill-ignore: turns check marks into dots
@@ -106,7 +126,8 @@ function render(slug: string): Page {
     .replace(/<table>/g, '<div class="table-wrap"><table>')
     .replace(/<\/table>/g, "</table></div>");
 
-  return { slug, title: meta.title ?? slug, heading, description: meta.description ?? "", markdown: body, html, toc };
+  const description = meta.description || clip(firstParagraph(html));
+  return { slug, title: meta.title ?? slug, heading, description, markdown: body, html, toc, component };
 }
 
 const LOGO = `<svg class="logo-mark" viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="5" fill="currentColor"/><circle cx="16" cy="16" r="10.5" fill="none" stroke="currentColor" stroke-width="2" opacity=".55"/><circle cx="16" cy="16" r="15" fill="none" stroke="currentColor" stroke-width="1.5" opacity=".22"/></svg>`;
@@ -121,10 +142,19 @@ const THEME_BOOT = `<script>document.documentElement.classList.add("js");try{var
 
 const ARROW = `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h15M13 5l7 7-7 7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 
-function head(title: string, description: string, prefix: string) {
+/** Every page's <head>: title, description, canonical URL, Open Graph and Twitter tags, optional JSON-LD. */
+function head(o: { title: string; description: string; prefix: string; path: string; type: "website" | "article"; jsonLd?: object[] }) {
+  const { title, description, prefix } = o;
+  const url = SITE_URL + o.path;
+  const t = escape(title), d = escape(description);
+  const ld = (o.jsonLd ?? []).map((x) => `<script type="application/ld+json">${JSON.stringify(x).replace(/</g, "\\u003c")}</script>`).join("");
   return `<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${escape(title)}</title><meta name="description" content="${escape(description)}">
-<meta property="og:title" content="${escape(title)}"><meta property="og:description" content="${escape(description)}">
+<title>${t}</title><meta name="description" content="${d}">
+<link rel="canonical" href="${url}">
+<meta property="og:type" content="${o.type}"><meta property="og:site_name" content="OneBase"><meta property="og:locale" content="en_US">
+<meta property="og:url" content="${url}"><meta property="og:title" content="${t}"><meta property="og:description" content="${d}">
+<meta name="twitter:card" content="summary"><meta name="twitter:title" content="${t}"><meta name="twitter:description" content="${d}">
+<link rel="alternate" type="text/plain" href="${prefix}llms.txt" title="llms.txt">${ld}
 <meta name="theme-color" content="#ffffff">
 <link rel="icon" href="${prefix}assets/favicon.svg" type="image/svg+xml">${FONTS}
 <link rel="stylesheet" href="${prefix}${asset("style.css")}">${THEME_BOOT}`;
@@ -143,7 +173,7 @@ function header(prefix: string, active: "home" | "docs", slug = "") {
       <a href="${prefix}docs/benchmarks.html"${cur("benchmarks")}>Benchmarks</a>
     </nav>
     <div class="topbar-actions">
-      ${active === "docs" ? `<button class="search-btn" type="button" data-search-open><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="m16 16 4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg><span>Search the docs</span><kbd>/</kbd></button>` : ""}
+      ${`<button class="search-btn" type="button" data-search-open><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="m16 16 4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg><span>Search the docs</span><kbd>/</kbd></button>`}
       <button class="icon-btn" type="button" aria-label="Toggle dark mode" data-theme-toggle>${ICON_THEME}</button>
       <a class="icon-btn" href="${REPO}" target="_blank" rel="noopener" aria-label="OneBase on GitHub">${ICON_GITHUB}</a>
       ${active === "home" ? `<a class="btn primary get" href="${prefix}docs/getting-started.html">Get started</a>` : ""}
@@ -198,7 +228,14 @@ function docPage(page: Page, pages: Map<string, Page>) {
     ${sections.length ? `<div class="n-toc"><p>On that page</p><ul>${sections.map((t) => `<li><a href="./${target!.slug}.html#${t.id}">${escape(t.text)}</a></li>`).join("")}</ul></div>` : ""}
   </div></section>`;
   return `<!doctype html>
-<html lang="en"><head>${head(`${page.title} · OneBase docs`, page.description, "../")}</head>
+<html lang="en"><head>${head({
+    title: page.component ? `${page.title}: optional component · OneBase` : `${page.title} · OneBase docs`,
+    description: page.description,
+    prefix: "../",
+    path: `docs/${page.slug}.html`,
+    type: "article",
+    jsonLd: [breadcrumbs(page)],
+  })}</head>
 <body class="docs-body" data-root="../">
 ${header("../", "docs", page.slug)}
 <div class="wrap docs-layout">
@@ -211,7 +248,9 @@ ${header("../", "docs", page.slug)}
       <div class="doc-actions">
         <button class="chip primary" type="button" data-copy-md="./${page.slug}.md">Copy as Markdown</button>
         <a class="chip" href="./${page.slug}.md">View as Markdown</a>
-        <a class="chip" href="${REPO}/edit/main/docs/${page.slug}.md" target="_blank" rel="noopener">Edit on GitHub</a>
+        ${page.component
+          ? `<a class="chip" href="${page.component.editUrl}" target="_blank" rel="noopener">${page.component.fromReadme ? "Edit on GitHub" : "Source on GitHub"}</a>`
+          : `<a class="chip" href="${REPO}/edit/main/docs/${page.slug}.md" target="_blank" rel="noopener">Edit on GitHub</a>`}
       </div>
     </header>
     ${tocMobile}
@@ -221,17 +260,43 @@ ${header("../", "docs", page.slug)}
 </div>
 ${nextBand}
 ${footer("../")}
-<div class="search" data-search hidden>
-  <div class="search-backdrop" data-search-close></div>
-  <div class="search-panel" role="dialog" aria-modal="true" aria-label="Search docs">
-    <input type="search" placeholder="Search the docs…" autocomplete="off" spellcheck="false" aria-label="Search the docs" data-search-input>
-    <ul class="search-results" data-search-results></ul>
-  </div>
-</div>
+${searchDialog("../")}
 <script src="../${asset("site.js")}" defer></script>
 </body></html>`;
 }
 
+/** The search dialog; site.js loads docs/search.json the first time it opens. */
+const searchDialog = (prefix: string) => `<div class="search" data-search data-search-index="${prefix}docs/search.json" hidden>
+  <div class="search-backdrop" data-search-close></div>
+  <div class="search-panel" role="dialog" aria-modal="true" aria-label="Search docs">
+    <input type="search" placeholder="Search the docs and components…" autocomplete="off" spellcheck="false" aria-label="Search the docs and components" data-search-input>
+    <ul class="search-results" data-search-results></ul>
+  </div>
+</div>`;
+
+/** Home › Docs › page, for search results that show where a page sits. */
+function breadcrumbs(page: Page) {
+  const items = [
+    ["OneBase", SITE_URL],
+    ["Docs", `${SITE_URL}docs/index.html`],
+    ...(page.slug === "index" ? [] : [[page.title, `${SITE_URL}docs/${page.slug}.html`]]),
+  ];
+  return {
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    itemListElement: items.map(([name, item], i) => ({ "@type": "ListItem", position: i + 1, name, item })),
+  };
+}
+
+/** Headings must not skip a level (h2 → h4) and a page has exactly one h1. */
+function checkHeadings(name: string, html: string) {
+  const levels = [...html.matchAll(/<h([1-6])[\s>]/g)].map((m) => Number(m[1]));
+  const h1 = levels.filter((l) => l === 1).length;
+  if (h1 !== 1) throw new Error(`site: ${name} has ${h1} <h1> elements`);
+  for (let i = 1; i < levels.length; i++) {
+    if (levels[i]! > levels[i - 1]! + 1) throw new Error(`site: ${name} jumps from <h${levels[i - 1]}> to <h${levels[i]}>`);
+  }
+}
 
 /** Splits each page at h2 headings into search entries. */
 function searchIndex(pages: Page[]) {
@@ -240,12 +305,17 @@ function searchIndex(pages: Page[]) {
     const parts = p.html.split(/(?=<h2 id=")/);
     for (const part of parts) {
       const m = /<h2 id="([^"]+)">([\s\S]*?)<\/h2>/.exec(part);
-      const text = stripTags(part.replace(/<h[12][^>]*>[\s\S]*?<\/h[12]>/g, " ").replace(/<button[\s\S]*?<\/button>/g, " "))
+      const text = stripTags(
+        part
+          .replace(/<h[12][^>]*>[\s\S]*?<\/h[12]>/g, " ")
+          .replace(/<button[\s\S]*?<\/button>/g, " ")
+          .replace(/<\/(p|li|td|th|tr|pre|div|h[3-6])>|<br\s*\/?>/g, " "), // keep words in separate cells and lines apart
+      )
         .replace(/\s+/g, " ")
         .trim()
         .slice(0, 4000);
       entries.push({
-        page: p.title,
+        page: p.component ? `${p.title} (component package)` : p.title,
         heading: m ? stripTags(m[2]!).replace(/^#/, "") : p.title,
         url: `./${p.slug}.html${m ? `#${m[1]}` : ""}`,
         text,
@@ -261,9 +331,19 @@ rmSync(OUT, { recursive: true, force: true });
 mkdirSync(join(OUT, "docs"), { recursive: true });
 cpSync(join(import.meta.dir, "assets"), join(OUT, "assets"), { recursive: true });
 
-const pages = new Map(NAV.flatMap((s) => s.pages).map((slug) => [slug, render(slug)]));
+const slugs = NAV.flatMap((s) => s.pages);
+const clash = COMPONENTS.find((c) => slugs.indexOf(c.slug) !== slugs.lastIndexOf(c.slug));
+if (clash) throw new Error(`site: component package "${clash.slug}" has the same name as a docs page`);
+const pages = new Map(slugs.map((slug) => [slug, render(slug)]));
+const titles = new Map<string, string>();
 for (const page of pages.values()) {
-  writeFileSync(join(OUT, "docs", `${page.slug}.html`), docPage(page, pages));
+  const html = docPage(page, pages);
+  checkHeadings(`docs/${page.slug}.html`, html);
+  const title = /<title>([\s\S]*?)<\/title>/.exec(html)![1]!;
+  if (titles.has(title)) throw new Error(`site: docs/${page.slug}.html and ${titles.get(title)} share the title "${title}"`);
+  titles.set(title, `docs/${page.slug}.html`);
+  if (!page.description) throw new Error(`site: docs/${page.slug}.html has no description`);
+  writeFileSync(join(OUT, "docs", `${page.slug}.html`), html);
 }
 writeFileSync(join(OUT, "docs", "search.json"), JSON.stringify(searchIndex([...pages.values()])));
 
@@ -281,8 +361,29 @@ for (const p of all) writeFileSync(join(OUT, "docs", `${p.slug}.md`), p.markdown
 const landing = readFileSync(join(import.meta.dir, "index.html"), "utf8")
   .replace('src="assets/site.js"', `src="${asset("site.js")}"`)
   .replace('src="assets/landing.js"', `src="${asset("landing.js")}"`)
-  .replace("<!--HEAD-->", head("OneBase: the reactive backend in one file", "TypeScript functions, a typed document database and live queries. A Convex-style API that runs as a single binary on SQLite, Postgres or Turso.", ""))
+  .replace("<!--HEAD-->", head({
+    title: "OneBase: the reactive backend in one file",
+    description: TAGLINE,
+    prefix: "",
+    path: "",
+    type: "website",
+    jsonLd: [{
+      "@context": "https://schema.org",
+      "@type": "SoftwareSourceCode",
+      name: "OneBase",
+      description: TAGLINE,
+      url: SITE_URL,
+      codeRepository: REPO,
+      programmingLanguage: { "@type": "ComputerLanguage", name: "TypeScript" },
+      runtimePlatform: "Bun",
+      license: "https://opensource.org/licenses/MIT",
+      version: VERSION,
+      keywords: "reactive backend, Convex, Bun, SQLite, TypeScript, live queries",
+      documentation: `${SITE_URL}docs/index.html`,
+    }],
+  }))
   .replace("<!--HEADER-->", header("", "home"))
+  .replace("<!--SEARCH-->", searchDialog(""))
   .replace("<!--FOOTER-->", footer(""))
   .replace(/<!--VERSION-->/g, VERSION)
   .replace(/<!--REPO-->/g, REPO);
@@ -290,7 +391,20 @@ const highlightBlocks = (html: string) =>
   html.replace(/<pre data-lang="(\w+)">([\s\S]*?)<\/pre>/g, (_m, lang: string, code: string) =>
     highlighter.codeToHtml(unescape(code).replace(/^\n|\n\s*$/g, ""), { lang, themes: THEMES, defaultColor: false }),
   );
-writeFileSync(join(OUT, "index.html"), highlightBlocks(landing));
+const landingHtml = highlightBlocks(landing);
+checkHeadings("index.html", landingHtml);
+writeFileSync(join(OUT, "index.html"), landingHtml);
 writeFileSync(join(OUT, ".nojekyll"), "");
 
-console.log(`site: ${pages.size} docs pages + landing → ${OUT}`);
+// Search engines. robots.txt only counts at a host's root, so on a project site
+// (user.github.io/onebase/) crawlers find the sitemap through Search Console instead.
+const urls = ["", ...slugs.map((s) => `docs/${s}.html`)];
+writeFileSync(
+  join(OUT, "sitemap.xml"),
+  `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${urls
+    .map((u) => `  <url><loc>${SITE_URL}${u}</loc></url>`)
+    .join("\n")}\n</urlset>\n`,
+);
+writeFileSync(join(OUT, "robots.txt"), `User-agent: *\nAllow: /\n\nSitemap: ${SITE_URL}sitemap.xml\n`);
+
+console.log(`site: ${pages.size} docs pages (${COMPONENTS.length} component packages${checkout ? ` from onebase-components@${checkout.commit.slice(0, 7)}` : ""}) + landing → ${OUT}`);

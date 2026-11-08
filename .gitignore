@@ -37,3 +37,6 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 onebase_data
 .onebase
 conv_data
+
+# site build: checkout of github.com/abdullah-bl/onebase-components
+site/.components

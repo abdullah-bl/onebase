@@ -164,6 +164,8 @@ export function counter<const N extends string>(opts: { names: N[] } & Config & 
 
 A component is an ordinary npm package that imports `onebase/components`, `onebase/server` and `onebase/values`. List `onebase` as a peer dependency: the server provides those modules itself, also to code pushed with `onebase deploy` and inside compiled binaries.
 
+The packages in [onebase-components](https://github.com/abdullah-bl/onebase-components) are published this way, one package per component. [`@onebase/teams`](https://github.com/abdullah-bl/onebase-components/tree/main/packages/teams) is a short one to copy from.
+
 ## Building one with an AI agent
 
 The `build-onebase-component` skill walks an agent through writing, mounting and testing a component. For Claude Code:

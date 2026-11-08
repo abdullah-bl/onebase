@@ -262,6 +262,7 @@ await ctx.components.limiter.limit({ name: "send", key: userId, throws: true });
 - Background jobs with limited parallelism or retries: `workQueue({ maxParallelism, retry: { maxAttempts } })` from `onebase/components/work-queue`, then `ctx.components.queue.enqueueAction({ fn: internal.x.y, args, onComplete: internal.x.done })`; `onComplete` takes `args: onCompleteArgs(v.object({ ... }))` (or `onCompleteValidator` for any context).
 - Counters written by many requests at once: `shardedCounter()` from `onebase/components/sharded-counter`, then `ctx.components.counter.inc({ name })` and `.count({ name })`.
 - Components get `ctx.auth` only when mounted with `auth: true`.
+- Optional packages, each installed on its own, live in [onebase-components](https://github.com/abdullah-bl/onebase-components): `@onebase/teams`, `@onebase/app-store`, `@onebase/entitlements`, `@onebase/push`, `@onebase/email` and `@onebase/notifications`. Mount them like the built-in ones.
 - Counts, sums and ranks over a table: mount `aggregate({ table: "scores", sortKey: (d: Doc<"scores">) => d.points })` from `onebase/components/aggregate` (it follows the table by itself), then `ctx.components.leaderboard.count()`, `.sum()`, `.indexOf({ key, order: "desc" })`, `.at({ index })`. Don't count with `.collect().length` on large tables.
 
 ## Differences from Convex

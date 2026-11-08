@@ -148,6 +148,19 @@ Renaming a mount is like removing one and adding another: the new name starts wi
 | [Presence](./presence.md) | `onebase/components/presence` | Who's online per room, with heartbeats and live lists |
 | [Action cache](./action-cache.md) | `onebase/components/action-cache` | A TTL cache for expensive actions, with deduped concurrent runs |
 
+## Optional component packages
+
+These live in their own repository, [onebase-components](https://github.com/abdullah-bl/onebase-components), as separate packages: install only the ones your app uses.
+
+| Package | |
+|---|---|
+| [`@onebase/teams`](https://github.com/abdullah-bl/onebase-components/tree/main/packages/teams) | Teams with opt-in roles (`owner`, `admin`, `member` by default) |
+| [`@onebase/app-store`](https://github.com/abdullah-bl/onebase-components/tree/main/packages/app-store) | Apple App Store billing: signed notifications, StoreKit 2 transaction sync, subscription state |
+| [`@onebase/entitlements`](https://github.com/abdullah-bl/onebase-components/tree/main/packages/entitlements) | Plans, limits and usage per user or team, which App Store events can drive |
+| [`@onebase/push`](https://github.com/abdullah-bl/onebase-components/tree/main/packages/push) | Push notifications over APNs and FCM, with a device registry and dead-token cleanup |
+| [`@onebase/email`](https://github.com/abdullah-bl/onebase-components/tree/main/packages/email) | Email over Resend, Postmark or SMTP, and a ready `sendCode` for [password auth](./auth.md) |
+| [`@onebase/notifications`](https://github.com/abdullah-bl/onebase-components/tree/main/packages/notifications) | An in-app notification feed with live queries and an optional email channel |
+
 To write your own, see [Writing components](./components-authoring.md).
 
 ## Notes

@@ -8,6 +8,12 @@
     "url": "git+https://github.com/abdullah-bl/onebase.git"
   },
   "homepage": "https://abdullah-bl.github.io/onebase/",
+  "files": [
+    "src",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
   "type": "module",
   "module": "src/server.ts",
   "bin": {
@@ -38,9 +44,8 @@
   "engines": {
     "bun": ">=1.4.4"
   },
-  "private": true,
   "devDependencies": {
-    "@types/bun": "latest",
+    "@types/bun": "1.4.4",
     "@types/react": "19",
     "preact": "10",
     "react": "19",

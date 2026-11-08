@@ -148,6 +148,8 @@ function stableStringify(value: unknown): string {
 
 const subKey = (path: string, args: unknown) => `${path}|${stableStringify(args ?? {})}`;
 
+const isRecord = (value: unknown): value is Record<string, any> => typeof value === "object" && value !== null && !Array.isArray(value);
+
 function toError(msg: { error: string; data?: unknown }): Error {
   return msg.data !== undefined && msg.data !== null ? new ConvexError(msg.error, msg.data) : new Error(msg.error);
 }
@@ -274,7 +276,7 @@ export class OnebaseClient {
       for (const sub of this.subs.values()) sub.sent = false;
       void this.authenticate();
     };
-    ws.onmessage = (event) => this.handle(JSON.parse(String(event.data)));
+    ws.onmessage = (event) => this.receive(event.data);
     ws.onclose = () => {
       if (this.ws !== ws) return;
       this.ws = null;
@@ -349,11 +351,35 @@ export class OnebaseClient {
     if (this._state !== "open") this.setState("open");
   }
 
-  private handle(msg: any) {
+  /**
+   * One frame from the server. Anything that isn't a message this client understands (protocol
+   * skew across a deploy, a proxy answering on the same path, a truncated frame) is skipped with
+   * a warning instead of throwing out of the socket handler.
+   */
+  private receive(data: unknown) {
+    let msg: any;
+    try {
+      msg = JSON.parse(String(data));
+    } catch {
+      return console.warn("onebase: ignored a message from the server that isn't JSON.");
+    }
+    if (!isRecord(msg)) return console.warn("onebase: ignored a message from the server that isn't an object.");
+    try {
+      this.handle(msg);
+    } catch (err) {
+      console.error(`onebase: handling a "${String(msg.type)}" message from the server failed.`, err);
+    }
+  }
+
+  private handle(msg: Record<string, any>) {
     if (msg.type === "update") this.apply([msg], []);
     else if (msg.type === "result") this.apply([], [msg]);
-    else if (msg.type === "transition") this.apply(msg.updates, msg.results);
-    else if (msg.type === "auth") this.onAuthAnswer(msg);
+    else if (msg.type === "transition") {
+      if (!Array.isArray(msg.updates) || !Array.isArray(msg.results)) {
+        return console.warn("onebase: ignored a transition from the server without updates and results lists.");
+      }
+      this.apply(msg.updates, msg.results);
+    } else if (msg.type === "auth") this.onAuthAnswer(msg as any);
   }
 
   private onAuthAnswer(msg: { ok: boolean; ended?: boolean; identity?: unknown; error?: string }) {
@@ -741,36 +767,46 @@ export class OnebaseClient {
    * together with the updates that reflect it, so its optimistic update is dropped exactly when
    * the real data arrives.
    */
-  private apply(updates: any[], results: any[]) {
+  private apply(updates: unknown[], results: unknown[]) {
     const settled: [Pending, any][] = [];
     for (const r of results) {
-      const p = this.pending.get(r.requestId);
+      if (!isRecord(r)) continue;
+      const p = this.pending.get(r.requestId as number);
       if (!p) continue;
-      this.pending.delete(r.requestId);
+      this.pending.delete(r.requestId as number);
       settled.push([p, r]);
     }
-    const finished = settled.map(([p]) => p.layer).filter((l): l is Layer => Boolean(l));
-    if (finished.length) this.layers = this.layers.filter((l) => !finished.includes(l));
-    const changed = new Set<Sub>();
-    for (const u of updates) {
-      const sub = this.subsById.get(u.id);
-      if (!sub) continue;
-      sub.server = u.ok ? { ok: true, value: u.value } : { ok: false, error: toError(u) };
-      if (u.ok) this.cacheResult(sub.key, u.value);
-      changed.add(sub);
-    }
-    if (this.layers.length || finished.length) {
-      this.applyLayers();
-    } else {
-      for (const sub of changed) {
-        sub.last = sub.server;
-        for (const l of sub.listeners) l(sub.last);
+    // Every call taken off `pending` above is settled below, even if applying the updates or a
+    // listener throws: otherwise its promise would never resolve or reject.
+    try {
+      const finished = settled.map(([p]) => p.layer).filter((l): l is Layer => Boolean(l));
+      if (finished.length) this.layers = this.layers.filter((l) => !finished.includes(l));
+      const changed = new Set<Sub>();
+      for (const u of updates) {
+        if (!isRecord(u)) continue;
+        const sub = this.subsById.get(u.id as number);
+        if (!sub) continue;
+        sub.server = u.ok ? { ok: true, value: u.value } : { ok: false, error: toError(u as any) };
+        if (u.ok) this.cacheResult(sub.key, u.value);
+        changed.add(sub);
       }
-    }
-    for (const [p, r] of settled) {
-      if (p.outbox) this.outboxDone(p.outbox);
-      if (r.ok) p.resolve(r.value);
-      else p.reject(toError(r));
+      if (this.layers.length || finished.length) {
+        this.applyLayers();
+      } else {
+        for (const sub of changed) {
+          sub.last = sub.server;
+          for (const l of sub.listeners) l(sub.last);
+        }
+      }
+    } finally {
+      for (const [p, r] of settled) {
+        try {
+          if (p.outbox) this.outboxDone(p.outbox);
+        } finally {
+          if (r.ok) p.resolve(r.value);
+          else p.reject(toError(r));
+        }
+      }
     }
   }
 

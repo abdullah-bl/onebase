@@ -82,3 +82,75 @@ describe("auth tokens reach the server before anything that depends on them", ()
     client.close();
   });
 });
+
+describe("frames the client doesn't understand never strand a call", () => {
+  /** A socket the test plays the server for: it sees what the client sends and pushes raw frames back. */
+  class FakeSocket {
+    static last: FakeSocket;
+    readyState = 0;
+    sent: any[] = [];
+    onopen: (() => void) | null = null;
+    onmessage: ((e: { data: string }) => void) | null = null;
+    onclose: (() => void) | null = null;
+    constructor(_url: string) {
+      FakeSocket.last = this;
+      queueMicrotask(() => {
+        this.readyState = 1;
+        this.onopen?.();
+      });
+    }
+    send(text: string) {
+      this.sent.push(JSON.parse(text));
+    }
+    close() {}
+    push(frame: unknown) {
+      this.onmessage!({ data: typeof frame === "string" ? frame : JSON.stringify(frame) });
+    }
+  }
+
+  const connect = async () => {
+    const client = new OnebaseClient("http://onebase.test", { webSocketConstructor: FakeSocket as any });
+    await Bun.sleep(0);
+    return { client, ws: FakeSocket.last };
+  };
+  const callId = (ws: FakeSocket) => ws.sent.find((m) => m.type === "call").requestId;
+  const quietly = async <T>(fn: () => Promise<T>) => {
+    const { warn, error } = console;
+    console.warn = console.error = () => {};
+    try {
+      return await fn();
+    } finally {
+      Object.assign(console, { warn, error });
+    }
+  };
+
+  test("non-JSON, non-object and malformed transition frames are skipped; the real answer still lands", async () => {
+    await quietly(async () => {
+      const { client, ws } = await connect();
+      const done = client.mutation("notes:add", {});
+      await Bun.sleep(0);
+      const requestId = callId(ws);
+      for (const frame of ["not json", "null", "[1,2]", "42", { type: "transition", updates: {}, results: {} }, { type: "transition", updates: [null, 3], results: [null, "x"] }]) {
+        expect(() => ws.push(frame)).not.toThrow();
+      }
+      ws.push({ type: "result", requestId, ok: true, value: "saved" });
+      expect(await done).toBe("saved");
+      client.close();
+    });
+  });
+
+  test("a listener that throws while a transition applies still settles the mutation in it", async () => {
+    await quietly(async () => {
+      const { client, ws } = await connect();
+      client.onUpdate("notes:list", {}, () => {
+        throw new Error("render failed");
+      });
+      const done = client.mutation("notes:add", {});
+      await Bun.sleep(0);
+      const sub = ws.sent.find((m) => m.type === "sub");
+      ws.push({ type: "transition", updates: [{ type: "update", id: sub.id, ok: true, value: [1] }], results: [{ type: "result", requestId: callId(ws), ok: true, value: "saved" }] });
+      expect(await Promise.race([done, Bun.sleep(200).then(() => "STILL PENDING")])).toBe("saved");
+      client.close();
+    });
+  });
+});

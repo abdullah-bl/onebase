@@ -8,7 +8,7 @@
         "@libsql/client": "^0.18.0",
       },
       "devDependencies": {
-        "@types/bun": "latest",
+        "@types/bun": "1.4.4",
         "@types/react": "19",
         "preact": "10",
         "react": "19",

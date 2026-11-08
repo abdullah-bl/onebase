@@ -88,7 +88,7 @@
     update();
   }
 
-  // Search over docs/search.json.
+  // Search over docs/search.json, a static index the site build writes.
   const search = $("[data-search]");
   if (search) {
     const input = $("[data-search-input]");
@@ -105,7 +105,12 @@
       search.hidden = false;
       input.focus();
       input.select();
-      index ??= await fetch("./search.json").then((r) => r.json()).catch(() => []);
+      if (!index) {
+        // Entry URLs are relative to docs/, where the index lives; resolve them for this page.
+        const src = new URL(search.dataset.searchIndex || "./search.json", location.href);
+        index = await fetch(src).then((r) => r.json()).catch(() => []);
+        for (const e of index) e.url = new URL(e.url, src).href;
+      }
       run();
     };
     const close = () => { search.hidden = true; };

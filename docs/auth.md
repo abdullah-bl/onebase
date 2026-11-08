@@ -126,6 +126,8 @@ export default {
 
 `sendCode` runs on the server. Its second argument has `runQuery`, `runMutation` and `runAction`, so it can also call an internal action that sends the email: `sendCode: (message, ctx) => ctx.runAction(internal.emails.sendCode, message)`.
 
+To skip writing the request yourself, the [`@onebase/email`](https://github.com/abdullah-bl/onebase-components/tree/main/packages/email) package has `createSendCode`, which sends the code over Resend, Postmark or SMTP with default templates.
+
 **Resetting a password** takes two calls:
 
 ```ts

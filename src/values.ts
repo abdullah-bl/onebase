@@ -180,11 +180,11 @@ export function asObjectValidator(args: PropertyValidators | AnyValidator): AnyV
  * Throw this for errors the client should see (e.g. "Not allowed").
  * Other errors are hidden from clients in production.
  */
-export class ConvexError<Data = string> extends Error {
+export class OneBaseError<Data = string> extends Error {
   readonly data: Data;
   constructor(data: Data) {
     super(typeof data === "string" ? data : JSON.stringify(data));
-    this.name = "ConvexError";
+    this.name = "OneBaseError";
     this.data = data;
   }
 }

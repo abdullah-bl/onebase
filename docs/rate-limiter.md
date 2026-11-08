@@ -35,9 +35,9 @@ export const send = mutation({
   args: { body: v.string() },
   handler: async (ctx, { body }) => {
     const userId = await getAuthUserId(ctx);
-    if (!userId) throw new ConvexError("Sign in first");
+    if (!userId) throw new OneBaseError("Sign in first");
     const { ok, retryAfter } = await ctx.components.limiter.limit({ name: "sendMessage", key: userId });
-    if (!ok) throw new ConvexError(`Slow down: try again in ${Math.ceil(retryAfter / 1000)}s.`);
+    if (!ok) throw new OneBaseError(`Slow down: try again in ${Math.ceil(retryAfter / 1000)}s.`);
     await ctx.db.insert("messages", { body, author: userId });
   },
 });
@@ -49,7 +49,7 @@ Or let it throw, and the whole mutation is rolled back:
 await ctx.components.limiter.limit({ name: "sendMessage", key: userId, throws: true });
 ```
 
-It throws a `ConvexError` whose `data` is `{ kind: "RateLimited", name, retryAfter }`. Clients get that `data` with the error, and `isRateLimitError(err)` (from `onebase/components/rate-limiter`) recognizes it on the server.
+It throws a `OneBaseError` whose `data` is `{ kind: "RateLimited", name, retryAfter }`. Clients get that `data` with the error, and `isRateLimitError(err)` (from `onebase/components/rate-limiter`) recognizes it on the server.
 
 ## Functions
 

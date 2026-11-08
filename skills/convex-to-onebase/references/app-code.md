@@ -28,7 +28,7 @@ These need no change:
 - the table-first forms `ctx.db.get("table", id)`, `patch("table", id, v)`, `replace("table", id, v)` and `delete("table", id)`, as well as the id-only forms
 - `ctx.scheduler`, `cronJobs()`, `httpRouter` / `httpAction`
 - `ctx.storage`, `ctx.auth.getUserIdentity()`, `ctx.vectorSearch`
-- `ConvexError`, `paginationOptsValidator`, `createFunctionHandle`
+- `OneBaseError (ConvexError in Convex)`, `paginationOptsValidator`, `createFunctionHandle`
 - `useQuery`, `useMutation`, `useAction`, `usePaginatedQuery`, and optimistic updates
 
 ## Differences to handle

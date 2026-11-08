@@ -1,4 +1,4 @@
-import { ConvexError, v } from "onebase/values";
+import { OneBaseError, v } from "onebase/values";
 import { action, mutation, query } from "./_generated/server";
 import { internal } from "./_generated/api";
 
@@ -19,7 +19,7 @@ function embed(text: string): number[] {
     vector[Math.abs(hash) % 64]! += 1;
   }
   const norm = Math.sqrt(vector.reduce((sum, x) => sum + x * x, 0));
-  if (!norm) throw new ConvexError("Write some words to embed");
+  if (!norm) throw new OneBaseError("Write some words to embed");
   return vector.map((x) => x / norm);
 }
 

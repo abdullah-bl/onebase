@@ -265,5 +265,5 @@ systemctl restart onebase # or however you run it
 - **Before deploying:** run `onebase doctor` (`onebase deploy` runs it for you), and try a risky schema change with `onebase deploy --dry-run`.
 - **Behind a proxy:** pass `--trust-proxy` so `--rate-limit` counts real client IPs.
 - **Dashboard:** keep the admin key secret, or block `/_admin` at the proxy (see [Dashboard](./dashboard.md)).
-- **Errors:** in production (no `--dev`), unexpected errors reach clients as `Server Error`. Use `ConvexError` for messages users should see.
+- **Errors:** in production (no `--dev`), unexpected errors reach clients as `Server Error`. Use `OneBaseError` for messages users should see.
 - **Memory:** expect about 40 MB at startup with SQLite; Postgres adds a few MB for its connection pool.

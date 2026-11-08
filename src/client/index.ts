@@ -14,13 +14,13 @@ import {
 export { anyApi, getFunctionName } from "../api";
 export type { FunctionArgs, FunctionReference, FunctionReturnType } from "../api";
 
-export class ConvexError<Data = unknown> extends Error {
+export class OneBaseError<Data = unknown> extends Error {
   constructor(
     message: string,
     readonly data: Data,
   ) {
     super(message);
-    this.name = "ConvexError";
+    this.name = "OneBaseError";
   }
 }
 
@@ -151,7 +151,7 @@ const subKey = (path: string, args: unknown) => `${path}|${stableStringify(args 
 const isRecord = (value: unknown): value is Record<string, any> => typeof value === "object" && value !== null && !Array.isArray(value);
 
 function toError(msg: { error: string; data?: unknown }): Error {
-  return msg.data !== undefined && msg.data !== null ? new ConvexError(msg.error, msg.data) : new Error(msg.error);
+  return msg.data !== undefined && msg.data !== null ? new OneBaseError(msg.error, msg.data) : new Error(msg.error);
 }
 
 const browserLocation = (globalThis as { location?: { href: string; origin: string } }).location;

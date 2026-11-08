@@ -44,14 +44,14 @@ A query that reads the clock or a random source (`Date.now()`, `new Date()`, `Ma
 Mutations write data in a transaction: either all of their writes happen, or none do.
 
 ```ts
-import { ConvexError, v } from "onebase/values";
+import { OneBaseError, v } from "onebase/values";
 import { mutation } from "./_generated/server";
 
 export const publish = mutation({
   args: { id: v.id("posts") },
   handler: async (ctx, { id }) => {
     const post = await ctx.db.get(id);
-    if (!post) throw new ConvexError("Post not found");
+    if (!post) throw new OneBaseError("Post not found");
     await ctx.db.patch(id, { published: true });
   },
 });
@@ -93,7 +93,7 @@ A worker runs several actions at once, since most of them spend their time waiti
 Each worker loads its own copy of your code: the functions folder, or the bundle from `onebase deploy`. So:
 
 - **Top-level code runs once per worker**, and once on the main thread. A variable at the top of a file isn't shared between workers, or with queries and mutations.
-- **Values are copied between threads.** Arguments, return values and everything passed to `ctx` must be plain values, `Blob`s, `Date`s or typed arrays. Class instances arrive as plain objects, and functions can't be passed at all. Errors keep their message, and a `ConvexError` keeps its `data`.
+- **Values are copied between threads.** Arguments, return values and everything passed to `ctx` must be plain values, `Blob`s, `Date`s or typed arrays. Class instances arrive as plain objects, and functions can't be passed at all. Errors keep their message, and a `OneBaseError` keeps its `data`.
 - **Await every `ctx` call.** One still running when its action returns fails with an error, as on Convex.
 - **An HTTP action gets its request body in full** before it starts. Its response body streams back.
 
@@ -123,7 +123,7 @@ Use `args: {}` for functions that take no arguments. `onebase doctor` warns abou
 
 ## Errors
 
-`throw new ConvexError("message")`, or `new ConvexError({ code: "LIMIT", max: 5 })`, for errors the caller should see. The client receives the message and the `data`.
+`throw new OneBaseError("message")`, or `new OneBaseError({ code: "LIMIT", max: 5 })`, for errors the caller should see. The client receives the message and the `data`.
 
 Any other error appears as `Server Error` to clients in production; the full message is logged on the server. In `onebase dev` every message is shown.
 

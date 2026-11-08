@@ -1,4 +1,4 @@
-import { ConvexError, v } from "onebase/values";
+import { OneBaseError, v } from "onebase/values";
 import { mutation, query } from "./_generated/server";
 
 export const listOptions = query({
@@ -52,7 +52,7 @@ export const vote = mutation({
   args: { option: v.id("options"), voter: v.string() },
   handler: async (ctx, { option, voter }) => {
     const { ok, retryAfter } = await ctx.components.limiter.limit({ name: "vote", key: voter });
-    if (!ok) throw new ConvexError(`Slow down: your next vote is ready in ${Math.ceil(retryAfter / 1000)}s.`);
+    if (!ok) throw new OneBaseError(`Slow down: your next vote is ready in ${Math.ceil(retryAfter / 1000)}s.`);
     await ctx.db.insert("votes", { option, voter });
     await ctx.components.counter.inc({ name: "votes" });
     return await ctx.components.pollCounts.count({ namespace: option });

@@ -88,7 +88,7 @@ the moment the real data arrives, with no flicker.
 - **Calls are at-most-once per send.** If the connection drops before an answer, the call may
   or may not have run; report it, never re-send it silently. Offline queues (below) persist a
   mutation *until it is first sent*, then follow this same rule.
-- **Errors from `ConvexError` are user-facing;** anything else the server may replace with
+- **Errors from `OneBaseError` are user-facing;** anything else the server may replace with
   `Server Error` outside dev mode.
 - **Ordering:** messages are processed in order; a client that sends `auth` → `sub`s → queued
   calls on reconnect sees them applied in that order.

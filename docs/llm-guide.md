@@ -73,14 +73,14 @@ export const byAuthor = query({
 ## Mutations (transactional writes)
 
 ```ts
-import { ConvexError, v } from "onebase/values";
+import { OneBaseError, v } from "onebase/values";
 import { mutation } from "./_generated/server";
 
 export const publish = mutation({
   args: { id: v.id("posts") },
   handler: async (ctx, { id }) => {
     const post = await ctx.db.get(id);
-    if (!post) throw new ConvexError("Post not found");
+    if (!post) throw new OneBaseError("Post not found");
     await ctx.db.patch(id, { published: true });
   },
 });
@@ -88,7 +88,7 @@ export const publish = mutation({
 
 - `insert(table, doc)` returns the id. `patch(id, fields)` does a shallow merge (a field set to `undefined` is removed). `replace(id, doc)` swaps the whole document. `delete(id)` removes it.
 - A mutation is all-or-nothing: if it throws, none of its writes happen.
-- `throw new ConvexError("message")` for errors the user should see. Other errors show as "Server Error" in production.
+- `throw new OneBaseError("message")` for errors the user should see. Other errors show as "Server Error" in production.
 - `ctx.runQuery` and `ctx.runMutation` run inside the same transaction. `ctx.scheduler.runAfter(ms, internal.x.y, args)` schedules work that only happens if the mutation commits.
 
 ## Actions (side effects: fetch, npm packages, AI calls)

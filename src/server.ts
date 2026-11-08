@@ -28,7 +28,7 @@ export type { FunctionArgs, FunctionHandle, FunctionReference, FunctionReturnTyp
 export { defineSchema, defineTable } from "./schema";
 import { defineTable } from "./schema";
 export type { DataModelFromSchema } from "./schema";
-export { ConvexError, v } from "./values";
+export { OneBaseError, v } from "./values";
 export type { GenericId, Infer } from "./values";
 import { v } from "./values";
 

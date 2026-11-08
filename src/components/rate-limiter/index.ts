@@ -10,7 +10,7 @@
 
 import { componentServer, defineComponent, splitMountOptions, type ComponentFn, type MountOptions, type Mount } from "..";
 import { defineSchema, defineTable, type DataModelFromSchema } from "../../schema";
-import { ConvexError, v } from "../../values";
+import { OneBaseError, v } from "../../values";
 import { checkRateLimitConfig, currentValue, shardConfig, take, type RateLimitConfig, type RateLimitResult, type RateLimitState } from "./algorithm";
 
 export { DAY, HOUR, MINUTE, SECOND } from "./algorithm";
@@ -82,7 +82,7 @@ const limit = mutation({
       if (row) await ctx.db.patch(row._id, state);
       else await ctx.db.insert("rateLimits", { name: args.name, key: args.key, shard, ...state });
     }
-    if (!result.ok && args.throws) throw new ConvexError({ kind: "RateLimited", name: args.name, retryAfter: result.retryAfter });
+    if (!result.ok && args.throws) throw new OneBaseError({ kind: "RateLimited", name: args.name, retryAfter: result.retryAfter });
     return result;
   },
 });
@@ -98,7 +98,7 @@ const check = query({
     const shard = Math.floor(Math.random() * (config.shards ?? 1));
     const row = await shardRow(ctx, args.name, args.key, shard);
     const { result } = take(shardConfig(config), asState(row), { count, reserve, now: Date.now() });
-    if (!result.ok && args.throws) throw new ConvexError({ kind: "RateLimited", name: args.name, retryAfter: result.retryAfter });
+    if (!result.ok && args.throws) throw new OneBaseError({ kind: "RateLimited", name: args.name, retryAfter: result.retryAfter });
     return result;
   },
 });
@@ -168,6 +168,6 @@ export function rateLimiter<const R extends Record<string, RateLimitConfig>, con
 export type RateLimitErrorData = { kind: "RateLimited"; name: string; retryAfter: number };
 
 /** True for the error limit({ throws: true }) throws; its `data` says which limit and when to retry. */
-export function isRateLimitError(err: unknown): err is ConvexError<RateLimitErrorData> {
-  return err instanceof ConvexError && (err.data as RateLimitErrorData | undefined)?.kind === "RateLimited";
+export function isRateLimitError(err: unknown): err is OneBaseError<RateLimitErrorData> {
+  return err instanceof OneBaseError && (err.data as RateLimitErrorData | undefined)?.kind === "RateLimited";
 }

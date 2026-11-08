@@ -82,7 +82,10 @@ const firstParagraph = (html: string) => stripTags(/<p>([\s\S]*?)<\/p>/.exec(htm
 const clip = (s: string, n = 160) => (s.length <= n ? s : s.slice(0, s.lastIndexOf(" ", n - 1)) + "…");
 
 /** Links to a package in onebase-components become links to its page here. */
-const componentLink = new RegExp(`href="${COMPONENTS_REPO.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")}/tree/main/packages/([\\w-]+)/?"`, "g");
+const reEscape = (s: string) => s.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+const componentLink = new RegExp(`href="${reEscape(COMPONENTS_REPO)}/(?:tree|blob)/main/packages/([\\w-]+)(?:/|/README\\.md)?"`, "g");
+/** Links from a component README to this site's own docs pages. */
+const siteDocLink = new RegExp(`href="${reEscape(SITE_URL)}docs/([\\w-]+)\\.html(#[\\w-]+)?"`, "g");
 
 function render(slug: string): Page {
   const component = componentBySlug.get(slug);
@@ -119,6 +122,7 @@ function render(slug: string): Page {
   html = html
     .replace(/href="\.\/([\w-]+)\.md(#[\w-]+)?"/g, (_m, page: string, hash = "") => `href="./${page === "index" ? "index" : page}.html${hash}"`)
     .replace(componentLink, (m, pkg: string) => (componentBySlug.has(pkg) ? `href="./${pkg}.html"` : m))
+    .replace(siteDocLink, (_m, page: string, hash = "") => `href="./${page}.html${hash}"`)
     .replace(/<a href="(https?:\/\/[^"]+)"/g, '<a href="$1" target="_blank" rel="noopener"')
     .split(/(<pre[\s\S]*?<\/pre>)/)
     .map((part) => (part.startsWith("<pre") ? part : part.replace(/✓/g, '<span class="yes" role="img" aria-label="Yes"></span>'))) // taste-skill-ignore: turns check marks into dots

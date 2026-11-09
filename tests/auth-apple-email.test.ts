@@ -99,6 +99,7 @@ describe("Sign in with Apple and email codes", () => {
       hostname: "127.0.0.1",
       dev: false,
       quiet: true,
+      trustProxy: true,
       http: router,
       auth: {
         methods: [
@@ -367,6 +368,20 @@ describe("Sign in with Apple and email codes", () => {
       expect((await post("signin", { provider: "email", params: { flow: "nope", email: "x@example.com" } })).status).toBe(400);
       let last = 0;
       for (let i = 0; i < 7; i++) last = (await start("flood@example.com")).status;
+      expect(last).toBe(429);
+    });
+
+    test("behind a proxy that sets Fly-Client-IP, rotating X-Forwarded-For does not dodge the guess limit", async () => {
+      await start("rotate@example.com");
+      let last = 0;
+      for (let i = 0; i < 12; i++) {
+        const res = await fetch(`${base}/api/auth/signin`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "fly-client-ip": "203.0.113.9", "x-forwarded-for": `198.51.100.${i + 1}` },
+          body: JSON.stringify({ provider: "email", params: { flow: "verify", email: "rotate@example.com", code: "000000" } }),
+        });
+        last = res.status;
+      }
       expect(last).toBe(429);
     });
 

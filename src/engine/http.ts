@@ -404,6 +404,8 @@ export function serve(opts: ServeOptions): Server<SocketData> {
           const identity = await identityFromRequest(req);
           return await runtime.runHttpAction(route.handler.handler, req, identity, route.mount);
         } catch (err) {
+          // A bad or expired session token is the caller's problem, not a server error.
+          if (err instanceof AuthError) return new Response(err.message, { status: err.status });
           runtime.log.error(`HTTP ${req.method} ${path}: ${err instanceof Error ? err.message : String(err)}`);
           return new Response(runtime.toClientError(err).message, { status: 500 });
         }

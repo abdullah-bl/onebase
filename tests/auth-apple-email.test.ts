@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startApp } from "../src/app";
 import { apple, emailCode, password } from "../src/auth";
-import { authTables, defineSchema, defineTable, getAuthUserId, query } from "../src/server";
+import { authTables, defineSchema, defineTable, getAuthUserId, httpAction, httpRouter, query } from "../src/server";
 import { v } from "../src/values";
 
 const BUNDLE = "studio.shasha.app";
@@ -72,6 +72,13 @@ async function fakeApple() {
   return { url: `http://127.0.0.1:${server.port}/keys`, server, sign, identity, pair };
 }
 
+const router = httpRouter();
+router.route({
+  method: "GET",
+  path: "/hello",
+  handler: httpAction(async (ctx) => new Response((await ctx.auth.getUserIdentity())?.subject ?? "anonymous")),
+});
+
 type Sent = { email: string; code: string; purpose: string };
 
 describe("Sign in with Apple and email codes", () => {
@@ -92,6 +99,7 @@ describe("Sign in with Apple and email codes", () => {
       hostname: "127.0.0.1",
       dev: false,
       quiet: true,
+      http: router,
       auth: {
         methods: [
           apple({
@@ -137,6 +145,17 @@ describe("Sign in with Apple and email codes", () => {
     });
     return ((await res.json()) as any).value;
   };
+
+  test("an HTTP route answers 401, not 500, for an invalid or signed-out session token", async () => {
+    const hello = (token?: string) => fetch(`${base}/hello`, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+    expect(await (await hello()).text()).toBe("anonymous");
+    expect((await hello("ob_s_unknown")).status).toBe(401);
+    expect((await hello("some-random-token")).status).toBe(401);
+    const res = await appleSignIn(await fake.identity({ sub: "apple-http" }));
+    expect((await hello(res.body.token)).status).toBe(200);
+    await post("signout", {}, res.body.token);
+    expect((await hello(res.body.token)).status).toBe(401);
+  });
 
   test("lists the methods", async () => {
     const res = await fetch(`${base}/api/auth/methods`);

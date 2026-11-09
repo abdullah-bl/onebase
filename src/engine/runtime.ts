@@ -967,6 +967,7 @@ export class Runtime {
     if (this.auth && token.startsWith(SESSION_PREFIX)) return this.auth.identifySession(token);
     // An agent's token is good for its tools at /mcp and nothing else.
     if (isMcpToken(token)) throw new AuthError("This is an MCP token: it only works at /mcp.", 401);
+    if (!this.authenticate && this.auth) throw new AuthError("This isn't a valid session token. Sign in again.", 401);
     if (!this.authenticate) {
       throw new OnebaseError(
         "A client sent an auth token, but auth.config.ts has no sign-in methods, providers or authenticate(token, ctx) to check it.",

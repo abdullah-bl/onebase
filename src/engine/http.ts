@@ -19,8 +19,11 @@ export type ServeOptions = {
   cors?: string[] | null;
   /** Per-IP limit on function calls, subscriptions and uploads. */
   rateLimit?: RateLimit | null;
-  /** Take the client IP from X-Forwarded-For (behind a reverse proxy). */
-  trustProxy?: boolean;
+  /**
+   * Take the client IP from X-Forwarded-For (behind a reverse proxy). `true` or a number: how many
+   * proxies in front of the server append to X-Forwarded-For (default 1). See forwardedClient.
+   */
+  trustProxy?: boolean | number;
   /** Handles /_admin requests (the dashboard). */
   admin?: ((req: Request, url: URL) => Promise<Response> | Response) | null;
   /** How often open connections re-check their auth token, in ms (default 60s; 0 disables). */
@@ -28,6 +31,45 @@ export type ServeOptions = {
   /** Largest request body, in bytes: uploads and everything else (default DEFAULT_MAX_BODY_BYTES, 1 GB). */
   maxBodyBytes?: number;
 };
+
+/**
+ * The client address from an X-Forwarded-For value, given how many proxies in front of the server
+ * append to it (`hops`). Proxies append the address they got the request from, so the entries a
+ * client sent itself come first: the client is the `hops`-th entry from the right, never the
+ * leftmost (which is whatever the client wrote). A header with fewer entries than hops gives the
+ * leftmost one, as a proxy that overwrites the header leaves a single entry.
+ */
+export function forwardedClient(header: string | null | undefined, hops = 1): string | null {
+  const entries = (header ?? "").split(",").map((e) => e.trim()).filter(Boolean);
+  if (!entries.length) return null;
+  return entries[Math.max(0, entries.length - Math.max(1, hops))]!;
+}
+
+/**
+ * The key a client's address is counted under. An IPv6 user usually controls a whole /64 (and can
+ * pick any address in it), so IPv6 addresses count per /64; IPv4-mapped IPv6 addresses count as the
+ * IPv4 address. Anything that doesn't parse as IPv6 (IPv4, "unknown") is used as is.
+ */
+export function networkKey(address: string): string {
+  let ip = address.trim().toLowerCase();
+  if (ip.startsWith("[")) ip = ip.slice(1, ip.indexOf("]") > 0 ? ip.indexOf("]") : undefined);
+  ip = ip.replace(/%.*$/, ""); // zone id
+  if (!ip.includes(":")) return address.trim();
+  const mapped = /^(?:0*:)*:?ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(ip) ?? /^::(\d+\.\d+\.\d+\.\d+)$/.exec(ip);
+  if (mapped) return mapped[1]!;
+  const halves = ip.split("::");
+  if (halves.length > 2) return address.trim();
+  const head = halves[0] ? halves[0].split(":") : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  // An embedded IPv4 tail takes two groups.
+  if (tail.length && tail[tail.length - 1]!.includes(".")) tail.splice(tail.length - 1, 1, "0", "0");
+  if (head.length && head[head.length - 1]!.includes(".")) head.splice(head.length - 1, 1, "0", "0");
+  const missing = 8 - head.length - tail.length;
+  if (missing < 0 || (halves.length === 1 && missing !== 0)) return address.trim();
+  const groups = [...head, ...Array(missing).fill("0"), ...tail];
+  if (!groups.every((g) => /^[0-9a-f]{1,4}$/.test(g))) return address.trim();
+  return `${groups.slice(0, 4).map((g) => parseInt(g, 16).toString(16)).join(":")}::/64`;
+}
 
 /** The largest request body (and so upload) a server accepts unless told otherwise: 1 GB. */
 export const DEFAULT_MAX_BODY_BYTES = 2 ** 30;
@@ -181,15 +223,19 @@ export function serve(opts: ServeOptions): Server<SocketData> {
   const json = (req: Request, body: unknown, status = 200, headers: Record<string, string> = {}) =>
     jsonText(req, JSON.stringify(body), status, headers);
 
+  const proxyHops = opts.trustProxy === true ? 1 : typeof opts.trustProxy === "number" && opts.trustProxy > 0 ? Math.floor(opts.trustProxy) : 0;
+
+  /** The client's network, the key for rate limits and sign-in lockouts (an IPv6 /64, see networkKey). */
   const clientIp = (req: Request, server: Server<SocketData>) => {
-    if (opts.trustProxy) {
-      // On Fly (which sets FLY_APP_NAME) the edge sets Fly-Client-IP itself, while X-Forwarded-For can start with
-      // whatever the client sent. Anywhere else Fly-Client-IP is just a header the client chose, so it's ignored.
+    if (proxyHops) {
+      // On Fly (which sets FLY_APP_NAME) the edge sets Fly-Client-IP itself. Anywhere else
+      // Fly-Client-IP is just a header the client chose, so it's ignored.
       const fly = process.env.FLY_APP_NAME ? req.headers.get("Fly-Client-IP")?.trim() : undefined;
-      const forwarded = fly || req.headers.get("X-Forwarded-For")?.split(",")[0]?.trim() || req.headers.get("X-Real-IP");
-      if (forwarded) return forwarded;
+      // X-Real-IP only when there's no X-Forwarded-For: a proxy that sets it (nginx) overwrites it.
+      const forwarded = fly || forwardedClient(req.headers.get("X-Forwarded-For"), proxyHops) || req.headers.get("X-Real-IP")?.trim();
+      if (forwarded) return networkKey(forwarded);
     }
-    return server.requestIP(cappedRequests.get(req)?.original ?? req)?.address ?? "unknown";
+    return networkKey(server.requestIP(cappedRequests.get(req)?.original ?? req)?.address ?? "unknown");
   };
 
   /** Null if allowed, otherwise the error to send. */

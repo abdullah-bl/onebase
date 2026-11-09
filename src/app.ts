@@ -60,7 +60,8 @@ export type AppOptions = {
   cors?: string[];
   /** Per-IP limit on function calls, subscriptions and uploads. */
   rateLimit?: RateLimit | null;
-  trustProxy?: boolean;
+  /** Read the client IP from X-Forwarded-For: true (one proxy) or how many proxies append to it. */
+  trustProxy?: boolean | number;
   /** Largest request body (and so upload), in bytes (default 1 GB). */
   maxBodyBytes?: number;
   /** How often open connections re-check their auth token, in ms (default 60s; 0 disables). */

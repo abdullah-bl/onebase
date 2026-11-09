@@ -133,3 +133,58 @@ for (const D of DRIVERS) describe(`${D.name}: presence`, () => {
     expect((await list("lobby"))[0]!.online).toBe(true);
   });
 });
+
+// Mounted as the docs show for browser clients: exposed, with auth. The user is the caller.
+const exposed = defineComponents({ here: presence({ auth: true, expose: ["heartbeat", "list"] }) });
+
+for (const D of DRIVERS) describe(`${D.name}: presence exposed with auth`, () => {
+  let dir: string;
+  let driver: Driver;
+  let runtime: Runtime;
+  const ada = { subject: "user_ada", tokenIdentifier: "onebase|user_ada" };
+
+  beforeEach(async () => {
+    dir = mkdtempSync(join(tmpdir(), "onebase-presence-auth-"));
+    ({ driver, runtime } = await openRuntime(() => D.make(dir), { schema, modules: {}, components: exposed as any }));
+  });
+  afterEach(async () => {
+    runtime.stop();
+    await driver.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const heartbeat = (args: Record<string, unknown>, identity?: typeof ada) =>
+    runtime.runMutation("components/here:heartbeat", { room: "doc1", sessionId: "s1", ...args }, identity ? { identity } : {});
+  const list = async () => (await runtime.runQuery("components/here:list", { room: "doc1" })).value as any[];
+
+  test("the user is the caller's identity", async () => {
+    await heartbeat({}, ada);
+    expect((await list()).map((e) => e.user)).toEqual(["user_ada"]);
+    // Passing your own id is fine.
+    await heartbeat({ user: "user_ada" }, ada);
+    expect((await list()).map((e) => e.user)).toEqual(["user_ada"]);
+  });
+
+  test("a client can't appear as someone else", async () => {
+    await expect(heartbeat({ user: "user_bob" }, ada)).rejects.toThrow("must be the signed-in user");
+    // Nor, signed out, as anyone at all.
+    await expect(heartbeat({ user: "user_bob" })).rejects.toThrow("sign in first");
+    await expect(heartbeat({})).rejects.toThrow("sign in first");
+    expect(await list()).toEqual([]);
+  });
+});
+
+test("without auth, heartbeat needs the user from the app", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "onebase-presence-noauth-"));
+  const { driver, runtime } = await openRuntime(() => DRIVERS[0]!.make(dir), { schema, modules, components: components as any });
+  try {
+    await expect(runtime.runMutation("admin:heartbeat", { room: "lobby", sessionId: "s1" } as any)).rejects.toThrow();
+    await expect(runtime.runMutation("components/here:heartbeat", { room: "lobby", sessionId: "s1" }, { allowInternal: true, source: "dashboard" })).rejects.toThrow(
+      "pass `user`",
+    );
+  } finally {
+    runtime.stop();
+    await driver.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

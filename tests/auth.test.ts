@@ -275,7 +275,7 @@ for (const DB of DATABASES) describe(`${DB.name}: built-in auth`, () => {
 
     const other = (await signUp("deleted@example.com")).body;
     await app.runtime.runMutation("auth:deleteUser", { id: other.userId });
-    expect((await ask("auth:whoami", other.token)).error).toContain("no longer exists");
+    expect((await ask("auth:whoami", other.token)).error).toContain("signed out");
     expect((await signUp("deleted@example.com")).status).toBe(200); // the email is free again
   });
 

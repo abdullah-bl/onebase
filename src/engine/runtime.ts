@@ -1136,7 +1136,7 @@ export class Runtime {
 
   private warn = (message: string) => this.log.warn(message);
 
-  private newDb(tx: Exec, extra: { readSet?: ReadSet; writes?: Write[]; budget?: CallBudget }, scope = TableScope.app) {
+  private newDb(tx: Exec, extra: { readSet?: ReadSet; writes?: Write[]; budget?: CallBudget; revokeSessions?: (ids: string[]) => void }, scope = TableScope.app) {
     return new DatabaseImpl({
       tx,
       dialect: this.driver.dialect,
@@ -1568,7 +1568,7 @@ export class Runtime {
       const state: TxState = { tx, db: undefined as any, writes: [], scheduled: false, afterCommit: [], revoked: [], hookCursors: new Map() };
       // The system's own writes (dashboard, auth) have no budget; a function's count from scratch on each attempt.
       const budget = limit ? new CallBudget(limit, "mutation", this.callLimits) : undefined;
-      state.db = this.newDb(tx, { writes: state.writes, budget }, scope);
+      state.db = this.newDb(tx, { writes: state.writes, budget, revokeSessions: (ids) => void state.revoked.push(...ids) }, scope);
       const value = await body(state);
       // Nothing commits before every table hook has seen every write.
       await this.flushHooks(state);

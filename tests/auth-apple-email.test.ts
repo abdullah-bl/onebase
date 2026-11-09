@@ -269,6 +269,32 @@ describe("Sign in with Apple and email codes", () => {
       expect(b.body.userId).not.toBe(a.body.userId);
     });
 
+    test("deleting a user leaves no sign-in behind: sessions, accounts, codes and counts with their email", async () => {
+      const email = "forget@example.com";
+      await post("signin", { provider: "email", params: { flow: "start", email } });
+      const code = sent.findLast((m) => m.email === email)!.code;
+      const mail = await post("signin", { provider: "email", params: { flow: "verify", email, code } });
+      const viaApple = await appleSignIn(await fake.identity({ sub: "apple-forget", email }));
+      expect(viaApple.body.userId).toBe(mail.body.userId);
+      await post("signin", { provider: "email", params: { flow: "start", email } }); // leaves a code and a count behind
+      const rows = () =>
+        app.runtime.adminRead(async (_db: any, tx: any) => ({
+          sessions: await tx.all("SELECT id FROM _auth_sessions WHERE user_id = ?", [mail.body.userId]),
+          accounts: await tx.all("SELECT provider FROM _auth_accounts WHERE user_id = ?", [mail.body.userId]),
+          codes: await tx.all("SELECT kind FROM _auth_codes WHERE kind LIKE ?", [`%${email}%`]),
+          counts: await tx.all("SELECT \"key\" FROM _auth_attempts WHERE \"key\" LIKE ?", [`%${email}%`]),
+        }));
+      const before = await rows();
+      expect(before.sessions.length).toBe(2);
+      expect(before.accounts.map((a: any) => a.provider).sort()).toEqual(["apple", "email"]);
+      expect(before.codes.length + before.counts.length).toBeGreaterThan(0);
+      await app.runtime.adminWrite((db: any) => db.delete(mail.body.userId));
+      expect(await me(mail.body.token)).toBeUndefined();
+      expect(await me(viaApple.body.token)).toBeUndefined();
+      const after = await rows();
+      expect(after).toEqual({ sessions: [], accounts: [], codes: [], counts: [] });
+    });
+
     test("repeated bad tokens from one network are limited, and a good sign-in is not held back before that", async () => {
       const bad = { idToken: "bad.token.here", nonce: "n".repeat(20) };
       let last = 0;

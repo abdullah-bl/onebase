@@ -60,6 +60,8 @@ export type OAuthMethod = {
 /** What an ID-token or email-code sign-in tells `profile` about a new user. */
 export type NewUserInfo = {
   provider: string;
+  /** The account's id at the provider: Apple's `sub`, the email address for email codes. */
+  accountId: string;
   email?: string;
   emailVerified: boolean;
   name?: string;

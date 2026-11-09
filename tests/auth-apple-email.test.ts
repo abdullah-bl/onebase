@@ -19,6 +19,7 @@ const schema = defineSchema({
     emailVerificationTime: v.optional(v.number()),
     plan: v.string(),
     accountToken: v.string(),
+    appleSub: v.optional(v.string()),
   }).index("email", ["email"]),
 });
 void authTables;
@@ -106,7 +107,7 @@ describe("Sign in with Apple and email codes", () => {
           apple({
             clientId: BUNDLE,
             jwksUrl: fake.url,
-            profile: (info) => ({ plan: "free", accountToken: crypto.randomUUID(), ...(info.params.locale ? {} : {}) }),
+            profile: (info) => ({ plan: "free", accountToken: crypto.randomUUID(), ...(info.provider === "apple" ? { appleSub: info.accountId } : {}) }),
           }),
           emailCode({
             codeLength: 6,
@@ -173,6 +174,7 @@ describe("Sign in with Apple and email codes", () => {
       const user = await me(res.body.token);
       expect(user).toMatchObject({ email: "new1@example.com", name: "New One", plan: "free" });
       expect(user.accountToken).toMatch(/^[0-9a-f-]{36}$/);
+      expect(user.appleSub).toBe("apple-new-1");
       expect(typeof user.emailVerificationTime).toBe("number");
     });
 

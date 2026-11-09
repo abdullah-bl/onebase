@@ -751,7 +751,7 @@ export class AuthService {
         userId = sameEmail.find((u) => typeof u.emailVerificationTime === "number")?._id ?? null;
       }
       userId ??= await db.insert("users", {
-        ...(newUser?.({ provider: providerId, email, emailVerified: verified, name: profile.name, params }) ?? {}),
+        ...(newUser?.({ provider: providerId, accountId: profile.id, email, emailVerified: verified, name: profile.name, params }) ?? {}),
         ...this.fitUsers({ email, name: profile.name, image: profile.image, emailVerificationTime: verified ? Date.now() : undefined }),
       });
       await tx.run("INSERT INTO _auth_accounts (provider, account_id, user_id, secret, created) VALUES (?, ?, ?, NULL, ?)", [

@@ -967,6 +967,7 @@ export class Runtime {
     if (this.auth && token.startsWith(SESSION_PREFIX)) return this.auth.identifySession(token);
     // An agent's token is good for its tools at /mcp and nothing else.
     if (isMcpToken(token)) throw new AuthError("This is an MCP token: it only works at /mcp.", 401);
+    if (!this.authenticate && this.auth) throw new AuthError("This isn't a valid session token. Sign in again.", 401);
     if (!this.authenticate) {
       throw new OnebaseError(
         "A client sent an auth token, but auth.config.ts has no sign-in methods, providers or authenticate(token, ctx) to check it.",
@@ -1135,7 +1136,7 @@ export class Runtime {
 
   private warn = (message: string) => this.log.warn(message);
 
-  private newDb(tx: Exec, extra: { readSet?: ReadSet; writes?: Write[]; budget?: CallBudget }, scope = TableScope.app) {
+  private newDb(tx: Exec, extra: { readSet?: ReadSet; writes?: Write[]; budget?: CallBudget; revokeSessions?: (ids: string[]) => void }, scope = TableScope.app) {
     return new DatabaseImpl({
       tx,
       dialect: this.driver.dialect,
@@ -1567,7 +1568,7 @@ export class Runtime {
       const state: TxState = { tx, db: undefined as any, writes: [], scheduled: false, afterCommit: [], revoked: [], hookCursors: new Map() };
       // The system's own writes (dashboard, auth) have no budget; a function's count from scratch on each attempt.
       const budget = limit ? new CallBudget(limit, "mutation", this.callLimits) : undefined;
-      state.db = this.newDb(tx, { writes: state.writes, budget }, scope);
+      state.db = this.newDb(tx, { writes: state.writes, budget, revokeSessions: (ids) => void state.revoked.push(...ids) }, scope);
       const value = await body(state);
       // Nothing commits before every table hook has seen every write.
       await this.flushHooks(state);

@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startApp } from "../src/app";
-import { oauth, password } from "../src/auth";
+import { emailCode, oauth, password } from "../src/auth";
 import { OnebaseClient, type AuthStorage } from "../src/client/index";
 import { AuthService, sha256 } from "../src/engine/auth";
 import { createDriver } from "../src/engine/driver";
@@ -275,7 +275,7 @@ for (const DB of DATABASES) describe(`${DB.name}: built-in auth`, () => {
 
     const other = (await signUp("deleted@example.com")).body;
     await app.runtime.runMutation("auth:deleteUser", { id: other.userId });
-    expect((await ask("auth:whoami", other.token)).error).toContain("no longer exists");
+    expect((await ask("auth:whoami", other.token)).error).toContain("signed out");
     expect((await signUp("deleted@example.com")).status).toBe(200); // the email is free again
   });
 
@@ -615,6 +615,27 @@ describe("built-in auth checks the schema at startup", () => {
     await expect(start(defineSchema({ notes: defineTable({ text: v.string() }) }))).rejects.toThrow('keeps users in a "users" table');
     await expect(start(defineSchema({ users: defineTable({ email: v.string(), plan: v.string() }) }))).rejects.toThrow("user.plan is required");
     await start(defineSchema({ users: defineTable({ email: v.string(), plan: v.optional(v.string()) }) }));
+  });
+
+  test("one method's profile doesn't excuse another that has none", async () => {
+    const check = (methods: any[]) => {
+      const dir = mkdtempSync(join(tmpdir(), "onebase-auth-check-"));
+      const rt = new Runtime({
+        driver: createDriver(join(dir, "db.sqlite")),
+        schema: defineSchema({ users: defineTable({ email: v.string(), plan: v.string() }) }),
+        modules: {},
+        log: quiet,
+        auth: { methods },
+      });
+      return rt.init().finally(() => {
+        rt.stop();
+        rmSync(dir, { recursive: true, force: true });
+      });
+    };
+    const withPlan = () => ({ plan: "free" });
+    const codes = emailCode({ sendCode: () => {}, profile: withPlan });
+    await expect(check([codes, password()])).rejects.toThrow("user.plan is required");
+    await check([codes, password({ profile: withPlan })]);
   });
 });
 

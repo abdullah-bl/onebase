@@ -42,6 +42,8 @@ export type DbOptions = {
   warned?: Set<string>;
   /** The call's read and write limits; none for the system's own reads and writes. */
   budget?: CallBudget;
+  /** Called with the sessions of a user that was deleted, so connections using them can be closed. */
+  revokeSessions?: (sessionIds: string[]) => void;
 };
 
 export class OnebaseError extends Error {
@@ -1007,6 +1009,33 @@ export class DatabaseImpl {
     await this.syncSearch(table, docId, null);
     await this.syncVectors(table, docId, null);
     this.writes?.push({ table, id: docId, before: doc, after: null });
+    if (table === "users") await this.forgetSignIns(docId, doc);
+  }
+
+  /**
+   * Deleting a user also ends their sign-ins: sessions, agent connections, the accounts that sign in to them (an
+   * Apple id, an email) and the sign-in codes and limiter counts that hold their email address.
+   */
+  private async forgetSignIns(userId: string, doc: Record<string, any>) {
+    const sessions = (await this.tx.all("SELECT id FROM _auth_sessions WHERE user_id = ?", [userId])).map((r) => r.id as string);
+    await this.tx.run("DELETE FROM _auth_sessions WHERE user_id = ?", [userId]);
+    await this.tx.run("DELETE FROM _auth_accounts WHERE user_id = ?", [userId]);
+    for (const c of await this.tx.all("SELECT id FROM _mcp_connections WHERE user_id = ?", [userId])) {
+      await this.tx.run("DELETE FROM _mcp_tokens WHERE connection_id = ?", [c.id]);
+    }
+    await this.tx.run("DELETE FROM _mcp_connections WHERE user_id = ?", [userId]);
+    const email = typeof doc.email === "string" ? doc.email.toLowerCase() : "";
+    if (email) {
+      for (const purpose of ["verify", "reset", "signin"]) await this.tx.run("DELETE FROM _auth_codes WHERE kind = ?", [`${purpose}:${email}`]);
+      const like = `%${email.replace(/[!%_]/g, "!$&")}%`;
+      const keys = (await this.tx.all("SELECT \"key\" FROM _auth_attempts WHERE \"key\" LIKE ? ESCAPE '!'", [like])).map((r) => r.key as string);
+      for (const key of keys) {
+        // password:<email>|<client>, code:<email>|<client>, code:<email>, send:<email>
+        const rest = key.slice(key.indexOf(":") + 1);
+        if (rest === email || rest.startsWith(`${email}|`)) await this.tx.run('DELETE FROM _auth_attempts WHERE "key" = ?', [key]);
+      }
+    }
+    if (sessions.length) this.opts.revokeSessions?.(sessions);
   }
 }
 

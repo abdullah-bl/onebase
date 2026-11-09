@@ -151,7 +151,9 @@ export class JwtVerifier {
     if (!ok) throw new TokenRejected("Auth token signature is invalid.");
 
     const now = Date.now() / 1000;
-    if (typeof claims.exp === "number" && now > claims.exp + LEEWAY_SECONDS) {
+    // A token with no expiry would work forever if it leaked, so one is required.
+    if (typeof claims.exp !== "number") throw new TokenRejected("Auth token has no expiry (exp). Configure your provider to set one.");
+    if (now > claims.exp + LEEWAY_SECONDS) {
       throw new TokenRejected(`Auth token expired at ${new Date(claims.exp * 1000).toISOString()}. Fetch a fresh token on the client.`);
     }
     if (typeof claims.nbf === "number" && now < claims.nbf - LEEWAY_SECONDS) {

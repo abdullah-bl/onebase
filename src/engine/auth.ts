@@ -4,7 +4,7 @@
 // that functions can't reach. Tokens and codes are stored as SHA-256 hashes only.
 
 import type { FunctionLike } from "../api";
-import type { AuthMethod, OAuthMethod, OAuthProfile, OAuthTokens, PasswordMethod } from "../auth";
+import type { AuthMethod, EmailCodeMethod, IdTokenMethod, NewUserProfile, OAuthMethod, OAuthProfile, OAuthTokens, PasswordMethod, SendCodeCtx } from "../auth";
 import type { UserIdentity } from "../server";
 import { validate, type AnyValidator } from "../values";
 import { OnebaseError, type DatabaseImpl } from "./database";
@@ -41,13 +41,18 @@ export class AuthError extends OnebaseError {
 export const sha256 = (text: string) => new Bun.CryptoHasher("sha256").update(text).digest("base64url");
 export const randomToken = () => Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
 
-/** An 8-digit code, easy to type from an email. */
-function randomCode(): string {
+/** A code of 8 digits (or 6), easy to type from an email. */
+function randomCode(length: 6 | 8 = 8): string {
   const n = new Uint32Array(1);
+  const modulus = 10 ** length;
+  const limit = Math.floor(4_294_967_296 / modulus) * modulus; // a multiple of 10^length, so every code is equally likely
   do crypto.getRandomValues(n);
-  while (n[0]! >= 4_200_000_000); // a multiple of 10^8, so every code is equally likely
-  return String(n[0]! % 100_000_000).padStart(8, "0");
+  while (n[0]! >= limit);
+  return String(n[0]! % modulus).padStart(length, "0");
 }
+/** What the client sent, minus the secrets: profile hooks see this, so a careless `({ ...params })` can't store a password. */
+const SECRET_PARAMS = new Set(["password", "newPassword", "code", "idToken", "nonce"]);
+const publicParams = (params: Record<string, unknown>) => Object.fromEntries(Object.entries(params).filter(([k]) => !SECRET_PARAMS.has(k)));
 const normalizeEmail = (email: unknown) => (typeof email === "string" ? email.trim().toLowerCase() : "");
 const defined = (fields: Record<string, unknown>) => Object.fromEntries(Object.entries(fields).filter(([, v]) => v !== undefined));
 
@@ -91,6 +96,8 @@ type SignInResult = { token: string; userId: string } | { redirect: string } | {
 export class AuthService {
   readonly methods: AuthMethod[];
   private readonly password: PasswordMethod | null;
+  private readonly emailCode: EmailCodeMethod | null;
+  private readonly idTokens = new Map<string, IdTokenMethod>();
   private readonly oauth = new Map<string, OAuthMethod>();
   private readonly sessionMs: number;
   private readonly redirects: string[];
@@ -103,14 +110,25 @@ export class AuthService {
     config: AuthConfig,
   ) {
     this.methods = config.methods ?? [];
-    this.password = null;
+    let password: PasswordMethod | null = null;
+    let emailCode: EmailCodeMethod | null = null;
+    const seen = new Set<string>();
     for (const m of this.methods) {
-      if (m?.kind === "password") this.password = m;
-      else if (m?.kind === "oauth") {
-        if (this.oauth.has(m.id)) throw new Error(`auth.config.ts: sign-in method "${m.id}" is listed twice.`);
-        this.oauth.set(m.id, m);
-      } else throw new Error(`auth.config.ts: methods must come from "onebase/auth", e.g. methods: [password(), github()].`);
+      if (!m || !["password", "oauth", "idToken", "emailCode"].includes(m.kind)) {
+        throw new Error(`auth.config.ts: methods must come from "onebase/auth", e.g. methods: [password(), github(), apple()].`);
+      }
+      if (seen.has(m.id)) throw new Error(`auth.config.ts: sign-in method "${m.id}" is listed twice.`);
+      seen.add(m.id);
+      if (m.kind === "password") password = m;
+      else if (m.kind === "emailCode") emailCode = m;
+      else if (m.kind === "idToken") {
+        this.idTokens.set(m.id, m);
+        // Its browser sign-in shares the id, so the callback and the accounts are the same.
+        if (m.web) this.oauth.set(m.id, { ...m.web, id: m.id });
+      } else this.oauth.set(m.id, m);
     }
+    this.password = password;
+    this.emailCode = emailCode;
     this.sessionMs = (config.sessionDays ?? 30) * DAY;
     this.redirects = config.redirects ?? [];
     if (config.deviceUrl !== undefined && (typeof config.deviceUrl !== "string" || !/^(\/|https?:\/\/)/.test(config.deviceUrl))) {
@@ -136,11 +154,13 @@ export class AuthService {
     if (this.password?.verifyEmail && users.validator.kind === "object" && !("emailVerificationTime" in users.validator.fields!)) {
       throw new Error(`password({ verifyEmail: true }) records verification in users.emailVerificationTime: add it to the users table (it's in authTables).`);
     }
-    const errors = this.password?.profile ? [] : validate(users.validator, { email: "someone@example.com" }, "user");
+    // Every method that can create a user without its own profile hook must be able to insert just { email }.
+    const bare = this.methods.some((m) => m.kind === "oauth" || !m.profile);
+    const errors = bare ? validate(users.validator, { email: "someone@example.com" }, "user") : [];
     if (errors.length) {
       throw new Error(
         `The "users" table must accept new users created at sign-up, like { email }:\n  - ${errors.join("\n  - ")}\n` +
-          `Make the other fields v.optional(...), or set them with password({ profile: (params) => ({ ... }) }).`,
+          `Make the other fields v.optional(...), or set them with profile on your sign-in methods, e.g. apple({ profile: (info) => ({ ... }) }).`,
       );
     }
   }
@@ -228,7 +248,8 @@ export class AuthService {
     const path = url.pathname.slice("/api/auth/".length);
     try {
       if (path === "methods" && req.method === "GET") {
-        return json({ methods: this.methods.map((m) => ({ id: m.id, kind: m.kind, name: m.kind === "oauth" ? m.name : "Password" })) });
+        const label = (m: AuthMethod) => (m.kind === "oauth" || m.kind === "idToken" ? m.name : m.kind === "emailCode" ? "Email code" : "Password");
+        return json({ methods: this.methods.map((m) => ({ id: m.id, kind: m.kind, name: label(m) })) });
       }
       if (path === "signin" && req.method === "POST") return json(await this.signIn(await this.body(req), origins, client));
       if (path === "signout" && req.method === "POST") {
@@ -237,7 +258,9 @@ export class AuthService {
         return json({ ok: true });
       }
       const callback = /^callback\/([a-z0-9_-]+)$/.exec(path);
-      if (callback && req.method === "GET") return await this.callback(callback[1]!, url);
+      // Most providers come back with a GET; Apple posts the result as a form (response_mode=form_post).
+      if (callback && req.method === "GET") return await this.callback(callback[1]!, url.searchParams);
+      if (callback && req.method === "POST") return await this.callback(callback[1]!, await this.form(req));
       return null;
     } catch (err) {
       if (err instanceof AuthError) return json({ error: err.message }, err.status);
@@ -258,10 +281,24 @@ export class AuthService {
     throw new AuthError("The request body must be a JSON object.");
   }
 
+  private async form(req: Request): Promise<URLSearchParams> {
+    const type = req.headers.get("Content-Type") ?? "";
+    if (!type.includes("application/x-www-form-urlencoded")) return new URLSearchParams();
+    const text = await req.text();
+    return new URLSearchParams(text.length > 64_000 ? "" : text);
+  }
+
   private async signIn(body: Record<string, any>, origins: Set<string> | null, client: string): Promise<SignInResult> {
     if (typeof body.code === "string") return this.redeemCode(body.code, body.verifier);
     const provider = body.provider;
     if (provider === "password" && this.password) return this.signInPassword(this.password, body.params ?? {}, client);
+    if (provider === "email" && this.emailCode) return this.signInEmailCode(this.emailCode, body.params ?? {}, client);
+    const idToken = typeof provider === "string" ? this.idTokens.get(provider) : undefined;
+    // With no idToken, a provider that also signs in on the web (Apple) redirects like any OAuth provider.
+    if (idToken && body.params?.idToken === undefined && this.oauth.has(idToken.id)) {
+      return { redirect: await this.startOAuth(this.oauth.get(idToken.id)!, body.redirectTo, body.challenge, origins) };
+    }
+    if (idToken) return this.signInIdToken(idToken, body.params ?? {}, client);
     const method = typeof provider === "string" ? this.oauth.get(provider) : undefined;
     if (method) return { redirect: await this.startOAuth(method, body.redirectTo, body.challenge, origins) };
     throw new AuthError(`Unknown sign-in method ${JSON.stringify(provider)}. Enabled: ${this.ids.join(", ") || "none"}.`);
@@ -326,7 +363,7 @@ export class AuthService {
   private async signUp(method: PasswordMethod, email: string, password: string, params: Record<string, unknown>, client: string): Promise<SignInResult> {
     const name = typeof params.name === "string" && params.name.trim() ? params.name.trim() : undefined;
     // Only a confirmed code marks an email verified (OAuth sign-ins join users by verified email).
-    const fields = method.profile ? { ...method.profile(params), email, emailVerificationTime: undefined } : defined({ email, name });
+    const fields = method.profile ? { ...method.profile(publicParams(params)), email, emailVerificationTime: undefined } : defined({ email, name });
     // Hashed either way, so the time a sign-up takes doesn't reveal whether the email is taken.
     const secret = await Bun.password.hash(password);
     let existing = false;
@@ -373,6 +410,59 @@ export class AuthService {
     return this.passwordSignIn(method, email, password, client);
   }
 
+  // ---- Passwordless email code ----
+
+  private async signInEmailCode(method: EmailCodeMethod, params: Record<string, unknown>, client: string): Promise<SignInResult> {
+    const email = normalizeEmail(params.email);
+    if (email.length > MAX_EMAIL || !EMAIL.test(email)) throw new AuthError("Enter a valid email address.");
+    const flow = params.flow ?? "start";
+    if (flow === "start") {
+      await this.sendEmailCode(method, email, "signin");
+      return { codeSent: true };
+    }
+    if (flow !== "verify") throw new AuthError(`flow must be start or verify; got ${JSON.stringify(flow)}.`);
+    await this.takeEmailCode("signin", email, params.code, client, undefined, method.codeLength);
+    const name = this.cleanName(params.name);
+    // The code proves the inbox, so the address is verified.
+    const userId = await this.userForProvider(method.id, { id: email, email, emailVerified: true, name }, method.profile, params);
+    return this.runtime.withWriter(async (tx) => ({ userId, token: await this.createSession(tx, userId) }));
+  }
+
+  // ---- ID tokens (Sign in with Apple) ----
+
+  private async signInIdToken(method: IdTokenMethod, params: Record<string, unknown>, client: string): Promise<SignInResult> {
+    // Only failures count, so a whole office signing in from one network is never held back.
+    const key = `idtoken:${method.id}|${client}`;
+    await this.countAttempt(key, MAX_FAILURES * 3, `failed ${method.name} sign-ins`);
+    let verified;
+    try {
+      verified = await method.verify(params);
+    } catch (err) {
+      if (err instanceof AuthError) throw err;
+      throw new AuthError(`${method.name} sign-in failed: ${err instanceof Error ? err.message : "the token isn't valid."}`, 401);
+    }
+    if (!verified.id) throw new AuthError(`${method.name} didn't return an account id.`, 401);
+    await this.runtime.withWriter((tx) => tx.run("DELETE FROM _auth_attempts WHERE \"key\" = ?", [key]));
+    // Find or create the user first, so a failure there (say, the users schema rejects the profile) doesn't burn the token.
+    const userId = await this.userForProvider(method.id, { ...verified, name: verified.name }, method.profile, params);
+    await this.useOnce(verified.once.key, verified.once.until);
+    return this.runtime.withWriter(async (tx) => ({ userId, token: await this.createSession(tx, userId) }));
+  }
+
+  /** Marks a token as used; a second sign-in with the same token is refused. */
+  private async useOnce(key: string, until: number) {
+    try {
+      await this.runtime.withWriter((tx) => tx.run("INSERT INTO _auth_codes (code_hash, kind, data, expires) VALUES (?, 'used', '{}', ?)", [sha256(key), until]));
+    } catch (err) {
+      if (!isUniqueViolation(err)) throw err;
+      throw new AuthError("This sign-in was already used. Sign in again.", 401);
+    }
+  }
+
+  private cleanName(name: unknown): string | undefined {
+    return typeof name === "string" && name.trim() ? name.trim().slice(0, 100) : undefined;
+  }
+
   // ---- Email codes: verification and password reset ----
 
   /** Context for sendCode: call your functions, e.g. an internal action that sends email. */
@@ -393,10 +483,16 @@ export class AuthService {
    * A verify code carries the password hash of whoever asked for it; confirming the code makes that
    * the account's password, so an unconfirmed account's earlier password never survives confirmation.
    */
-  private async sendEmailCode(method: PasswordMethod, email: string, purpose: "verify" | "reset", counted = false, secret?: string) {
+  private async sendEmailCode(
+    method: { sendCode?: (message: any, ctx: SendCodeCtx) => Promise<void> | void; codeLength?: 6 | 8 },
+    email: string,
+    purpose: "verify" | "reset" | "signin",
+    counted = false,
+    secret?: string,
+  ) {
     if (!method.sendCode) throw new AuthError("Email codes aren't set up: add sendCode to password() in auth.config.ts.");
     if (!counted) await this.countCodeSent(email);
-    const code = randomCode();
+    const code = randomCode(method.codeLength ?? 8);
     await this.runtime.withWriter(async (tx) => {
       await tx.run("DELETE FROM _auth_codes WHERE kind = ?", [`${purpose}:${email}`]);
       await tx.run("INSERT INTO _auth_codes (code_hash, kind, data, expires) VALUES (?, ?, ?, ?)", [
@@ -420,12 +516,21 @@ export class AuthService {
    * asked for a verify code chose the password confirming it applies, and that may not be the
    * inbox owner, so the person confirming has to know it too.
    */
-  private async takeEmailCode(purpose: "verify" | "reset", email: string, code: unknown, client: string, password?: string): Promise<{ secret?: string }> {
+  private async takeEmailCode(
+    purpose: "verify" | "reset" | "signin",
+    email: string,
+    code: unknown,
+    client: string,
+    password?: string,
+    length: 6 | 8 = 8,
+  ): Promise<{ secret?: string }> {
     const key = `code:${email}|${client}`;
     await this.countAttempt(key, MAX_FAILURES, "wrong codes");
+    // A 6-digit code is guessable across many networks, so wrong guesses for the address are also counted overall.
+    if (length < 8) await this.countAttempt(`code:${email}`, MAX_FAILURES * 3, "wrong codes");
     const entered = typeof code === "string" ? code.replace(/\s/g, "") : "";
     const hash = sha256(`${purpose}|${email}|${entered}`);
-    const row = /^\d{8}$/.test(entered)
+    const row = new RegExp(`^\\d{${length}}$`).test(entered)
       ? await this.runtime.withReader((tx) => tx.get("SELECT data, expires FROM _auth_codes WHERE code_hash = ? AND kind = ?", [hash, `${purpose}:${email}`]))
       : null;
     const data = row && Number(row.expires) >= Date.now() ? (JSON.parse(row.data as string) as { secret?: string }) : null;
@@ -435,7 +540,7 @@ export class AuthService {
     }
     const { changes } = await this.runtime.withWriter((tx) => tx.run("DELETE FROM _auth_codes WHERE code_hash = ?", [hash]));
     if (changes !== 1) throw new AuthError("That code is wrong or has expired. Request a new one.", 401); // used just now
-    await this.runtime.withWriter((tx) => tx.run("DELETE FROM _auth_attempts WHERE \"key\" = ?", [key]));
+    await this.runtime.withWriter((tx) => tx.run("DELETE FROM _auth_attempts WHERE \"key\" = ? OR \"key\" = ?", [key, `code:${email}`]));
     return data;
   }
 
@@ -464,7 +569,12 @@ export class AuthService {
       // The owner has proven the inbox: their failed-password count ends, on every network.
       await tx.run("DELETE FROM _auth_attempts WHERE \"key\" = ? OR \"key\" LIKE ?", [`password:${email}`, `password:${email}|%`]);
       // The code proves they read this inbox.
-      if (typeof user.emailVerificationTime !== "number" && "emailVerificationTime" in this.fitUsers({ emailVerificationTime: 1 })) {
+      // (Unless another user already holds the address verified: that one stays the only verified user for it.)
+      if (
+        typeof user.emailVerificationTime !== "number" &&
+        "emailVerificationTime" in this.fitUsers({ emailVerificationTime: 1 }) &&
+        !(await this.verifiedUser(db, email, user._id))
+      ) {
         await db.patch(user._id, { emailVerificationTime: Date.now() });
       }
       return { userId: user._id, token: await this.createSession(tx, user._id) };
@@ -479,6 +589,19 @@ export class AuthService {
       const user = account ? await db.get(account.user_id) : null;
       if (!user) throw new AuthError("This account no longer exists.", 401);
       if (typeof user.emailVerificationTime !== "number") {
+        // Someone else already proved this inbox (an email code, Google, Apple...): that is the same
+        // person, so the password joins their account, and this unconfirmed duplicate, which never had
+        // a session, goes. Each address then has at most one verified user.
+        const owner = await this.verifiedUser(db, email, user._id);
+        if (owner) {
+          await tx.run("UPDATE _auth_accounts SET user_id = ?, secret = COALESCE(?, secret) WHERE provider = 'password' AND account_id = ?", [
+            owner._id,
+            secret ?? null,
+            email,
+          ]);
+          await db.delete(user._id);
+          return { userId: owner._id, token: await this.createSession(tx, owner._id) };
+        }
         await db.patch(user._id, { emailVerificationTime: Date.now() });
         // Until now anyone could have created this account. The inbox owner keeps the password they
         // just chose (takeEmailCode checked they know it), and nothing from before confirmation (an
@@ -584,28 +707,28 @@ export class AuthService {
       client_id: method.clientId,
       redirect_uri: this.callbackUrl(method),
       state,
-      code_challenge: sha256(verifier),
-      code_challenge_method: "S256",
-      ...(method.scopes.length ? { scope: method.scopes.join(" ") } : {}),
+      ...(method.pkce === false ? {} : { code_challenge: sha256(verifier), code_challenge_method: "S256" }),
+      ...(method.scopes.length ? { scope: method.scopes.join(method.scopeSeparator ?? " ") } : {}),
       ...method.authorizationParams,
     };
     for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
     return url.toString();
   }
 
-  private async callback(id: string, url: URL): Promise<Response> {
+  private async callback(id: string, query: URLSearchParams): Promise<Response> {
     const method = this.oauth.get(id);
     if (!method) return page(404, `Unknown sign-in method "${id}".`);
-    const stateParam = url.searchParams.get("state");
+    const stateParam = query.get("state");
     const state = stateParam ? await this.takeCode(stateParam, "oauth_state") : null;
     if (!state || state.provider !== id) return page(400, "This sign-in link has expired or was already used. Go back and try again.");
     const back = (params: Record<string, string>) => Response.redirect(withParams(state.redirectTo, params), 302);
-    const error = url.searchParams.get("error");
-    if (error) return back({ auth_error: url.searchParams.get("error_description") ?? error });
-    const code = url.searchParams.get("code");
+    const error = query.get("error");
+    if (error) return back({ auth_error: query.get("error_description") ?? (error === "user_cancelled_authorize" ? "Sign-in was cancelled." : error) });
+    const code = query.get("code");
     if (!code) return back({ auth_error: `${method.name} didn't send a sign-in code.` });
     try {
-      const profile = await method.profile(await this.exchange(method, code, state.verifier));
+      const params = Object.fromEntries([...query].filter(([k]) => k !== "code" && k !== "state"));
+      const profile = await method.profile(await this.exchange(method, code, state.verifier), { params });
       if (!profile?.id) throw new Error(`${method.name} didn't return an account id.`);
       const userId = await this.userForOAuth(method, profile);
       const loginCode = randomToken();
@@ -619,19 +742,27 @@ export class AuthService {
 
   private async exchange(method: OAuthMethod, code: string, verifier: string): Promise<OAuthTokens> {
     const { tokenUrl } = await method.endpoints();
-    const res = await fetch(tokenUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
-      body: new URLSearchParams({
-        grant_type: "authorization_code",
-        code,
-        redirect_uri: this.callbackUrl(method),
-        client_id: method.clientId,
-        client_secret: method.clientSecret,
-        code_verifier: verifier,
-      }),
-    });
-    const body = (await res.json().catch(() => null)) as OAuthTokens | null;
+    const secret = typeof method.clientSecret === "function" ? await method.clientSecret() : method.clientSecret;
+    const form = new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: this.callbackUrl(method) });
+    if (method.pkce !== false) form.set("code_verifier", verifier);
+    const headers: Record<string, string> = { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" };
+    if (method.tokenAuth === "basic") {
+      // RFC 6749 2.3.1: each part is form-encoded before joining.
+      headers.Authorization = `Basic ${btoa(`${encodeURIComponent(method.clientId)}:${encodeURIComponent(secret)}`)}`;
+    } else {
+      form.set("client_id", method.clientId);
+      form.set("client_secret", secret);
+    }
+    const res = await fetch(tokenUrl, { method: "POST", headers, body: form });
+    // Some providers answer with a form-encoded body even when asked for JSON.
+    const text = await res.text();
+    let body: OAuthTokens | null = null;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      const parsed = Object.fromEntries(new URLSearchParams(text));
+      if (parsed.access_token) body = parsed as OAuthTokens;
+    }
     if (!res.ok || typeof body?.access_token !== "string") {
       throw new Error(`the token endpoint returned ${res.status}: ${JSON.stringify(body)?.slice(0, 200)}`);
     }
@@ -640,31 +771,53 @@ export class AuthService {
 
   /** Finds or creates the user for an OAuth account. */
   private userForOAuth(method: OAuthMethod, profile: OAuthProfile): Promise<string> {
+    return this.userForProvider(method.id, profile);
+  }
+
+  /**
+   * Finds or creates the user for an account at a provider (OAuth, ID token or email code).
+   * `profile` (the method's) adds fields to a new user's document, but can't set email or its verification.
+   */
+  private userForProvider(
+    providerId: string,
+    profile: OAuthProfile,
+    newUser?: NewUserProfile,
+    params: Record<string, unknown> = {},
+  ): Promise<string> {
     return this.runtime.authWrite(async ({ db, tx }) => {
-      const account = await tx.get("SELECT user_id FROM _auth_accounts WHERE provider = ? AND account_id = ?", [method.id, profile.id]);
+      const account = await tx.get("SELECT user_id FROM _auth_accounts WHERE provider = ? AND account_id = ?", [providerId, profile.id]);
       if (account && (await db.get(account.user_id))) return account.user_id as string;
-      if (account) await tx.run("DELETE FROM _auth_accounts WHERE provider = ? AND account_id = ?", [method.id, profile.id]);
+      if (account) await tx.run("DELETE FROM _auth_accounts WHERE provider = ? AND account_id = ?", [providerId, profile.id]);
       const email = profile.email ? normalizeEmail(profile.email) : undefined;
       const verified = Boolean(email && profile.emailVerified);
       // Join an existing user only if both sides verified the email: otherwise someone could
       // sign up with another person's address first and share their account later.
-      let userId: string | null = null;
-      if (verified) {
-        const sameEmail = await db.query("users").filter({ email }).take(20);
-        userId = sameEmail.find((u) => typeof u.emailVerificationTime === "number")?._id ?? null;
-      }
-      userId ??= await db.insert(
-        "users",
-        this.fitUsers({ email, name: profile.name, image: profile.image, emailVerificationTime: verified ? Date.now() : undefined }),
-      );
+      let userId: string | null = verified ? ((await this.verifiedUser(db, email!))?._id ?? null) : null;
+      userId ??= await db.insert("users", {
+        ...(newUser?.({ provider: providerId, accountId: profile.id, email, emailVerified: verified, name: profile.name, params: publicParams(params) }) ?? {}),
+        ...this.fitUsers({ email, name: profile.name, image: profile.image, emailVerificationTime: verified ? Date.now() : undefined }),
+      });
       await tx.run("INSERT INTO _auth_accounts (provider, account_id, user_id, secret, created) VALUES (?, ?, ?, NULL, ?)", [
-        method.id,
+        providerId,
         profile.id,
         userId,
         Date.now(),
       ]);
       return userId;
     });
+  }
+
+  /**
+   * The verified user with this email, if any (besides `except`). Only verified users are looked at, so
+   * unverified ones with the same address can't crowd out the real owner, and the users table's email
+   * index is used when it has one, so sign-in doesn't scan the table.
+   */
+  private async verifiedUser(db: DatabaseImpl, email: string, except?: string): Promise<Record<string, any> | null> {
+    const def = this.runtime.schema?.tables.users as { indexes?: { name: string; fields: string[] }[] } | undefined;
+    const index = def?.indexes?.find((i) => i.fields[0] === "email");
+    const byEmail: any = index ? db.query("users").withIndex(index.name, (q: any) => q.eq("email", email)) : db.query("users").filter({ email });
+    const rows: Record<string, any>[] = await byEmail.filter((q: any) => q.neq(q.field("emailVerificationTime"), undefined)).take(10);
+    return rows.find((u) => typeof u.emailVerificationTime === "number" && u._id !== except) ?? null;
   }
 
   /** Drops profile fields the users table doesn't declare, so a custom users table still works. */

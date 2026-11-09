@@ -125,7 +125,10 @@ export function serve(opts: ServeOptions): Server<SocketData> {
 
   const clientIp = (req: Request, server: Server<SocketData>) => {
     if (opts.trustProxy) {
-      const forwarded = req.headers.get("X-Forwarded-For")?.split(",")[0]?.trim() || req.headers.get("X-Real-IP");
+      // On Fly (which sets FLY_APP_NAME) the edge sets Fly-Client-IP itself, while X-Forwarded-For can start with
+      // whatever the client sent. Anywhere else Fly-Client-IP is just a header the client chose, so it's ignored.
+      const fly = process.env.FLY_APP_NAME ? req.headers.get("Fly-Client-IP")?.trim() : undefined;
+      const forwarded = fly || req.headers.get("X-Forwarded-For")?.split(",")[0]?.trim() || req.headers.get("X-Real-IP");
       if (forwarded) return forwarded;
     }
     return server.requestIP(req)?.address ?? "unknown";
@@ -404,6 +407,8 @@ export function serve(opts: ServeOptions): Server<SocketData> {
           const identity = await identityFromRequest(req);
           return await runtime.runHttpAction(route.handler.handler, req, identity, route.mount);
         } catch (err) {
+          // A bad or expired session token is the caller's problem, not a server error.
+          if (err instanceof AuthError) return new Response(err.message, { status: err.status });
           runtime.log.error(`HTTP ${req.method} ${path}: ${err instanceof Error ? err.message : String(err)}`);
           return new Response(runtime.toClientError(err).message, { status: 500 });
         }

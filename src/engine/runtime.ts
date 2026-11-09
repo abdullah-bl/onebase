@@ -1724,12 +1724,13 @@ export class Runtime {
 
   async startScheduler() {
     await this.withWriter((tx) => tx.run("DELETE FROM _scheduled WHERE state <> 'pending' AND run_at < ?", [Date.now() - 7 * 86400_000]));
+    await this.recoverInterruptedJobs();
     this.pokeScheduler();
     // With a shared database, pick up jobs left by instances that went away.
     // Also catch up on a deploy whose broadcast was missed (say, while reconnecting).
     if (this.driver.shared) {
       this.heartbeat = setInterval(() => {
-        this.pokeScheduler();
+        void this.recoverInterruptedJobs().then(() => this.pokeScheduler());
         void this.syncDeployment();
       }, 30_000);
     }
@@ -1757,6 +1758,38 @@ export class Runtime {
       .catch((err) => this.log.error(`Scheduler: ${err instanceof Error ? err.message : String(err)}`));
   }
 
+  /**
+   * Jobs left `running` by a process that died mid-job (a crash, SIGKILL, a lost machine) go back
+   * to pending and run again (docs/scheduling.md): a migration's or workflow's next step continues
+   * on its own. A mutation job never committed (it's marked done in its own transaction), so it
+   * still runs exactly once; an action may run a second time, as documented.
+   *
+   * With a database only this process uses, every running job at startup is such a leftover. With
+   * a shared one, a job counts as abandoned once it was claimed (run_at is set to the claim time)
+   * longer ago than its time limit allows, plus a minute.
+   */
+  async recoverInterruptedJobs(now = Date.now()) {
+    if (this.stopped) return;
+    const limitOf = (ms: number) => (ms > 0 ? ms : 60 * 60_000) + 60_000;
+    const cutoff = (type: string | undefined) =>
+      !this.driver.shared ? Infinity : now - limitOf(type === "mutation" ? this.timeLimits.mutationMs : this.timeLimits.actionMs);
+    try {
+      const recovered = await this.withWriter(async (tx) => {
+        const jobs = (await tx.all("SELECT id, fn, run_at FROM _scheduled WHERE state = 'running'")) as { id: string; fn: string; run_at: number }[];
+        let n = 0;
+        for (const job of jobs) {
+          const type = this.functions.get(job.fn)?.type;
+          if (Number(job.run_at) >= cutoff(type)) continue;
+          n += (await tx.run("UPDATE _scheduled SET state = 'pending', run_at = ? WHERE id = ? AND state = 'running'", [now, job.id])).changes;
+        }
+        return n;
+      });
+      if (recovered) this.log.info(`Scheduler: recovered ${recovered} job(s) interrupted by a stopped server.`);
+    } catch (err) {
+      this.log.error(`Scheduler: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   private async runDueJobs() {
     // Every slot is taken: a finishing job pokes the scheduler again.
     const free = MAX_RUNNING_JOBS - this.runningJobs;
@@ -1769,7 +1802,8 @@ export class Runtime {
       )) as { id: string; fn: string; args: string }[];
       const claimed = [];
       for (const job of jobs) {
-        const { changes } = await tx.run("UPDATE _scheduled SET state = 'running' WHERE id = ? AND state = 'pending'", [job.id]);
+        // run_at becomes the claim time, so a job its instance never finished can be told apart (recoverInterruptedJobs).
+        const { changes } = await tx.run("UPDATE _scheduled SET state = 'running', run_at = ? WHERE id = ? AND state = 'pending'", [Date.now(), job.id]);
         if (changes === 1) claimed.push(job);
       }
       return claimed;

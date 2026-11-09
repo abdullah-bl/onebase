@@ -12,7 +12,7 @@ import { upgrade } from "./upgrade";
 import { doctor, printFindings } from "./doctor";
 import { SqliteDriver } from "./engine/driver";
 import { LocalBlobs } from "./engine/files";
-import { parseRateLimit } from "./engine/http";
+import { parseRateLimit, parseSize } from "./engine/http";
 import { CALL_LIMIT_ENV } from "./engine/limits";
 import type { AuthConfig } from "./engine/jwt";
 import type { Modules } from "./engine/runtime";
@@ -71,6 +71,7 @@ Options (each $NAME can also come from a .env file):
   --backup-keep <n>   Snapshots to keep (default: 24, or $ONEBASE_BACKUP_KEEP)
   --cors <origins>  Browser origins allowed to call the API, comma-separated (default: any; $ONEBASE_CORS)
   --rate-limit <r>  Per-IP limit on function calls, e.g. 100/10s or 600/m (default: off; $ONEBASE_RATE_LIMIT)
+  --max-upload <s>  Largest upload (any request body), e.g. 1gb or 512mb (default: 1gb; $ONEBASE_MAX_UPLOAD)
   --trust-proxy     Take the client IP from X-Forwarded-For (when behind a reverse proxy; $ONEBASE_TRUST_PROXY=1)
   --at <time>       restore: snapshot to use, e.g. 20261022T0300 (default: newest)
   --force           restore: overwrite an existing database
@@ -129,6 +130,7 @@ function options(argv: string[]) {
       cors: { type: "string" },
       "rate-limit": { type: "string" },
       "trust-proxy": { type: "boolean" },
+      "max-upload": { type: "string" },
       at: { type: "string" },
       force: { type: "boolean", default: false },
       "no-dashboard": { type: "boolean" },
@@ -174,6 +176,7 @@ function options(argv: string[]) {
     cors: values.cors ?? env.ONEBASE_CORS,
     "rate-limit": values["rate-limit"] ?? env.ONEBASE_RATE_LIMIT,
     "trust-proxy": values["trust-proxy"] ?? enabled(env.ONEBASE_TRUST_PROXY),
+    "max-upload": values["max-upload"] ?? env.ONEBASE_MAX_UPLOAD,
     "no-dashboard": values["no-dashboard"] ?? off("ONEBASE_DASHBOARD", env.ONEBASE_DASHBOARD),
     "no-deploy": values["no-deploy"] ?? off("ONEBASE_DEPLOY", env.ONEBASE_DEPLOY),
   };
@@ -220,6 +223,7 @@ function serverOptions(opts: ReturnType<typeof options>) {
     cors: opts.cors ? opts.cors.split(",").map((o) => o.trim()).filter(Boolean) : undefined,
     rateLimit: opts["rate-limit"] ? parseRateLimit(opts["rate-limit"]) : null,
     trustProxy: opts["trust-proxy"],
+    maxBodyBytes: opts["max-upload"] ? parseSize(opts["max-upload"]) : undefined,
     dashboard: !opts["no-dashboard"],
     deploys: !opts["no-deploy"],
     timeLimits: {

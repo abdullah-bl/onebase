@@ -8,10 +8,16 @@ import * as auth from "./auth";
 import * as components from "./components";
 import * as mcp from "./mcp";
 import type { ComponentsDefinition } from "./components";
+import * as actionCache from "./components/action-cache";
+import * as agent from "./components/agent";
 import * as aggregate from "./components/aggregate";
+import * as migrations from "./components/migrations";
+import * as presence from "./components/presence";
+import * as rag from "./components/rag";
 import * as rateLimiter from "./components/rate-limiter";
 import * as shardedCounter from "./components/sharded-counter";
 import * as workQueue from "./components/work-queue";
+import * as workflow from "./components/workflow";
 import type { AuthConfig } from "./engine/jwt";
 import { OnebaseError } from "./engine/database";
 import { rememberModule } from "./engine/deployments";
@@ -38,7 +44,43 @@ export type Project = {
 const SPECIAL = new Set(["schema", "auth.config", "components"]);
 
 /** The components that ship with onebase, importable as onebase/components/<name>. */
-export const BUILT_IN_COMPONENTS: Record<string, Record<string, unknown>> = { aggregate, "rate-limiter": rateLimiter, "sharded-counter": shardedCounter, "work-queue": workQueue };
+export const BUILT_IN_COMPONENTS: Record<string, Record<string, unknown>> = {
+  "action-cache": actionCache,
+  agent,
+  aggregate,
+  migrations,
+  presence,
+  rag,
+  "rate-limiter": rateLimiter,
+  "sharded-counter": shardedCounter,
+  "work-queue": workQueue,
+  workflow,
+};
+
+/** The `onebase/*` modules server code can import: every one registerVirtualModules provides. */
+export const SERVER_MODULES: readonly string[] = [
+  "onebase",
+  "onebase/server",
+  "onebase/values",
+  "onebase/auth",
+  "onebase/components",
+  "onebase/mcp",
+  ...Object.keys(BUILT_IN_COMPONENTS).map((name) => `onebase/components/${name}`),
+];
+
+/**
+ * The `onebase/*` modules a bundle imports that this server doesn't provide. In a binary from
+ * `onebase build` there is no node_modules to fall back on, so such an import can't load; this
+ * names it instead of Bun's "Cannot find package 'onebase'".
+ */
+export function unknownOnebaseImports(source: string): string[] {
+  const known = new Set(SERVER_MODULES);
+  const found = new Set<string>();
+  for (const m of source.matchAll(/(?:\bfrom\s*|\bimport\s*\(?\s*|\brequire\s*\(\s*)["'](onebase(?:\/[^"']*)?)["']/g)) {
+    if (!known.has(m[1]!)) found.add(m[1]!);
+  }
+  return [...found].sort();
+}
 
 let registered = false;
 
@@ -190,6 +232,13 @@ let bundleDir: string | null = null;
  */
 export async function importBundle(source: string, id: string): Promise<ProjectCode> {
   registerVirtualModules();
+  const unknown = unknownOnebaseImports(source);
+  if (unknown.length) {
+    throw new OnebaseError(
+      `The pushed code imports ${unknown.map((m) => `"${m}"`).join(", ")}, which this server's onebase doesn't provide to server code ` +
+        `(it provides ${SERVER_MODULES.join(", ")}). Remove the import, or upgrade the server to a onebase that has it.`,
+    );
+  }
   bundleDir ??= mkdtempSync(join(tmpdir(), "onebase-deploys-"));
   const file = join(bundleDir, `${id}.js`);
   writeFileSync(file, source);

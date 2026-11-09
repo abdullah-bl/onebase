@@ -136,6 +136,7 @@ Every flag also has an environment variable, and environment variables can come 
 | `--backup-keep` | `ONEBASE_BACKUP_KEEP` | `24` |
 | `--cors` | `ONEBASE_CORS` | any origin; comma-separated list of allowed browser origins |
 | `--rate-limit` | `ONEBASE_RATE_LIMIT` | off; per-IP limit on calls, e.g. `100/10s` or `600/m` |
+| `--max-upload` | `ONEBASE_MAX_UPLOAD` | 1gb; largest upload (and any request body), e.g. `512mb` or `2gb` |
 | `--trust-proxy` | `ONEBASE_TRUST_PROXY=1` | off; read the client IP from `X-Forwarded-For` (set it behind a proxy) |
 | `--no-dashboard` | `ONEBASE_DASHBOARD=off` | dashboard on at `/_admin` (see [Dashboard](./dashboard.md)) |
 | `--no-deploy` | `ONEBASE_DEPLOY=off` | deploys on (see [onebase deploy](#onebase-deploy)) |

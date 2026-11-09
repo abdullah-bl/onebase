@@ -25,7 +25,64 @@ export type ServeOptions = {
   admin?: ((req: Request, url: URL) => Promise<Response> | Response) | null;
   /** How often open connections re-check their auth token, in ms (default 60s; 0 disables). */
   sessionRecheckMs?: number;
+  /** Largest request body, in bytes: uploads and everything else (default DEFAULT_MAX_BODY_BYTES, 1 GB). */
+  maxBodyBytes?: number;
 };
+
+/** The largest request body (and so upload) a server accepts unless told otherwise: 1 GB. */
+export const DEFAULT_MAX_BODY_BYTES = 2 ** 30;
+
+/** Parses a size like "1gb", "512mb", "100k" or a number of bytes. */
+export function parseSize(text: string): number {
+  const m = /^(\d+(?:\.\d+)?)\s*(b|k|kb|m|mb|g|gb|t|tb)?$/i.exec(text.trim().replace(/_/g, ""));
+  const unit = { b: 1, k: 2 ** 10, m: 2 ** 20, g: 2 ** 30, t: 2 ** 40 }[(m?.[2]?.[0] ?? "b").toLowerCase() as "b"];
+  const bytes = m ? Math.floor(Number(m[1]) * unit) : NaN;
+  if (!(bytes >= 1) || !Number.isSafeInteger(bytes)) throw new Error(`Invalid size "${text}": use e.g. 1gb, 512mb or a number of bytes.`);
+  return bytes;
+}
+
+/** Thrown while reading a request body that turned out bigger than the limit. */
+export class BodyTooLarge extends Error {
+  constructor(readonly limit: number) {
+    super(`Request body is larger than this server accepts (${describeSize(limit)}; set --max-upload or $ONEBASE_MAX_UPLOAD to change it).`);
+  }
+}
+
+function describeSize(bytes: number): string {
+  for (const [n, unit] of [[2 ** 40, "TB"], [2 ** 30, "GB"], [2 ** 20, "MB"], [2 ** 10, "KB"]] as const) {
+    if (bytes >= n) return `${+(bytes / n).toFixed(2)} ${unit}`;
+  }
+  return `${bytes} bytes`;
+}
+
+/** A request whose body is counted as it streams: the one Bun handed over, and whether it went over. */
+type Capped = { original: Request; over: boolean };
+const cappedRequests = new WeakMap<Request, Capped>();
+
+/**
+ * `req` with a body that errors once more than `max` bytes went through, for a body sent without
+ * a Content-Length (chunked). Whoever reads it sees a stream error, which `tooLarge` recognizes.
+ */
+function capBody(req: Request, max: number): Request {
+  const state: Capped = { original: req, over: false };
+  let size = 0;
+  const body = req.body!.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        size += chunk.byteLength;
+        if (size <= max) return controller.enqueue(chunk);
+        state.over = true;
+        controller.error(new BodyTooLarge(max));
+      },
+    }),
+  );
+  const capped = new Request(req, { body, duplex: "half" } as RequestInit);
+  cappedRequests.set(capped, state);
+  return capped;
+}
+
+/** Whether `err` (from reading `req`'s body) is because the body went over the limit. */
+const tooLarge = (req: Request, err: unknown) => err instanceof BodyTooLarge || cappedRequests.get(req)?.over === true;
 
 export type RateLimit = { max: number; windowMs: number };
 
@@ -104,6 +161,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
   const sockets = new Set<ServerWebSocket<SocketData>>();
   const origins = opts.cors?.length && !opts.cors.includes("*") ? new Set(opts.cors.map((o) => o.replace(/\/$/, ""))) : null;
   const limiter = opts.rateLimit ? new RateLimiter(opts.rateLimit) : null;
+  const maxBody = opts.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
 
   const originAllowed = (req: Request) => {
     const origin = req.headers.get("Origin");
@@ -131,7 +189,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
       const forwarded = fly || req.headers.get("X-Forwarded-For")?.split(",")[0]?.trim() || req.headers.get("X-Real-IP");
       if (forwarded) return forwarded;
     }
-    return server.requestIP(req)?.address ?? "unknown";
+    return server.requestIP(cappedRequests.get(req)?.original ?? req)?.address ?? "unknown";
   };
 
   /** Null if allowed, otherwise the error to send. */
@@ -175,7 +233,13 @@ export function serve(opts: ServeOptions): Server<SocketData> {
     ws.data.subs.get(id)?.unsubscribe();
     const limit = counted ? limited(ws.data.ip) : null;
     if (limit) {
-      ws.data.subs.set(id, { path, args, unsubscribe: () => {}, failed: true });
+      // Try again once a token is free, so the query starts on its own (the client keeps showing
+      // the error until then). Unsubscribing, a new sub with this id, or closing cancels the retry.
+      const entry = { path, args, unsubscribe: () => clearTimeout(retry), failed: true };
+      const retry = setTimeout(() => {
+        if (ws.readyState === 1 && ws.data.subs.get(id) === entry) subscribe(ws, id, path, args);
+      }, limit.retryMs);
+      ws.data.subs.set(id, entry);
       return pushUpdate(ws, { type: "update", id, ok: false, error: limit.message });
     }
     try {
@@ -310,7 +374,8 @@ export function serve(opts: ServeOptions): Server<SocketData> {
     let body: any;
     try {
       body = await req.json();
-    } catch {
+    } catch (err) {
+      if (tooLarge(req, err)) return json(req, { status: "error", errorMessage: new BodyTooLarge(maxBody).message }, 413);
       return json(req, { status: "error", errorMessage: 'Body must be JSON: { "path": "messages:list", "args": {} }' }, 400);
     }
     try {
@@ -334,9 +399,21 @@ export function serve(opts: ServeOptions): Server<SocketData> {
   return Bun.serve<SocketData>({
     port: opts.port ?? 8090,
     hostname: opts.hostname ?? "0.0.0.0",
+    // Bun's own limit answers 413 with an empty body before fetch runs; the limit is enforced
+    // below instead, so the client gets a JSON error that says what the limit is.
+    maxRequestBodySize: Number.MAX_SAFE_INTEGER,
     async fetch(req, server) {
       const url = new URL(req.url);
       const path = url.pathname;
+      if (req.body) {
+        const length = Number(req.headers.get("Content-Length") ?? NaN);
+        if (length > maxBody) {
+          const err = new BodyTooLarge(maxBody);
+          return path.startsWith("/api/") ? json(req, { status: "error", errorMessage: err.message, error: err.message }, 413) : new Response(err.message, { status: 413 });
+        }
+        // No length up front (chunked): count while it streams.
+        if (!(length >= 0)) req = capBody(req, maxBody);
+      }
 
       if (path === "/api/sync") {
         if (!originAllowed(req)) return new Response("Origin not allowed", { status: 403 });
@@ -369,6 +446,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
             const storageId = await runtime.upload(url.searchParams.get("token"), req);
             return json(req, { storageId });
           } catch (err) {
+            if (tooLarge(req, err)) return json(req, { error: new BodyTooLarge(maxBody).message }, 413);
             return json(req, { error: runtime.toClientError(err).message }, 400);
           }
         }
@@ -409,6 +487,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
         } catch (err) {
           // A bad or expired session token is the caller's problem, not a server error.
           if (err instanceof AuthError) return new Response(err.message, { status: err.status });
+          if (tooLarge(req, err)) return new Response(new BodyTooLarge(maxBody).message, { status: 413 });
           runtime.log.error(`HTTP ${req.method} ${path}: ${err instanceof Error ? err.message : String(err)}`);
           return new Response(runtime.toClientError(err).message, { status: 500 });
         }

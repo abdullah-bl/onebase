@@ -22,11 +22,24 @@ export interface BlobBackend {
   remove(id: string): Promise<void>;
   /** Size and type of the stored bytes, or null when there are none. */
   stat(id: string): Promise<BlobStat | null>;
-  /**
-   * A URL the client can PUT the file's bytes to, straight into storage, valid for `expiresIn`
-   * seconds. Absent when the backend can't take uploads directly (local disk).
-   */
-  presignUpload?(id: string, expiresIn: number): string;
+  /** Uploads straight into storage. Absent when the backend can't take them (local disk). */
+  direct?: DirectUploads;
+}
+
+/**
+ * Direct uploads go to a staging object, never to the file's own key: a presigned URL can't be
+ * revoked, so a URL for the file itself would let the client replace (or re-create) the file after
+ * confirmUpload() checked it. Confirming copies the staged bytes to the file's key.
+ */
+export interface DirectUploads {
+  /** A URL the client can PUT the bytes to (the staging object), valid for `expiresIn` seconds. */
+  presign(id: string, expiresIn: number): string;
+  /** Size and type of the staged bytes, or null when there are none. */
+  stat(id: string): Promise<BlobStat | null>;
+  /** Copies the staged bytes to the file's own key, stored with `contentType`. Throws when nothing is staged. */
+  promote(id: string, contentType: string | null): Promise<void>;
+  /** Deletes the staged bytes (nothing there is fine). */
+  remove(id: string): Promise<void>;
 }
 
 /**
@@ -170,20 +183,35 @@ export class S3Blobs implements BlobBackend {
   async remove(id: string) {
     await this.loc.client.delete(this.key(id));
   }
-  async stat(id: string) {
+  stat(id: string) {
+    return this.statKey(this.key(id));
+  }
+  private async statKey(key: string): Promise<BlobStat | null> {
     try {
-      const stat = await this.loc.client.file(this.key(id)).stat();
+      const stat = await this.loc.client.file(key).stat();
       return { size: stat.size, contentType: stat.type || null };
     } catch (err) {
       if ((err as { code?: string })?.code === "NoSuchKey" || (err as { code?: string })?.code === "NotFound") return null;
       throw err;
     }
   }
-  presignUpload(id: string, expiresIn: number) {
+  /** Where direct uploads land until confirmUpload() copies them to the file's key. Ids have no "/", so this never names a file. */
+  private stagingKey(id: string) {
+    return `${this.loc.prefix}uploads/${checkId(id)}`;
+  }
+  readonly direct: DirectUploads = {
     // Content-Type isn't part of the signature (Bun signs only the host), so any type is accepted
     // here and checked by confirmUpload; serve() pins the type downloads are answered with.
-    return this.loc.client.presign(this.key(id), { method: "PUT", expiresIn });
-  }
+    presign: (id, expiresIn) => this.loc.client.presign(this.stagingKey(id), { method: "PUT", expiresIn }),
+    stat: (id) => this.statKey(this.stagingKey(id)),
+    promote: async (id, contentType) => {
+      const staged = this.loc.client.file(this.stagingKey(id));
+      await this.loc.client.write(this.key(id), staged, contentType ? { type: contentType } : undefined);
+    },
+    remove: async (id) => {
+      await this.loc.client.delete(this.stagingKey(id));
+    },
+  };
 }
 
 const UPLOAD_URL_TTL_MS = 60 * 60_000;
@@ -201,6 +229,11 @@ export type Reservation = { id: string; token: string; expires: number; size: nu
 
 /** size while a POST to a local reservation is still streaming. */
 const UPLOADING = -1;
+/**
+ * size once confirmed, on a backend with staged direct uploads. The row stays until the URL (and
+ * grace period) is past, so the sweep can delete anything PUT to the staging object after the confirm.
+ */
+export const CONFIRMED = -2;
 
 export class FileStore {
   constructor(
@@ -287,6 +320,11 @@ export class FileStore {
     await tx.run("DELETE FROM _upload_reservations WHERE id = ?", [id]);
   }
 
+  /** Keeps a confirmed reservation until its URL is long expired, so the sweep clears its staging object. */
+  async markConfirmed(tx: Exec, id: string) {
+    await tx.run("UPDATE _upload_reservations SET size = ? WHERE id = ?", [CONFIRMED, id]);
+  }
+
   /**
    * The upload endpoint's half of a reservation on a backend without presigned PUTs: claims it
    * (one upload at a time, before it expires), streams and hashes the bytes, and records what came.
@@ -322,10 +360,10 @@ export class FileStore {
     );
   }
 
-  /** Reservations whose time (plus twice the grace period) is up: their bytes can go. */
-  async expiredReservations(tx: Exec, now = Date.now(), limit = 500): Promise<string[]> {
-    const rows = await tx.all(`SELECT id FROM _upload_reservations WHERE expires < ? ORDER BY expires LIMIT ${limit}`, [now - 2 * RESERVATION_GRACE_MS]);
-    return rows.map((r) => r.id as string);
+  /** Reservations whose time (plus twice the grace period) is up: their uploaded bytes can go. */
+  async expiredReservations(tx: Exec, now = Date.now(), limit = 500): Promise<{ id: string; confirmed: boolean }[]> {
+    const rows = await tx.all(`SELECT id, size FROM _upload_reservations WHERE expires < ? ORDER BY expires LIMIT ${limit}`, [now - 2 * RESERVATION_GRACE_MS]);
+    return rows.map((r) => ({ id: r.id as string, confirmed: Number(r.size) === CONFIRMED }));
   }
 
   async dropExpiredReservations(tx: Exec, ids: string[], now = Date.now()) {

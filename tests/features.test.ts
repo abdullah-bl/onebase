@@ -86,6 +86,7 @@ describe("JWT auth providers", () => {
     const verifier = new JwtVerifier([{ domain: rs.origin, applicationID: "my-app" }]);
     const reason = (p: Promise<unknown>) => p.then(() => "accepted", (e: Error) => e.message);
     expect(await reason(verifier.verify(await rs.sign({ iss: rs.origin, sub: "u", aud: "my-app", exp: now() - 3600 })))).toContain("expired");
+    expect(await reason(verifier.verify(await rs.sign({ iss: rs.origin, sub: "u", aud: "my-app" })))).toContain("no expiry");
     expect(await reason(verifier.verify(await rs.sign({ iss: rs.origin, sub: "u", aud: "other", exp: now() + 60 })))).toContain("audience");
     expect(await reason(verifier.verify(await rs.sign({ iss: "https://evil.example", sub: "u", aud: "my-app" })))).toContain("isn't configured");
     // Signed by a different key than the issuer's.

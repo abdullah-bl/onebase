@@ -125,8 +125,10 @@ export function serve(opts: ServeOptions): Server<SocketData> {
 
   const clientIp = (req: Request, server: Server<SocketData>) => {
     if (opts.trustProxy) {
-      // Fly's edge sets Fly-Client-IP itself, while X-Forwarded-For can start with whatever the client sent.
-      const forwarded = req.headers.get("Fly-Client-IP")?.trim() || req.headers.get("X-Forwarded-For")?.split(",")[0]?.trim() || req.headers.get("X-Real-IP");
+      // On Fly (which sets FLY_APP_NAME) the edge sets Fly-Client-IP itself, while X-Forwarded-For can start with
+      // whatever the client sent. Anywhere else Fly-Client-IP is just a header the client chose, so it's ignored.
+      const fly = process.env.FLY_APP_NAME ? req.headers.get("Fly-Client-IP")?.trim() : undefined;
+      const forwarded = fly || req.headers.get("X-Forwarded-For")?.split(",")[0]?.trim() || req.headers.get("X-Real-IP");
       if (forwarded) return forwarded;
     }
     return server.requestIP(req)?.address ?? "unknown";

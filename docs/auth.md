@@ -174,7 +174,7 @@ export const myNotes = query({
 
 `ctx.auth.getUserIdentity()` works too. Its `subject` is the user's id, and it has `email`, `name` and `pictureUrl` from the user document.
 
-Users are ordinary documents, so you can read them, add fields and show them in the dashboard. Deleting a user (`ctx.db.delete(userId)` or in the dashboard) also ends their sign-ins: sessions are removed and open connections closed, and the linked Apple, email and OAuth accounts, agent connections, and the sign-in codes and rate-limit counts that hold their email address are deleted too. To add your own fields, define `users` yourself instead of spreading `authTables`. Keep `name`, `email`, `image` and `emailVerificationTime`, and make new fields optional or fill them at sign-up with `password({ profile: (params) => ({ email: params.email, plan: "free" }) })`. The server checks at startup that the users table accepts new users.
+Users are ordinary documents, so you can read them, add fields and show them in the dashboard. Deleting a user (`ctx.db.delete(userId)` or in the dashboard) also ends their sign-ins: sessions are removed and open connections closed, and the linked Apple, email and OAuth accounts, agent connections, and the sign-in codes and rate-limit counts that hold their email address are deleted too. To add your own fields, define `users` yourself instead of spreading `authTables`. Keep `name`, `email`, `image` and `emailVerificationTime`, and make new fields optional or fill them at sign-up with `password({ profile: (params) => ({ plan: "free" }) })`. Profile hooks get what the client sent, minus secrets (`password`, `newPassword`, `code`, `idToken`, `nonce`); treat the rest as user input, and don't copy fields like `role` from it. The server checks at startup that the users table accepts new users.
 
 Don't let your own mutations change `email` or `emailVerificationTime`. An OAuth sign-in joins the user whose verified email matches, so a user who could set their email to someone else's would get that person's account. If users can change their email, clear `emailVerificationTime` in the same mutation and confirm the new address with a code. (`profile` can't set `emailVerificationTime`.)
 
@@ -191,27 +191,51 @@ export default {
 };
 ```
 
-In dev mode, `localhost` is always allowed. Other providers:
+In dev mode, `localhost` is always allowed.
+
+Built-in providers, each reading `AUTH_<NAME>_ID` and `AUTH_<NAME>_SECRET` unless you pass `{ clientId, clientSecret }`:
+
+| Method | Notes |
+| --- | --- |
+| `github()` | Uses the verified primary email. |
+| `google()` | |
+| `microsoft({ tenant })` | `tenant` defaults to `AUTH_MICROSOFT_TENANT` or `"common"`; use your tenant id to allow only your organization. |
+| `discord()` | |
+| `facebook()` | |
+| `twitter()` | X. It doesn't share the email. |
+| `gitlab({ issuer })` | gitlab.com, or your own with `issuer` (or `AUTH_GITLAB_ISSUER`). |
+| `linkedin()` | |
+| `slack()` | Sign in with Slack. |
+| `apple({ web })` | See [Sign in with Apple](#sign-in-with-apple). |
+
+Microsoft and Facebook don't say whether an email is verified, so their sign-ins never join an existing user by email.
+
+For any other provider, use `oidc()` if it publishes an OpenID Connect discovery document, or `oauth()`:
 
 ```ts
 import { oauth, oidc } from "onebase/auth";
 
 oidc({ id: "okta", issuer: "https://dev-123.okta.com", clientId, clientSecret }),
 oauth({
-  id: "discord",
+  id: "strava",
   clientId,
   clientSecret,
-  authorizationUrl: "https://discord.com/oauth2/authorize",
-  tokenUrl: "https://discord.com/api/oauth2/token",
-  scopes: ["identify", "email"],
+  authorizationUrl: "https://www.strava.com/oauth/authorize",
+  tokenUrl: "https://www.strava.com/oauth/token",
+  scopes: ["read"],
+  scopeSeparator: ",", // the default is a space
+  pkce: false, // the default sends a PKCE challenge
+  // tokenAuth: "basic", // send the client id and secret as HTTP Basic auth instead of in the body
   profile: async ({ access_token }) => {
-    const me = await fetch("https://discord.com/api/users/@me", { headers: { Authorization: `Bearer ${access_token}` } }).then((r) => r.json());
-    return { id: me.id, email: me.email, emailVerified: me.verified, name: me.global_name, image: undefined };
+    const me = await fetch("https://www.strava.com/api/v3/athlete", { headers: { Authorization: `Bearer ${access_token}` } }).then((r) => r.json());
+    return { id: String(me.id), name: `${me.firstname} ${me.lastname}`, image: me.profile };
   },
 }),
 ```
 
-**Linking accounts:** an OAuth sign-in with a new account joins an existing user only when both the provider and that user have verified the email address. Otherwise it creates a new user. This stops someone from signing up with another person's email and later sharing their account.
+`clientSecret` can also be a function that returns the secret, for providers that want a freshly signed one. `profile` gets a second argument, `{ params }`, with whatever else the provider sent to the callback. The callback accepts both a GET and a form POST (`response_mode=form_post`), and token endpoints may answer in JSON or form encoding.
+
+**Linking accounts:** an OAuth sign-in with a new account joins an existing user only when both the provider and that user have verified the email address. Otherwise it creates a new user. This stops someone from signing up with another person's email and later sharing their account. Each address has at most one verified user: confirming a password sign-up (with its emailed code) for an address another user already verified adds the password to that user instead of creating a second one, and a password reset doesn't mark a duplicate as verified.
 
 ### Sign in with Apple
 
@@ -237,7 +261,16 @@ or `POST /api/auth/signin` with `{ provider: "apple", params: { idToken, nonce, 
 - **New users:** `apple({ profile: (info) => ({ ... }) })` adds fields to a new user's document, like `password({ profile })`. `info` has `email`, `emailVerified`, `name` and the `params` the client sent. It can't set `email` or `emailVerificationTime`.
 - **Sessions:** sessions last as long as for any other method, and `signOut` ends them. Apple's token itself expires in minutes, so it is only used for the sign-in.
 
-This is the native flow. Apple sign-in in a browser (a Services ID and a signed client secret) isn't built in; use `oidc()` for it.
+**On the web**, `client.signIn("apple")` with no `idToken` redirects to Apple like any OAuth provider. Create a Services ID and a Sign in with Apple key (.p8) in your Apple developer account, register `<your public URL>/api/auth/callback/apple` as the return URL, and add `web`:
+
+```ts
+apple({
+  clientId: "com.example.myapp", // the iPhone app's bundle id, if you have one
+  web: { servicesId: "com.example.web", teamId: "ABCDE12345", keyId: "XYZ987WVU6", privateKey: process.env.APPLE_P8 },
+}),
+```
+
+or set `AUTH_APPLE_SERVICES_ID`, `AUTH_APPLE_TEAM_ID`, `AUTH_APPLE_KEY_ID` and `AUTH_APPLE_PRIVATE_KEY` (the .p8 contents; `\n` written out is fine). onebase signs the client secret Apple wants with that key, and reads the name Apple sends on the first sign-in. Apple only accepts https return URLs on a real domain, so test it on a deployed server. The app and the website sign in to the same account.
 
 ### Email code
 
@@ -346,6 +379,7 @@ export default {
 };
 ```
 
+- **Expiry:** tokens must have an `exp` claim. A token without one is refused, since it would work forever if it leaked.
 - **`domain`** is the token's issuer (`iss`). Keys are fetched from `<domain>/.well-known/openid-configuration`, cached, and refetched when the provider rotates them.
 - **`applicationID`**, if set, must appear in the token's audience (`aud`). In Clerk, create a JWT template with that name. In Auth0, set it as the API audience.
 - **Algorithms:** RS256/384/512, PS256, ES256/384 and EdDSA are supported, all verified with WebCrypto.

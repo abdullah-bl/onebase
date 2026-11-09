@@ -107,7 +107,10 @@ describe("Sign in with Apple and email codes", () => {
           apple({
             clientId: BUNDLE,
             jwksUrl: fake.url,
-            profile: (info) => ({ plan: "free", accountToken: crypto.randomUUID(), ...(info.provider === "apple" ? { appleSub: info.accountId } : {}) }),
+            profile: (info) => {
+              if (info.params.failProfile) throw new Error("profile failed");
+              return { plan: "free", accountToken: crypto.randomUUID(), ...(info.provider === "apple" ? { appleSub: info.accountId } : {}) };
+            },
           }),
           emailCode({
             codeLength: 6,
@@ -117,7 +120,7 @@ describe("Sign in with Apple and email codes", () => {
             },
             profile: () => ({ plan: "free", accountToken: crypto.randomUUID() }),
           }),
-          password({ sendCode: (m) => void sent.push(m) }),
+          password({ sendCode: (m) => void sent.push(m), profile: () => ({ plan: "free", accountToken: crypto.randomUUID() }) }),
         ],
       },
     });
@@ -216,6 +219,12 @@ describe("Sign in with Apple and email codes", () => {
       const again = await appleSignIn(token);
       expect(again.status).toBe(401);
       expect(again.body.error).toContain("already used");
+    });
+
+    test("a sign-in that fails while creating the user doesn't use up the token", async () => {
+      const token = await fake.identity({ sub: "apple-retry", email: "retry@example.com" });
+      expect((await appleSignIn({ ...token, failProfile: true })).status).not.toBe(200);
+      expect((await appleSignIn(token)).status).toBe(200);
     });
 
     test("refuses a wrong nonce, a missing nonce and a token without one", async () => {
@@ -374,13 +383,32 @@ describe("Sign in with Apple and email codes", () => {
     });
 
     test("behind a proxy that sets Fly-Client-IP, rotating X-Forwarded-For does not dodge the guess limit", async () => {
-      await start("rotate@example.com");
+      process.env.FLY_APP_NAME = "test-app";
+      try {
+        await start("rotate@example.com");
+        let last = 0;
+        for (let i = 0; i < 12; i++) {
+          const res = await fetch(`${base}/api/auth/signin`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "fly-client-ip": "203.0.113.9", "x-forwarded-for": `198.51.100.${i + 1}` },
+            body: JSON.stringify({ provider: "email", params: { flow: "verify", email: "rotate@example.com", code: "000000" } }),
+          });
+          last = res.status;
+        }
+        expect(last).toBe(429);
+      } finally {
+        delete process.env.FLY_APP_NAME;
+      }
+    });
+
+    test("off Fly, a client-sent Fly-Client-IP is ignored", async () => {
+      await start("spoof@example.com");
       let last = 0;
       for (let i = 0; i < 12; i++) {
         const res = await fetch(`${base}/api/auth/signin`, {
           method: "POST",
-          headers: { "Content-Type": "application/json", "fly-client-ip": "203.0.113.9", "x-forwarded-for": `198.51.100.${i + 1}` },
-          body: JSON.stringify({ provider: "email", params: { flow: "verify", email: "rotate@example.com", code: "000000" } }),
+          headers: { "Content-Type": "application/json", "fly-client-ip": `203.0.113.${i + 1}`, "x-forwarded-for": "198.51.100.7" },
+          body: JSON.stringify({ provider: "email", params: { flow: "verify", email: "spoof@example.com", code: "000000" } }),
         });
         last = res.status;
       }

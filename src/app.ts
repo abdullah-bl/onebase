@@ -61,6 +61,8 @@ export type AppOptions = {
   /** Per-IP limit on function calls, subscriptions and uploads. */
   rateLimit?: RateLimit | null;
   trustProxy?: boolean;
+  /** Largest request body (and so upload), in bytes (default 1 GB). */
+  maxBodyBytes?: number;
   /** How often open connections re-check their auth token, in ms (default 60s; 0 disables). */
   sessionRecheckMs?: number;
   /** Refuse a pushed bundle that takes longer than this to load (default 30s). */
@@ -146,6 +148,7 @@ export async function startApp(opts: AppOptions) {
     cors: opts.cors,
     rateLimit: opts.rateLimit,
     trustProxy: opts.trustProxy,
+    maxBodyBytes: opts.maxBodyBytes,
     sessionRecheckMs: opts.sessionRecheckMs,
     admin: adminKey ? createAdmin({ runtime, key: adminKey.key, assets: dashboardAssets, version: VERSION }) : null,
   });

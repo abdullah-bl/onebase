@@ -164,7 +164,13 @@ export class FileStore {
         },
       }),
     );
-    await this.backend.put(id, counted, contentType || null);
+    try {
+      await this.backend.put(id, counted, contentType || null);
+    } catch (err) {
+      // Say, the upload went over the size limit or the client went away: drop what was written.
+      await this.backend.remove(id).catch(() => {});
+      throw err;
+    }
     return { _id: id, _creationTime: this.nextCreationTime(), sha256: hasher.digest("base64"), size, contentType: contentType || null };
   }
 

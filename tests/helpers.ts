@@ -19,7 +19,7 @@ export async function openRuntime(make: () => Driver, opts: Omit<RuntimeOptions,
   if (driver.shared) {
     await driver.init();
     await driver.write(async (tx) => {
-      for (const t of ["documents", "_scheduled", "_crons", "_storage", "_upload_tokens", "_meta", "_auth_sessions", "_auth_accounts", "_auth_codes", "_auth_attempts", "_mcp_clients", "_mcp_connections", "_mcp_tokens", "_deployments", "_env"]) {
+      for (const t of ["documents", "_scheduled", "_crons", "_storage", "_upload_tokens", "_upload_reservations", "_meta", "_auth_sessions", "_auth_accounts", "_auth_codes", "_auth_attempts", "_mcp_clients", "_mcp_connections", "_mcp_tokens", "_deployments", "_env"]) {
         await tx.run(`DELETE FROM ${t}`);
       }
     });

@@ -443,7 +443,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
         }
         if (path === "/api/storage/upload" && req.method === "POST") {
           try {
-            const storageId = await runtime.upload(url.searchParams.get("token"), req);
+            const storageId = await runtime.upload(url.searchParams.get("token"), req, url.searchParams.get("id"));
             return json(req, { storageId });
           } catch (err) {
             if (tooLarge(req, err)) return json(req, { error: new BodyTooLarge(maxBody).message }, 413);

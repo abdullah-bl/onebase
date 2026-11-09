@@ -192,6 +192,7 @@ export const sqliteDialect: Dialect = {
     "CREATE TABLE IF NOT EXISTS _crons (name TEXT PRIMARY KEY, spec TEXT NOT NULL, next_run REAL NOT NULL, last_run REAL, last_error TEXT)",
     "CREATE TABLE IF NOT EXISTS _storage (id TEXT PRIMARY KEY, ct REAL NOT NULL, sha256 TEXT NOT NULL, size INTEGER NOT NULL, content_type TEXT)",
     "CREATE TABLE IF NOT EXISTS _upload_tokens (token TEXT PRIMARY KEY, expires REAL NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS _upload_reservations (id TEXT PRIMARY KEY, token TEXT NOT NULL, expires REAL NOT NULL, size INTEGER, content_type TEXT, sha256 TEXT)",
     `CREATE TABLE IF NOT EXISTS _meta ("key" TEXT PRIMARY KEY, value TEXT NOT NULL)`,
     "CREATE TABLE IF NOT EXISTS _deployments (id TEXT PRIMARY KEY, created REAL NOT NULL, code TEXT NOT NULL, assets TEXT)",
     // Integer row ids for FTS5 tables (documents has text ids).
@@ -335,6 +336,7 @@ export const postgresDialect: Dialect = {
     "CREATE TABLE IF NOT EXISTS _crons (name TEXT PRIMARY KEY, spec TEXT NOT NULL, next_run DOUBLE PRECISION NOT NULL, last_run DOUBLE PRECISION, last_error TEXT)",
     "CREATE TABLE IF NOT EXISTS _storage (id TEXT PRIMARY KEY, ct DOUBLE PRECISION NOT NULL, sha256 TEXT NOT NULL, size BIGINT NOT NULL, content_type TEXT)",
     "CREATE TABLE IF NOT EXISTS _upload_tokens (token TEXT PRIMARY KEY, expires DOUBLE PRECISION NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS _upload_reservations (id TEXT PRIMARY KEY, token TEXT NOT NULL, expires DOUBLE PRECISION NOT NULL, size BIGINT, content_type TEXT, sha256 TEXT)",
     `CREATE TABLE IF NOT EXISTS _meta ("key" TEXT PRIMARY KEY, value TEXT NOT NULL)`,
     "CREATE TABLE IF NOT EXISTS _deployments (id TEXT PRIMARY KEY, created DOUBLE PRECISION NOT NULL, code TEXT NOT NULL, assets TEXT)",
     ...authDdl("DOUBLE PRECISION"),
@@ -426,6 +428,7 @@ export const mysqlDialect: Dialect = {
     `CREATE TABLE IF NOT EXISTS _crons (name ${MY_KEY} PRIMARY KEY, spec TEXT NOT NULL, next_run DOUBLE NOT NULL, last_run DOUBLE, last_error TEXT) ${MY_TABLE}`,
     `CREATE TABLE IF NOT EXISTS _storage (id ${MY_KEY} PRIMARY KEY, ct DOUBLE NOT NULL, sha256 VARCHAR(64) NOT NULL, size BIGINT NOT NULL, content_type ${MY_KEY}) ${MY_TABLE}`,
     `CREATE TABLE IF NOT EXISTS _upload_tokens (token ${MY_KEY} PRIMARY KEY, expires DOUBLE NOT NULL) ${MY_TABLE}`,
+    `CREATE TABLE IF NOT EXISTS _upload_reservations (id ${MY_KEY} PRIMARY KEY, token ${MY_KEY} NOT NULL, expires DOUBLE NOT NULL, size BIGINT, content_type ${MY_KEY}, sha256 VARCHAR(64)) ${MY_TABLE}`,
     `CREATE TABLE IF NOT EXISTS _meta ("key" ${MY_KEY} PRIMARY KEY, value LONGTEXT NOT NULL) ${MY_TABLE}`,
     `CREATE TABLE IF NOT EXISTS _deployments (id ${MY_KEY} PRIMARY KEY, created DOUBLE NOT NULL, code LONGTEXT NOT NULL, assets LONGTEXT) ${MY_TABLE}`,
     `CREATE TABLE IF NOT EXISTS _auth_accounts (provider ${MY_KEY} NOT NULL, account_id ${MY_KEY} NOT NULL, user_id ${MY_KEY} NOT NULL, secret TEXT, created DOUBLE NOT NULL, PRIMARY KEY (provider, account_id), KEY _auth_accounts_user (user_id)) ${MY_TABLE}`,

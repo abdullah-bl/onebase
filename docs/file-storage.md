@@ -1,6 +1,6 @@
 ---
 title: File storage
-description: Upload, serve and delete files, on local disk or in S3, R2 or MinIO.
+description: Upload, serve and delete files, on local disk or in any S3-compatible store, including uploads straight to the bucket.
 ---
 
 # File storage
@@ -32,7 +32,81 @@ const { storageId } = await res.json();
 await client.mutation(api.photos.savePhoto, { image: storageId, caption });
 ```
 
-Upload URLs work once and expire after an hour. Uploads are streamed straight to storage and hashed on the way, so even large files never sit in memory.
+Upload URLs work once and expire after an hour. Uploads are streamed straight to storage and hashed on the way, so even large files never sit in memory. The largest body the server accepts is set by `--max-upload` (default 1 GB).
+
+## Uploading straight to the bucket
+
+With S3 storage, the bytes can skip the server: the client PUTs the file to a presigned URL, then a mutation confirms it. The server only signs a URL and checks the result, so big uploads don't tie it up.
+
+```ts
+export const generateUploadUrl = mutation({
+  args: { contentType: v.string() },
+  handler: (ctx, { contentType }) => ctx.storage.generateUploadUrl({ direct: true, contentType }),
+});
+
+export const savePhoto = mutation({
+  args: { image: v.id("_storage"), caption: v.string() },
+  handler: async (ctx, { image, caption }) => {
+    // Checks what arrived: deletes it and throws if it's too big or the wrong type.
+    await ctx.storage.confirmUpload(image, { maxBytes: 20 * 2 ** 20, contentTypes: ["image/*"] });
+    return ctx.db.insert("photos", { image, caption });
+  },
+});
+```
+
+```ts
+const { url, method, headers, storageId } = await client.mutation(api.photos.generateUploadUrl, { contentType: file.type });
+const res = await fetch(url, { method, headers, body: file });
+if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
+await client.mutation(api.photos.savePhoto, { image: storageId, caption });
+```
+
+`generateUploadUrl({ direct: true, contentType?, expiresIn? })` reserves a storage id and returns:
+
+| | |
+|---|---|
+| `storageId` | The file's id once confirmed. |
+| `url`, `method`, `headers` | Where to send the bytes: `fetch(url, { method, headers, body })`. |
+| `expiresAt` | When the URL stops working (ms). `expiresIn` sets it, in seconds: default 900, at most 7 days. |
+| `direct` | `true` for a presigned `PUT` straight to the bucket. `false` with local-disk storage: the URL is this server's upload endpoint (`POST`), so the same client code works on both. |
+
+`confirmUpload(storageId, { maxBytes?, contentTypes? })` looks up what was uploaded (an S3 `HEAD`). It then does one of four things:
+
+- **The file passes:** it becomes a file with its size and type from the bucket, and you get its metadata.
+- **It's larger than `maxBytes`** (default: the server's `--max-upload`) **or its type isn't in `contentTypes`** (`"image/png"` or `"image/*"`): it throws and deletes the bytes.
+- **Nothing has arrived yet:** it throws and keeps the reservation, so the client can still upload.
+- **It was already confirmed:** you get the same metadata again, so it's safe to retry.
+
+A rejection throws, which rolls back the rest of the mutation. The reservation lasts until its URL expires, so the client can send another file to the same URL.
+
+Mutations and actions can both call it. In an action, the `HEAD` happens before the write lock is taken.
+
+**Cleanup.** A reservation nobody confirms is deleted, bytes and all, two hours after its URL expires. The server sweeps at startup and every 10 minutes, so you don't need a bucket lifecycle rule. Confirming still works for an hour after expiry, for an upload that started just in time.
+
+**What the server can't enforce.** A presigned PUT doesn't sign the size or the `Content-Type`, so the bucket takes whatever the client sends. That's why `confirmUpload` checks both. Downloads are answered with the confirmed type, pinned with `response-content-type`. Types a browser could run as a page are sent as `attachment` downloads. Until `expiresAt`, the URL can still overwrite the object, even after it's confirmed, so keep `expiresIn` short.
+
+**`sha256`.** Files uploaded straight to the bucket have `sha256: null`, because the server never sees their bytes. Every S3-compatible store implements plain `PUT`/`HEAD`, but checksum headers on presigned URLs are optional and inconsistently supported across them. Downloads come from the bucket, which sets its own `ETag` for caching. If you need a hash, compute it in an action with `ctx.storage.get(id)`. Uploads through the server, including the local-disk fallback, are hashed as they stream.
+
+### Provider notes
+
+Direct uploads use plain S3 calls: presigned `PUT` and `GET`, plus `HEAD` and `DELETE`. They need no multipart uploads, lifecycle rules, checksums or provider-specific APIs.
+
+| Provider | Largest single PUT | CORS for browser uploads |
+|---|---|---|
+| AWS S3 | 5 GB | Bucket CORS: `aws s3api put-bucket-cors` |
+| Cloudflare R2 | 5 GiB (about 4.995) | Bucket → Settings → CORS policy, or `wrangler r2 bucket cors set` |
+| MinIO | 5 TiB | Server-wide: `MINIO_API_CORS_ALLOW_ORIGIN` (default `*`) |
+| Backblaze B2 | 5 GB | Bucket CORS rules with `s3_put`, `s3_get` and `s3_head` (web UI or `b2` CLI) |
+| DigitalOcean Spaces | 5 GB | Space → Settings → CORS, or `PutBucketCors` |
+| Wasabi | 5 GB | `PutBucketCors` |
+
+Bigger files need multipart uploads, which onebase doesn't sign. Set `maxBytes` (or `--max-upload`) below your provider's limit.
+
+Browsers need a CORS rule on the bucket that allows `PUT` from your app's origin, with the `Content-Type` header. Native apps don't. An S3-style rule looks like this:
+
+```json
+[{ "AllowedOrigins": ["https://app.example.com"], "AllowedMethods": ["PUT", "GET", "HEAD"], "AllowedHeaders": ["Content-Type"], "MaxAgeSeconds": 3600 }]
+```
 
 ## Serving files
 
@@ -59,6 +133,8 @@ Set `--url https://api.example.com` so these URLs use your public address.
 | `ctx.storage.getUrl(id)` | ✓ | ✓ | ✓ |
 | `ctx.storage.getMetadata(id)` → `{ sha256, size, contentType, … }` | ✓ | ✓ | ✓ |
 | `ctx.storage.generateUploadUrl()` | | ✓ | ✓ |
+| `ctx.storage.generateUploadUrl({ direct: true })` → `{ url, method, headers, storageId, expiresAt, direct }` | | ✓ | ✓ |
+| `ctx.storage.confirmUpload(id, { maxBytes?, contentTypes? })` → metadata | | ✓ | ✓ |
 | `ctx.storage.delete(id)` | | ✓ | ✓ |
 | `ctx.storage.store(blob)` → id | | | ✓ |
 | `ctx.storage.get(id)` → `Blob` | | | ✓ |
@@ -77,7 +153,7 @@ const storageId = await ctx.storage.store(image);
 | | |
 |---|---|
 | Default | `<data dir>/files` (`./onebase_data/files`) |
-| S3 / R2 / MinIO | `--files s3://bucket/prefix` |
+| Any S3-compatible store (AWS S3, R2, MinIO, B2, Spaces, Wasabi…) | `--files s3://bucket/prefix` |
 
 S3 credentials come from environment variables:
 

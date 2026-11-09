@@ -48,7 +48,7 @@ onebase follows [Convex](https://convex.dev)'s programming model and API, and ma
 | [Client protocol](./client-protocol.md) | The wire contract every client implements — JS, [Swift](./swift.md), and yours |
 | [Swift client](./swift.md) | iOS and macOS apps: live queries, auth, optimistic updates, offline |
 | [Scheduling](./scheduling.md) | `runAfter` / `runAt`, plus cron jobs that survive restarts |
-| [File storage](./file-storage.md) | Uploads and downloads, on local disk or in S3 / R2 / MinIO |
+| [File storage](./file-storage.md) | Uploads and downloads, on local disk or any S3-compatible store; direct-to-bucket uploads |
 | [Auth](./auth.md) | Built-in password and OAuth sign-in with sessions, or tokens from Clerk, Auth0, WorkOS and any OIDC provider |
 | [HTTP actions](./http-actions.md) | Webhooks and custom HTTP endpoints |
 | [MCP](./mcp.md) | Let AI agents use your app: tools at /mcp, with OAuth 2.1 sign-in and API keys |

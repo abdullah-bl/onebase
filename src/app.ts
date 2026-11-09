@@ -130,6 +130,7 @@ export async function startApp(opts: AppOptions) {
     log: consoleLogger,
     loadCode: opts.deploys === false ? null : importBundle,
     loadTimeoutMs: opts.loadTimeoutMs,
+    maxUploadBytes: opts.maxBodyBytes,
     timeLimits: opts.timeLimits,
     source: opts.source,
     actionWorkers: opts.actionWorkers,

@@ -17,7 +17,18 @@ import { BACKFILL_BATCH, backfilled, coalesce, hookState, readProgress, writePro
 import { applySchema, DatabaseImpl, OnebaseError, readerView, writerView, type ReadSet, type VectorSearchQuery, type Write } from "./database";
 import { isIdForTable, newId } from "./dialect";
 import { envNumber, savepoint, SerialQueue, type Driver, type Exec } from "./driver";
-import { FileStore, LocalBlobs, type BlobBackend } from "./files";
+import {
+  DIRECT_UPLOAD_DEFAULT_SECONDS,
+  DIRECT_UPLOAD_MAX_SECONDS,
+  FileStore,
+  LocalBlobs,
+  RESERVATION_GRACE_MS,
+  typeAllowed,
+  type BlobBackend,
+  type BlobStat,
+  type FileMetadata,
+} from "./files";
+import { DEFAULT_MAX_BODY_BYTES } from "./http";
 import { CallLog, type CallSource } from "./calllog";
 import { CallBudget, DEFAULT_CALL_LIMITS, type CallLimits } from "./limits";
 import { currentFunction, installGuards } from "./guard";
@@ -152,7 +163,35 @@ export type RuntimeOptions = {
   envVars?: EnvVars;
   /** The caller already ran driver.init() (to read stored variables before loading the code). */
   driverReady?: boolean;
+  /** Largest file confirmUpload() accepts unless told otherwise; the server's --max-upload (default 1 GB). */
+  maxUploadBytes?: number;
 };
+
+/** ctx.storage.generateUploadUrl({ direct: true, ... }) */
+export type DirectUploadOptions = { direct: true; contentType?: string; expiresIn?: number };
+
+/** Where and how the client sends a file's bytes; then a mutation calls confirmUpload(storageId). */
+export type DirectUploadUrl = {
+  storageId: string;
+  url: string;
+  /** PUT: straight to the bucket. POST: this server's upload endpoint (a backend without presigned uploads, like local disk). */
+  method: "PUT" | "POST";
+  /** Headers to send with the request (Content-Type, when one was given). */
+  headers: Record<string, string>;
+  /** When the URL stops working, in ms since the epoch. */
+  expiresAt: number;
+  /** Whether the bytes go straight to storage, bypassing this server. */
+  direct: boolean;
+};
+
+export type ConfirmUploadOptions = {
+  /** Largest size accepted, in bytes (default: the server's --max-upload). */
+  maxBytes?: number;
+  /** Types accepted, exact ("image/png") or by family ("image/*"); default: any. */
+  contentTypes?: string[];
+};
+
+const SWEEP_INTERVAL_MS = 10 * 60_000;
 
 /** What an environment variable change did. */
 export type EnvChange = {
@@ -313,6 +352,8 @@ export class Runtime {
   private schedulerTimer: ReturnType<typeof setTimeout> | null = null;
   private runningJobs = 0;
   private heartbeat: ReturnType<typeof setInterval> | null = null;
+  private uploadSweeper: ReturnType<typeof setInterval> | null = null;
+  readonly maxUploadBytes: number;
   private lastCreationTime = 0;
   private readonly warnedQueries = new Set<string>();
   /** Signs function handles; loaded from the database by init(). */
@@ -349,6 +390,7 @@ export class Runtime {
     }
     this.files = new FileStore(opts.blobs ?? new LocalBlobs(mkdtempSync(join(tmpdir(), "onebase-files-"))), () => this.nextCreationTime());
     this.siteUrl = (opts.siteUrl ?? "http://localhost:8090").replace(/\/$/, "");
+    this.maxUploadBytes = opts.maxUploadBytes ?? DEFAULT_MAX_BODY_BYTES;
     const code = {
       schema: opts.schema,
       modules: opts.modules,
@@ -1206,10 +1248,109 @@ export class Runtime {
     state.afterCommit.push(() => this.files.backend.remove(id));
   }
 
+  /** generateUploadUrl(): the Convex-style POST URL; with { direct: true }, a DirectUploadUrl. */
+  private async uploadUrl(tx: Exec, opts: unknown): Promise<string | DirectUploadUrl> {
+    if (opts === undefined || opts === null || (isPlainObject(opts) && !opts.direct)) {
+      return `${this.siteUrl}/api/storage/upload?token=${await this.files.createUploadToken(tx)}`;
+    }
+    if (!isPlainObject(opts)) throw new OnebaseError("generateUploadUrl() takes no argument, or { direct: true, contentType?, expiresIn? }.");
+    const { contentType, expiresIn = DIRECT_UPLOAD_DEFAULT_SECONDS } = opts as Partial<DirectUploadOptions>;
+    if (contentType !== undefined && (typeof contentType !== "string" || /[\r\n]/.test(contentType))) {
+      throw new OnebaseError("generateUploadUrl(): contentType must be a string like \"image/png\".");
+    }
+    if (typeof expiresIn !== "number" || !Number.isInteger(expiresIn) || expiresIn < 1 || expiresIn > DIRECT_UPLOAD_MAX_SECONDS) {
+      throw new OnebaseError(`generateUploadUrl(): expiresIn must be a whole number of seconds from 1 to ${DIRECT_UPLOAD_MAX_SECONDS} (7 days).`);
+    }
+    const r = await this.files.reserve(tx, expiresIn);
+    const headers: Record<string, string> = contentType ? { "Content-Type": contentType } : {};
+    const presign = this.files.backend.presignUpload;
+    if (presign) {
+      return { storageId: r.id, url: presign.call(this.files.backend, r.id, expiresIn), method: "PUT", headers, expiresAt: r.expires, direct: true };
+    }
+    const url = `${this.siteUrl}/api/storage/upload?id=${r.id}&token=${r.token}`;
+    return { storageId: r.id, url, method: "POST", headers, expiresAt: r.expires, direct: false };
+  }
+
+  /** What the client uploaded for a reservation: recorded by our own endpoint, else asked of the backend. */
+  private async uploadedStat(id: string, recorded: { size: number | null; contentType: string | null }): Promise<BlobStat | null> {
+    const stat = await this.files.backend.stat(id);
+    // A rejected upload's bytes are gone even when its record was rolled back with the mutation.
+    if (!stat || recorded.size === null) return stat;
+    return { size: recorded.size, contentType: recorded.contentType };
+  }
+
+  /**
+   * ctx.storage.confirmUpload(): turns a reservation into a file once its bytes check out. A file
+   * already confirmed is returned as is, so calling it again is safe. `stat` is passed in when it
+   * was looked up before the transaction (actions).
+   */
+  private async confirmUpload(state: TxState, id: unknown, opts: unknown, stat?: BlobStat | null): Promise<FileMetadata> {
+    if (typeof id !== "string" || !/^[0-9a-z]+$/.test(id)) throw new OnebaseError(`confirmUpload(): expected a storage id, got ${describeValue(id)}.`);
+    if (opts !== undefined && !isPlainObject(opts)) throw new OnebaseError("confirmUpload(): options must be { maxBytes?, contentTypes? }.");
+    const { maxBytes = this.maxUploadBytes, contentTypes } = (opts ?? {}) as ConfirmUploadOptions;
+    if (typeof maxBytes !== "number" || !(maxBytes >= 0)) throw new OnebaseError("confirmUpload(): maxBytes must be a number of bytes.");
+    if (contentTypes !== undefined && (!Array.isArray(contentTypes) || contentTypes.some((t) => typeof t !== "string"))) {
+      throw new OnebaseError("confirmUpload(): contentTypes must be an array of types like \"image/*\".");
+    }
+    const existing = await this.files.metadata(state.tx, id);
+    if (existing) return existing;
+    const r = await this.files.reservation(state.tx, id);
+    if (!r) throw new OnebaseError(`confirmUpload(): no upload "${id}". Its URL may have expired; get a new one from generateUploadUrl({ direct: true }).`);
+    if (r.size === -1) throw new OnebaseError(`confirmUpload(): upload "${id}" is still in progress.`);
+    if (r.expires + RESERVATION_GRACE_MS < Date.now()) {
+      await this.files.dropReservation(state.tx, id);
+      await this.files.backend.remove(id).catch(() => {});
+      throw new OnebaseError(`confirmUpload(): upload "${id}" expired. Get a new URL from generateUploadUrl({ direct: true }).`);
+    }
+    const found = stat !== undefined && r.size === null ? stat : await this.uploadedStat(id, r);
+    // Nothing there (yet, or any more after a rejection): the reservation stays, so the client can
+    // still send a file before the URL expires.
+    if (!found) throw new OnebaseError(`confirmUpload(): nothing was uploaded for "${id}" yet.`);
+    const reject = async (why: string) => {
+      await this.files.dropReservation(state.tx, id);
+      await this.files.backend.remove(id).catch(() => {});
+      return new OnebaseError(`confirmUpload(): ${why} The upload was deleted.`);
+    };
+    if (found.size > maxBytes) throw await reject(`the file is ${found.size} bytes, more than the ${maxBytes} allowed.`);
+    if (contentTypes && !typeAllowed(found.contentType, contentTypes)) {
+      throw await reject(`the file's type ${found.contentType ? `"${found.contentType}"` : "(none)"} isn't one of ${contentTypes.join(", ")}.`);
+    }
+    const meta: FileMetadata = { _id: id, _creationTime: this.nextCreationTime(), sha256: r.sha256, size: found.size, contentType: found.contentType };
+    await this.files.insert(state.tx, meta);
+    await this.files.dropReservation(state.tx, id);
+    state.writes.push({ table: "_storage", id, before: null, after: null });
+    return meta;
+  }
+
+  /**
+   * Deletes the bytes of direct uploads nobody confirmed, once their URL and grace period are long
+   * gone. Runs at startup and every 10 minutes; needs no bucket lifecycle rule.
+   */
+  async sweepUploads(now = Date.now()): Promise<number> {
+    let removed = 0;
+    for (;;) {
+      const ids = await this.withReader((tx) => this.files.expiredReservations(tx, now));
+      if (!ids.length) return removed;
+      const gone: string[] = [];
+      for (const id of ids) {
+        try {
+          await this.files.backend.remove(id);
+          gone.push(id);
+        } catch (err) {
+          this.log.warn(`Uploads: couldn't delete unconfirmed upload ${id}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      if (gone.length) await this.withWriter((tx) => this.files.dropExpiredReservations(tx, gone, now));
+      removed += gone.length;
+      if (gone.length < ids.length || this.stopped) return removed;
+    }
+  }
+
   private storageWriter(state: TxState) {
     return {
       ...this.storageReader(state.tx),
-      generateUploadUrl: async () => `${this.siteUrl}/api/storage/upload?token=${await this.files.createUploadToken(state.tx)}`,
+      generateUploadUrl: (opts?: unknown) => this.uploadUrl(state.tx, opts),
+      confirmUpload: (id: unknown, opts?: unknown) => this.confirmUpload(state, id, opts),
       delete: (id: string) => this.removeFile(state, id),
     };
   }
@@ -1219,7 +1360,13 @@ export class Runtime {
     return {
       getUrl: async (id: string) => ((await read((tx) => this.files.metadata(tx, id))) ? this.fileUrl(id) : null),
       getMetadata: (id: string) => read((tx) => this.files.metadata(tx, id)),
-      generateUploadUrl: async () => `${this.siteUrl}/api/storage/upload?token=${await this.withWriter((tx) => this.files.createUploadToken(tx))}`,
+      generateUploadUrl: (opts?: unknown) => this.withWriter((tx) => this.uploadUrl(tx, opts)),
+      /** Asks the bucket before taking the write lock, so the lock isn't held over a network call. */
+      confirmUpload: async (id: unknown, opts?: unknown) => {
+        const pending = typeof id === "string" && /^[0-9a-z]+$/.test(id) ? await read((tx) => this.files.reservation(tx, id)) : null;
+        const stat = pending && pending.size === null ? await this.files.backend.stat(id as string) : undefined;
+        return this.transact((state) => this.confirmUpload(state, id, opts, stat));
+      },
       delete: (id: string) => this.transact((state) => this.removeFile(state, id)),
       /** Saves a Blob (e.g. from fetch) and returns its storage id. */
       store: async (blob: Blob) => {
@@ -1232,8 +1379,14 @@ export class Runtime {
     };
   }
 
-  /** Handles POST /api/storage/upload?token=... */
-  async upload(token: string | null, request: Request): Promise<string> {
+  /** Handles POST /api/storage/upload?token=... (and ?id=...&token=... for a direct upload without presigned URLs). */
+  async upload(token: string | null, request: Request, reservedId: string | null = null): Promise<string> {
+    if (reservedId !== null) {
+      if (!token) throw new OnebaseError("Upload URL is invalid: it has no token.");
+      if (!request.body) throw new OnebaseError("Upload body is empty. POST the file as the request body.");
+      await this.files.writeReserved((fn) => this.withWriter(fn), reservedId, token, request.body, request.headers.get("Content-Type"));
+      return reservedId;
+    }
     if (!token || !(await this.withWriter((tx) => this.files.consumeToken(tx, token)))) {
       throw new OnebaseError("Upload URL is invalid or expired. Get a fresh one from ctx.storage.generateUploadUrl() (each works once, for 1 hour).");
     }
@@ -1248,7 +1401,7 @@ export class Runtime {
     if (!/^[0-9a-z]+$/.test(id)) return null;
     const meta = await this.withReader((tx) => this.files.metadata(tx, id));
     if (!meta) return null;
-    if (request.headers.get("If-None-Match") === `"${meta.sha256}"`) return new Response(null, { status: 304 });
+    if (meta.sha256 && request.headers.get("If-None-Match") === `"${meta.sha256}"`) return new Response(null, { status: 304 });
     return this.files.backend.serve(id, meta);
   }
 
@@ -1735,6 +1888,14 @@ export class Runtime {
       }, 30_000);
     }
     this.schedulerStarted = true;
+    // Unconfirmed direct uploads: at startup, then every 10 minutes. Never fails startup.
+    const sweep = () =>
+      void this.sweepUploads()
+        .then((n) => n && this.log.info(`Uploads: deleted ${n} unconfirmed upload(s).`))
+        .catch((err) => this.log.error(`Uploads: ${err instanceof Error ? err.message : String(err)}`));
+    sweep();
+    this.uploadSweeper = setInterval(sweep, SWEEP_INTERVAL_MS);
+    this.uploadSweeper.unref?.();
     await this.startCrons();
   }
 
@@ -1848,6 +2009,7 @@ export class Runtime {
     this.cronRunner?.stop();
     if (this.schedulerTimer) clearTimeout(this.schedulerTimer);
     if (this.heartbeat) clearInterval(this.heartbeat);
+    if (this.uploadSweeper) clearInterval(this.uploadSweeper);
   }
 }
 

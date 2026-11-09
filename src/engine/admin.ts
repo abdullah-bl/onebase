@@ -264,7 +264,7 @@ export function createAdmin(opts: { runtime: Runtime; key: string; assets: Dashb
         const rows = before
           ? await tx.all(`SELECT id, ct, sha256, size, content_type FROM _storage WHERE ct < ? ORDER BY ct DESC LIMIT ${n}`, [before])
           : await tx.all(`SELECT id, ct, sha256, size, content_type FROM _storage ORDER BY ct DESC LIMIT ${n}`);
-        return rows.map((r) => ({ id: r.id, createdAt: Number(r.ct), size: Number(r.size), contentType: r.content_type, sha256: r.sha256 }));
+        return rows.map((r) => ({ id: r.id, createdAt: Number(r.ct), size: Number(r.size), contentType: r.content_type, sha256: r.sha256 || null }));
       }),
 
     // `onebase deploy`: the bundle's code, the frontend as { "/path": base64 } (or null), dryRun,

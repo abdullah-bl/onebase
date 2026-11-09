@@ -156,6 +156,7 @@ Store references as `v.id("_storage")`. The storage functions:
 - `ctx.storage.getUrl(id)` and `getMetadata(id)` work everywhere.
 - `generateUploadUrl()` and `delete(id)` work in mutations and actions. A delete in a mutation that fails is rolled back.
 - `store(blob)` and `get(id)` work in actions.
+- With S3 storage, `generateUploadUrl({ direct: true, contentType })` returns `{ url, method, headers, storageId, expiresAt, direct }`. The client calls `fetch(url, { method, headers, body: file })`, which goes straight to the bucket (`PUT`), or to the server's endpoint (`POST`) with local disk. A mutation then calls `ctx.storage.confirmUpload(storageId, { maxBytes, contentTypes: ["image/*"] })` before saving the id. It checks the upload and deletes it if it's too big or the wrong type. Unconfirmed uploads are deleted after they expire. Direct uploads have `sha256: null`. See docs/file-storage.md.
 
 Files are kept in `<data>/files`, or in S3 with `--files s3://bucket/prefix`. Set `--url https://your.domain` so file URLs use your public address.
 

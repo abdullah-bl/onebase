@@ -50,7 +50,7 @@ describe("dashboard admin API", () => {
       headers: { Authorization: `Bearer ${key}` },
       body: JSON.stringify(body),
     });
-    return { status: res.status, body: (await res.json()) as any };
+    return { status: res.status, body: (await res.json()) as any, res };
   };
   const ok = async (name: string, body: unknown = {}) => {
     const { body: r } = await admin(name, body);
@@ -79,6 +79,40 @@ describe("dashboard admin API", () => {
     expect((await fetch(`${base}/_admin/app.js`)).headers.get("content-type")).toContain("javascript");
     expect((await admin("overview", {}, "wrong")).status).toBe(401);
     expect((await admin("overview", {}, "")).status).toBe(401);
+  });
+
+  test("can't be framed, opened and scripted, or made to run injected script", async () => {
+    const page = await fetch(`${base}/_admin`);
+    const html = await page.text();
+    const csp = page.headers.get("content-security-policy") ?? "";
+    expect(csp).toContain("frame-ancestors 'none'");
+    expect(csp).toContain("default-src 'none'");
+    expect(csp).toContain("connect-src 'self'");
+    expect(csp).not.toContain("unsafe-eval");
+    // The only inline script (the theme) is allowed by its hash; nothing else inline runs.
+    const scriptSrc = /script-src ([^;]+)/.exec(csp)![1]!;
+    expect(scriptSrc).not.toContain("unsafe-inline");
+    const inline = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]!);
+    expect(inline.length).toBe(1);
+    const hash = new Bun.CryptoHasher("sha256").update(inline[0]!).digest("base64");
+    expect(scriptSrc).toContain(`'sha256-${hash}'`);
+    expect(page.headers.get("x-frame-options")).toBe("DENY");
+    expect(page.headers.get("cross-origin-opener-policy")).toBe("same-origin");
+    // The API and assets carry the same headers.
+    for (const res of [await fetch(`${base}/_admin/app.js`), (await admin("overview", {}, "wrong")).res, await fetch(`${base}/_admin/nope`)]) {
+      expect(res.headers.get("content-security-policy")).toBe(csp);
+      expect(res.headers.get("x-frame-options")).toBe("DENY");
+    }
+  });
+
+  test("the dashboard keeps the key out of localStorage", async () => {
+    const source = await Bun.file(new URL("../src/dashboard/api.ts", import.meta.url)).text();
+    expect(source).not.toMatch(/localStorage\.setItem/);
+    expect(source).toMatch(/sessionStorage\.setItem\(STORAGE_KEY/);
+    // And the shipped bundle is built from it.
+    const { dashboardAssets } = await import("../src/dashboard/bundle.generated");
+    expect(dashboardAssets.js).not.toMatch(/localStorage\.setItem\("ob-admin-key"/);
+    expect(dashboardAssets.js).toContain('localStorage.removeItem("ob-admin-key")');
   });
 
   test("browses and edits documents, with schema validation", async () => {

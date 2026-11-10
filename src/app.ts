@@ -178,7 +178,8 @@ export async function startApp(opts: AppOptions) {
     if (runtime.actionPool) console.log(`  actions    on up to ${runtime.actionPool.maxThreads} worker thread${runtime.actionPool.maxThreads === 1 ? "" : "s"}`);
     console.log(`  database   ${driver.description}`);
     console.log(`  files      ${blobs.description}`);
-    if (opts.backup) console.log(`  backups    ${opts.backup.url} every ${Math.round(opts.backup.everyMs / 60_000)} min, keep ${opts.backup.keep}`);
+    // Not the query: it may carry accessKeyId/secretAccessKey.
+    if (opts.backup) console.log(`  backups    ${opts.backup.url.replace(/\?.*$/s, "")} every ${Math.round(opts.backup.everyMs / 60_000)} min, keep ${opts.backup.keep}`);
     if (opts.cors?.length && !opts.cors.includes("*")) console.log(`  cors       ${opts.cors.join(", ")}`);
     const limits = runtime.timeLimits;
     if ((Object.keys(limits) as (keyof TimeLimits)[]).some((k) => limits[k] !== DEFAULT_TIME_LIMITS[k])) {

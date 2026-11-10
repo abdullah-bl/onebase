@@ -18,6 +18,7 @@ import { applySchema, DatabaseImpl, OnebaseError, readerView, writerView, type R
 import { isIdForTable, newId } from "./dialect";
 import { envNumber, savepoint, SerialQueue, type Driver, type Exec } from "./driver";
 import {
+  CONFIRMED,
   DIRECT_UPLOAD_DEFAULT_SECONDS,
   DIRECT_UPLOAD_MAX_SECONDS,
   FileStore,
@@ -1263,10 +1264,8 @@ export class Runtime {
     }
     const r = await this.files.reserve(tx, expiresIn);
     const headers: Record<string, string> = contentType ? { "Content-Type": contentType } : {};
-    const presign = this.files.backend.presignUpload;
-    if (presign) {
-      return { storageId: r.id, url: presign.call(this.files.backend, r.id, expiresIn), method: "PUT", headers, expiresAt: r.expires, direct: true };
-    }
+    const direct = this.files.backend.direct;
+    if (direct) return { storageId: r.id, url: direct.presign(r.id, expiresIn), method: "PUT", headers, expiresAt: r.expires, direct: true };
     const url = `${this.siteUrl}/api/storage/upload?id=${r.id}&token=${r.token}`;
     return { storageId: r.id, url, method: "POST", headers, expiresAt: r.expires, direct: false };
   }
@@ -1280,9 +1279,31 @@ export class Runtime {
   }
 
   /**
+   * Copies a direct upload's staged bytes to the file's own key and returns what is there now (null:
+   * nothing was staged). The copy is what gets checked, not the staged object: the client can PUT
+   * to that again at any time, but only the server writes the file's key.
+   */
+  private async promoteUpload(id: string): Promise<BlobStat | null> {
+    const direct = this.files.backend.direct!;
+    const staged = await direct.stat(id);
+    if (!staged) return null;
+    await direct.promote(id, staged.contentType);
+    const copied = await this.files.backend.stat(id);
+    // The size is the copy's; the type is the one the copy was written with (the store may add a
+    // charset to what it reports, and downloads are served with the recorded type anyway).
+    return copied && { size: copied.size, contentType: staged.contentType };
+  }
+
+  /** Deletes an unconfirmed upload's bytes, wherever they are. */
+  private async removeUpload(id: string) {
+    await Promise.all([this.files.backend.direct?.remove(id), this.files.backend.remove(id)]);
+  }
+
+  /**
    * ctx.storage.confirmUpload(): turns a reservation into a file once its bytes check out. A file
-   * already confirmed is returned as is, so calling it again is safe. `stat` is passed in when it
-   * was looked up before the transaction (actions).
+   * already confirmed is returned if it meets these limits too, so calling it again is safe. `stat`
+   * is passed in when it was looked up before the transaction (actions): for a staged direct
+   * upload, what promoteUpload() found.
    */
   private async confirmUpload(state: TxState, id: unknown, opts: unknown, stat?: BlobStat | null): Promise<FileMetadata> {
     if (typeof id !== "string" || !/^[0-9a-z]+$/.test(id)) throw new OnebaseError(`confirmUpload(): expected a storage id, got ${describeValue(id)}.`);
@@ -1292,32 +1313,57 @@ export class Runtime {
     if (contentTypes !== undefined && (!Array.isArray(contentTypes) || contentTypes.some((t) => typeof t !== "string"))) {
       throw new OnebaseError("confirmUpload(): contentTypes must be an array of types like \"image/*\".");
     }
+    const problem = (found: BlobStat) =>
+      found.size > maxBytes
+        ? `the file is ${found.size} bytes, more than the ${maxBytes} allowed.`
+        : contentTypes && !typeAllowed(found.contentType, contentTypes)
+          ? `the file's type ${found.contentType ? `"${found.contentType}"` : "(none)"} isn't one of ${contentTypes.join(", ")}.`
+          : null;
     const existing = await this.files.metadata(state.tx, id);
-    if (existing) return existing;
+    if (existing) {
+      // Any existing id can be passed in (another feature's upload, someone else's file), so it has
+      // to meet these limits too. It isn't deleted: it was accepted before, possibly elsewhere.
+      const why = problem(existing);
+      if (why) throw new OnebaseError(`confirmUpload(): ${why}`);
+      return existing;
+    }
     const r = await this.files.reservation(state.tx, id);
-    if (!r) throw new OnebaseError(`confirmUpload(): no upload "${id}". Its URL may have expired; get a new one from generateUploadUrl({ direct: true }).`);
+    if (!r || r.size === CONFIRMED) {
+      throw new OnebaseError(`confirmUpload(): no upload "${id}". Its URL may have expired; get a new one from generateUploadUrl({ direct: true }).`);
+    }
     if (r.size === -1) throw new OnebaseError(`confirmUpload(): upload "${id}" is still in progress.`);
     if (r.expires + RESERVATION_GRACE_MS < Date.now()) {
       await this.files.dropReservation(state.tx, id);
-      await this.files.backend.remove(id).catch(() => {});
+      await this.removeUpload(id).catch(() => {});
       throw new OnebaseError(`confirmUpload(): upload "${id}" expired. Get a new URL from generateUploadUrl({ direct: true }).`);
     }
-    const found = stat !== undefined && r.size === null ? stat : await this.uploadedStat(id, r);
+    const direct = this.files.backend.direct;
+    const found = direct
+      ? stat !== undefined
+        ? stat
+        : await this.promoteUpload(id)
+      : stat !== undefined && r.size === null
+        ? stat
+        : await this.uploadedStat(id, r);
     // Nothing there (yet, or any more after a rejection): the reservation stays, so the client can
     // still send a file before the URL expires.
     if (!found) throw new OnebaseError(`confirmUpload(): nothing was uploaded for "${id}" yet.`);
-    const reject = async (why: string) => {
+    const why = problem(found);
+    if (why) {
       await this.files.dropReservation(state.tx, id);
-      await this.files.backend.remove(id).catch(() => {});
-      return new OnebaseError(`confirmUpload(): ${why} The upload was deleted.`);
-    };
-    if (found.size > maxBytes) throw await reject(`the file is ${found.size} bytes, more than the ${maxBytes} allowed.`);
-    if (contentTypes && !typeAllowed(found.contentType, contentTypes)) {
-      throw await reject(`the file's type ${found.contentType ? `"${found.contentType}"` : "(none)"} isn't one of ${contentTypes.join(", ")}.`);
+      await this.removeUpload(id).catch(() => {});
+      throw new OnebaseError(`confirmUpload(): ${why} The upload was deleted.`);
     }
     const meta: FileMetadata = { _id: id, _creationTime: this.nextCreationTime(), sha256: r.sha256, size: found.size, contentType: found.contentType };
     await this.files.insert(state.tx, meta);
-    await this.files.dropReservation(state.tx, id);
+    if (direct) {
+      // The staging URL can't be revoked; the reservation stays (marked) so the sweep deletes
+      // whatever is PUT there later. The file itself is only ever read from its own key.
+      await this.files.markConfirmed(state.tx, id);
+      state.afterCommit.push(() => direct.remove(id).catch(() => {}));
+    } else {
+      await this.files.dropReservation(state.tx, id);
+    }
     state.writes.push({ table: "_storage", id, before: null, after: null });
     return meta;
   }
@@ -1329,12 +1375,15 @@ export class Runtime {
   async sweepUploads(now = Date.now()): Promise<number> {
     let removed = 0;
     for (;;) {
-      const ids = await this.withReader((tx) => this.files.expiredReservations(tx, now));
-      if (!ids.length) return removed;
+      const rows = await this.withReader((tx) => this.files.expiredReservations(tx, now));
+      if (!rows.length) return removed;
+      const ids = rows.map((r) => r.id);
       const gone: string[] = [];
-      for (const id of ids) {
+      for (const { id, confirmed } of rows) {
         try {
-          await this.files.backend.remove(id);
+          // A confirmed file stays; only what was PUT to its staging object since goes.
+          if (confirmed) await this.files.backend.direct?.remove(id);
+          else await this.removeUpload(id);
           gone.push(id);
         } catch (err) {
           this.log.warn(`Uploads: couldn't delete unconfirmed upload ${id}: ${err instanceof Error ? err.message : String(err)}`);
@@ -1364,7 +1413,8 @@ export class Runtime {
       /** Asks the bucket before taking the write lock, so the lock isn't held over a network call. */
       confirmUpload: async (id: unknown, opts?: unknown) => {
         const pending = typeof id === "string" && /^[0-9a-z]+$/.test(id) ? await read((tx) => this.files.reservation(tx, id)) : null;
-        const stat = pending && pending.size === null ? await this.files.backend.stat(id as string) : undefined;
+        const waiting = pending && pending.size === null;
+        const stat = waiting ? await (this.files.backend.direct ? this.promoteUpload(id as string) : this.files.backend.stat(id as string)) : undefined;
         return this.transact((state) => this.confirmUpload(state, id, opts, stat));
       },
       delete: (id: string) => this.transact((state) => this.removeFile(state, id)),

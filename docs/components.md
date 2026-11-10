@@ -86,7 +86,7 @@ presence: presence({ auth: true, expose: ["heartbeat", "list"] }),
 
 Clients then call `api.components.presence.heartbeat` like any of your functions: `useQuery(api.components.presence.list, { room })`. `_generated/api.ts` has `api.components` for exposed functions only, and `internal.components` for all of a component's public functions, which you can schedule or run from crons. Nested functions are exposed by their dotted path: `expose: ["lib.list"]`.
 
-Expose only what's safe for anyone to call with any arguments. A rate limiter's `reset`, for one, isn't.
+Expose only what's safe for anyone to call with any arguments. A rate limiter's `reset`, for one, isn't. A component that records who did something must take that from the caller's identity, not from an argument: presence's `heartbeat`, mounted with `auth: true` as above, uses the signed-in user and refuses anyone else's id. Without `auth: true`, wrap such functions in your own and pass the user from `getAuthUserId(ctx)`.
 
 ## Function handles
 

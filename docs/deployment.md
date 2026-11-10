@@ -138,6 +138,7 @@ Every flag also has an environment variable, and environment variables can come 
 | `--rate-limit` | `ONEBASE_RATE_LIMIT` | off; per-IP limit on calls, e.g. `100/10s` or `600/m` |
 | `--max-upload` | `ONEBASE_MAX_UPLOAD` | 1gb; largest upload (and any request body), e.g. `512mb` or `2gb` |
 | `--trust-proxy` | `ONEBASE_TRUST_PROXY=1` | off; read the client IP from `X-Forwarded-For` (set it behind a proxy) |
+| `--proxy-hops <n>` | `ONEBASE_TRUST_PROXY=<n>` | 1; how many proxies append to `X-Forwarded-For` |
 | `--no-dashboard` | `ONEBASE_DASHBOARD=off` | dashboard on at `/_admin` (see [Dashboard](./dashboard.md)) |
 | `--no-deploy` | `ONEBASE_DEPLOY=off` | deploys on (see [onebase deploy](#onebase-deploy)) |
 | | `ONEBASE_ADMIN_KEY` | generated into `<data>/admin.key` |
@@ -264,7 +265,7 @@ systemctl restart onebase # or however you run it
 - **Durable data:** keep `onebase_data` on persistent disk, and add `--backup` (or use Postgres or Turso).
 - **Before upgrading:** take a backup, and read the release notes. See [Upgrading onebase](#upgrading-onebase).
 - **Before deploying:** run `onebase doctor` (`onebase deploy` runs it for you), and try a risky schema change with `onebase deploy --dry-run`.
-- **Behind a proxy:** pass `--trust-proxy` so `--rate-limit` counts real client IPs.
+- **Behind a proxy:** pass `--trust-proxy` so `--rate-limit` and sign-in lockouts count real client IPs. The client is taken from the right end of `X-Forwarded-For` (what your proxy appended), so set `--proxy-hops` to the number of proxies that append to it, e.g. `2` for a CDN in front of a load balancer. Counting the wrong number lets clients choose their own address (too many) or counts everyone as the proxy (too few).
 - **Dashboard:** keep the admin key secret, or block `/_admin` at the proxy (see [Dashboard](./dashboard.md)).
 - **Errors:** in production (no `--dev`), unexpected errors reach clients as `Server Error`. Use `OneBaseError` for messages users should see.
 - **Memory:** expect about 40 MB at startup with SQLite; Postgres adds a few MB for its connection pool.

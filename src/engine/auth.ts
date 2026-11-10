@@ -20,10 +20,17 @@ const DAY = 86_400_000;
 const STATE_TTL = 10 * 60_000;
 const LOGIN_CODE_TTL = 2 * 60_000;
 const MAX_FAILURES = 10;
+/**
+ * Failures for one email across every network. Per-network counts alone let someone with many
+ * addresses guess without limit; this caps that, high enough that one network can't reach it.
+ */
+const MAX_EMAIL_FAILURES = 100;
 const FAILURE_WINDOW = 3_600_000;
 const MAX_PASSWORD = 1024;
 const EMAIL_CODE_TTL = 15 * 60_000;
+/** Codes sent for one email to one network an hour, and to all networks together. */
 const MAX_CODES_SENT = 5;
+const MAX_CODES_SENT_PER_EMAIL = 20;
 const MAX_EMAIL = 254;
 // Domain labels can't contain dots, so no input can make the matcher backtrack.
 const EMAIL = /^[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+$/;
@@ -316,7 +323,7 @@ export class AuthService {
       case "signUp":
         return this.signUp(method, email, this.checkPassword(params.password, method.minLength), params, client);
       case "reset":
-        return this.requestReset(method, email);
+        return this.requestReset(method, email, client);
       case "reset-verification":
         return this.resetPassword(method, email, params.code, this.checkPassword(params.newPassword, method.minLength), client);
       case "email-verification":
@@ -347,6 +354,8 @@ export class AuthService {
     // guessing at their address from elsewhere.
     const key = `password:${email}|${client}`;
     await this.countAttempt(key, MAX_FAILURES, "failed sign-in attempts");
+    // And per email across every network, so many addresses don't buy unlimited guesses.
+    await this.countAttempt(`password:${email}`, MAX_EMAIL_FAILURES, "failed sign-in attempts");
     const found = await this.passwordUser(email);
     // Verify against a dummy hash for unknown emails, so timing doesn't reveal which emails have accounts.
     const valid = found ? await Bun.password.verify(password, found.secret) : (await Bun.password.verify(password, await this.dummy()), false);
@@ -354,7 +363,7 @@ export class AuthService {
     await this.runtime.withWriter((tx) => tx.run("DELETE FROM _auth_attempts WHERE \"key\" = ?", [key]));
     const user = found!.user;
     if (method.verifyEmail && typeof user.emailVerificationTime !== "number") {
-      await this.sendEmailCode(method, email, "verify", false, found!.secret);
+      await this.sendEmailCode(method, email, "verify", client, false, found!.secret);
       return { codeSent: true };
     }
     return this.runtime.withWriter(async (tx) => ({ userId: user._id, token: await this.createSession(tx, user._id) }));
@@ -393,7 +402,7 @@ export class AuthService {
       existing = true; // signed up twice at once; the account is there now
     }
     if (!existing) {
-      if ("codeSent" in created!) await this.sendEmailCode(method, email, "verify", false, secret);
+      if ("codeSent" in created!) await this.sendEmailCode(method, email, "verify", client, false, secret);
       return created!;
     }
     // The email already has an account, but the answer must read exactly like a fresh sign-up's,
@@ -402,7 +411,7 @@ export class AuthService {
       // A code is sent either way; confirming it signs the owner into their existing account. If
       // that account was never confirmed, someone else may have created it, so confirming also
       // makes this sign-up's password the account's password.
-      await this.sendEmailCode(method, email, "verify", false, secret);
+      await this.sendEmailCode(method, email, "verify", client, false, secret);
       return { codeSent: true };
     }
     // Without emailed codes there's nothing to answer a fresh sign-up's token with: the right
@@ -417,11 +426,12 @@ export class AuthService {
     if (email.length > MAX_EMAIL || !EMAIL.test(email)) throw new AuthError("Enter a valid email address.");
     const flow = params.flow ?? "start";
     if (flow === "start") {
-      await this.sendEmailCode(method, email, "signin");
+      await this.sendEmailCode(method, email, "signin", client);
       return { codeSent: true };
     }
     if (flow !== "verify") throw new AuthError(`flow must be start or verify; got ${JSON.stringify(flow)}.`);
     await this.takeEmailCode("signin", email, params.code, client, undefined, method.codeLength);
+    await this.clearCodesSent(email, client);
     const name = this.cleanName(params.name);
     // The code proves the inbox, so the address is verified.
     const userId = await this.userForProvider(method.id, { id: email, email, emailVerified: true, name }, method.profile, params);
@@ -473,9 +483,22 @@ export class AuthService {
     runAction: (fn: FunctionLike, args?: Record<string, unknown>) => this.runtime.runAction(fn, args ?? {}, { allowInternal: true, source: "auth" }),
   };
 
-  /** Counts a code sent to `email`; at most MAX_CODES_SENT an hour, so nobody can flood an inbox. */
-  private async countCodeSent(email: string) {
-    await this.countAttempt(`send:${email}`, MAX_CODES_SENT, "codes requested for this email");
+  /**
+   * Counts a code requested for `email` from `client`, and says whether it may be sent: at most
+   * MAX_CODES_SENT an hour per network and MAX_CODES_SENT_PER_EMAIL overall, so nobody can flood an
+   * inbox. Over the limit the request still succeeds, it just sends nothing (and leaves the code the
+   * owner may already have in place): a refusal would let anyone lock a chosen address out of
+   * sign-in, reset and verification by asking for codes for it.
+   */
+  private async countCodeSent(email: string, client: string): Promise<boolean> {
+    const mine = await this.bump(`send:${email}|${client}`);
+    if (mine.count > MAX_CODES_SENT) return false;
+    return (await this.bump(`send:${email}`)).count <= MAX_CODES_SENT_PER_EMAIL;
+  }
+
+  /** After a sign-in with a code, that network may ask for codes again. */
+  private async clearCodesSent(email: string, client: string) {
+    await this.runtime.withWriter((tx) => tx.run("DELETE FROM _auth_attempts WHERE \"key\" = ?", [`send:${email}|${client}`]));
   }
 
   /**
@@ -487,11 +510,12 @@ export class AuthService {
     method: { sendCode?: (message: any, ctx: SendCodeCtx) => Promise<void> | void; codeLength?: 6 | 8 },
     email: string,
     purpose: "verify" | "reset" | "signin",
+    client: string,
     counted = false,
     secret?: string,
   ) {
     if (!method.sendCode) throw new AuthError("Email codes aren't set up: add sendCode to password() in auth.config.ts.");
-    if (!counted) await this.countCodeSent(email);
+    if (!counted && !(await this.countCodeSent(email, client))) return;
     const code = randomCode(method.codeLength ?? 8);
     await this.runtime.withWriter(async (tx) => {
       await tx.run("DELETE FROM _auth_codes WHERE kind = ?", [`${purpose}:${email}`]);
@@ -526,8 +550,8 @@ export class AuthService {
   ): Promise<{ secret?: string }> {
     const key = `code:${email}|${client}`;
     await this.countAttempt(key, MAX_FAILURES, "wrong codes");
-    // A 6-digit code is guessable across many networks, so wrong guesses for the address are also counted overall.
-    if (length < 8) await this.countAttempt(`code:${email}`, MAX_FAILURES * 3, "wrong codes");
+    // Wrong guesses for the address are also counted across every network; more tightly for a 6-digit code.
+    await this.countAttempt(`code:${email}`, length < 8 ? MAX_FAILURES * 3 : MAX_EMAIL_FAILURES, "wrong codes");
     const entered = typeof code === "string" ? code.replace(/\s/g, "") : "";
     const hash = sha256(`${purpose}|${email}|${entered}`);
     const row = new RegExp(`^\\d{${length}}$`).test(entered)
@@ -545,12 +569,12 @@ export class AuthService {
   }
 
   /** Step 1 of a reset. The answer is the same whether or not the email has an account. */
-  private async requestReset(method: PasswordMethod, email: string): Promise<SignInResult> {
+  private async requestReset(method: PasswordMethod, email: string, client: string): Promise<SignInResult> {
     if (!method.sendCode) throw new AuthError("Password reset isn't set up: add sendCode to password() in auth.config.ts.");
-    await this.countCodeSent(email); // counted (and limited) the same way for unknown emails
-    if (await this.passwordUser(email)) {
+    // Counted (and limited) the same way for unknown emails; over the limit, nothing is sent.
+    if ((await this.countCodeSent(email, client)) && (await this.passwordUser(email))) {
       // Sent in the background, so the response time doesn't reveal that the account exists either.
-      void this.sendEmailCode(method, email, "reset", true).catch(() => {});
+      void this.sendEmailCode(method, email, "reset", client, true).catch(() => {});
     }
     return { codeSent: true };
   }
@@ -558,6 +582,7 @@ export class AuthService {
   /** Step 2 of a reset: a new password, signed in, and every other session ended. */
   private async resetPassword(method: PasswordMethod, email: string, code: unknown, newPassword: string, client: string): Promise<SignInResult> {
     await this.takeEmailCode("reset", email, code, client);
+    await this.clearCodesSent(email, client);
     const secret = await Bun.password.hash(newPassword);
     return this.runtime.authWrite(async ({ db, tx, revoke }) => {
       const account = await tx.get("SELECT user_id FROM _auth_accounts WHERE provider = 'password' AND account_id = ?", [email]);
@@ -584,6 +609,7 @@ export class AuthService {
   /** Confirms the email of a new account (verifyEmail) and signs in. */
   private async confirmEmail(email: string, code: unknown, password: string, client: string): Promise<SignInResult> {
     const { secret } = await this.takeEmailCode("verify", email, code, client, password);
+    await this.clearCodesSent(email, client);
     return this.runtime.authWrite(async ({ db, tx, revoke }) => {
       const account = await tx.get("SELECT user_id FROM _auth_accounts WHERE provider = 'password' AND account_id = ?", [email]);
       const user = account ? await db.get(account.user_id) : null;
@@ -636,7 +662,17 @@ export class AuthService {
    */
   private async countAttempt(key: string, max: number, what: string) {
     const now = Date.now();
-    const { count, start } = await this.runtime.withWriter(async (tx) => {
+    const { count, start } = await this.bump(key);
+    if (count > max) {
+      const minutes = Math.max(1, Math.ceil((start + FAILURE_WINDOW - now) / 60_000));
+      throw new AuthError(`Too many ${what}. Try again in ${minutes} minute${minutes === 1 ? "" : "s"}.`, 429);
+    }
+  }
+
+  /** Adds one to `key`'s count for the current hour-long window and returns the count. */
+  private async bump(key: string): Promise<{ count: number; start: number }> {
+    const now = Date.now();
+    return this.runtime.withWriter(async (tx) => {
       const row = await tx.get("SELECT count, window_start FROM _auth_attempts WHERE \"key\" = ?", [key]);
       if (!row) {
         await tx.run("INSERT INTO _auth_attempts (\"key\", count, window_start) VALUES (?, 1, ?)", [key, now]);
@@ -651,10 +687,6 @@ export class AuthService {
       await tx.run("UPDATE _auth_attempts SET count = count + 1 WHERE \"key\" = ?", [key]);
       return { count: Number(row.count) + 1, start: Number(row.window_start) };
     });
-    if (count > max) {
-      const minutes = Math.max(1, Math.ceil((start + FAILURE_WINDOW - now) / 60_000));
-      throw new AuthError(`Too many ${what}. Try again in ${minutes} minute${minutes === 1 ? "" : "s"}.`, 429);
-    }
   }
 
   // ---- OAuth ----

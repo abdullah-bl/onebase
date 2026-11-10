@@ -35,12 +35,40 @@ function sameDigest(a: Uint8Array, b: Uint8Array): boolean {
   return diff === 0;
 }
 
+/** Applies the saved theme before the first paint (allowed by its hash in the CSP). */
+const THEME_SCRIPT = `try{var t=localStorage.getItem("ob-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}`;
+
+/**
+ * Sent with everything under /_admin. The dashboard shares its origin with the app, so an injected
+ * script on an app page must not be able to frame it, open it and script it, or run script inside
+ * it: no framing, a separate browsing context group (COOP), and only the dashboard's own script.
+ * Images may come from anywhere: S3 file previews redirect to the bucket. Inline styles stay
+ * allowed (the UI sets a few style attributes); they can't run script.
+ */
+export const ADMIN_SECURITY_HEADERS: Record<string, string> = {
+  "Content-Security-Policy": [
+    "default-src 'none'",
+    `script-src 'self' 'sha256-${new Bun.CryptoHasher("sha256").update(THEME_SCRIPT).digest("base64")}'`,
+    "style-src 'self' 'unsafe-inline'",
+    "img-src * data: blob:",
+    "connect-src 'self'",
+    "font-src 'self' data:",
+    "base-uri 'none'",
+    "form-action 'none'",
+    "frame-ancestors 'none'",
+  ].join("; "),
+  "X-Frame-Options": "DENY",
+  "Cross-Origin-Opener-Policy": "same-origin",
+  "X-Content-Type-Options": "nosniff",
+  "Referrer-Policy": "no-referrer",
+};
+
 const HTML = (version: string) => `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>OneBase dashboard</title><meta name="robots" content="noindex">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='5' fill='%232563eb'/%3E%3Ccircle cx='16' cy='16' r='10.5' fill='none' stroke='%232563eb' stroke-width='2.4' opacity='.6'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/_admin/app.css?v=${version}">
-<script>try{var t=localStorage.getItem("ob-theme");if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<script>${THEME_SCRIPT}</script>
 </head><body><div id="app"></div><script type="module" src="/_admin/app.js?v=${version}"></script></body></html>`;
 
 type Handler = (body: any) => Promise<unknown> | unknown;
@@ -351,9 +379,11 @@ export function createAdmin(opts: { runtime: Runtime; key: string; assets: Dashb
     });
   };
 
-  return async (req: Request, url: URL): Promise<Response> => {
+  const handle = async (req: Request, url: URL): Promise<Response> => {
     const path = url.pathname;
-    if (path === "/_admin" || path === "/_admin/") return new Response(HTML(assetsVersion), { headers: { "Content-Type": "text/html; charset=utf-8" } });
+    if (path === "/_admin" || path === "/_admin/") {
+      return new Response(HTML(assetsVersion), { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
+    }
     if (path === "/_admin/app.js") return new Response(opts.assets.js, { headers: { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "public, max-age=3600" } });
     if (path === "/_admin/app.css") return new Response(opts.assets.css, { headers: { "Content-Type": "text/css; charset=utf-8", "Cache-Control": "public, max-age=3600" } });
     if (!path.startsWith("/_admin/api/")) return new Response("Not found", { status: 404 });
@@ -375,6 +405,12 @@ export function createAdmin(opts: { runtime: Runtime; key: string; assets: Dashb
     } catch (err) {
       return json({ ok: false, error: err instanceof Error ? err.message : String(err) }, 400);
     }
+  };
+
+  return async (req: Request, url: URL): Promise<Response> => {
+    const res = await handle(req, url);
+    for (const [name, value] of Object.entries(ADMIN_SECURITY_HEADERS)) res.headers.set(name, value);
+    return res;
   };
 }
 

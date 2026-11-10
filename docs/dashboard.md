@@ -36,7 +36,9 @@ In production the startup output says where the key is:
   dashboard  http://localhost:8090/_admin (admin key: onebase_data/admin.key)
 ```
 
-The browser keeps the key in local storage until you sign out (the button at the bottom of the sidebar). Every API call is checked against it with a constant-time comparison.
+The browser keeps the key in the tab's session storage until you sign out (the button at the bottom of the sidebar) or close the tab; a new tab asks for it again. It is never put in local storage, because the dashboard shares its origin with your app, and a script injected into any app page could read it from there. Every API call is checked against it with a constant-time comparison.
+
+Everything under `/_admin` is sent with a strict `Content-Security-Policy` (only the dashboard's own script, `frame-ancestors 'none'`), `X-Frame-Options: DENY` and `Cross-Origin-Opener-Policy: same-origin`, so an app page can't frame the dashboard or open it and script it. For a stronger boundary, keep the dashboard off the app's origin: block `/_admin` at your proxy for the public hostname and reach it on a separate one (or an SSH tunnel), or run with `--no-dashboard` and deploy from CI.
 
 ## Editing data
 

@@ -367,9 +367,8 @@ for (const DB of DATABASES) describe(`${DB.name}: built-in auth`, () => {
 
   test("reset requests look the same for unknown emails, and codes per email are limited", async () => {
     for (let i = 0; i < 5; i++) expect(await passwordFlow("reset", { email: "ghost@example.com" })).toEqual({ status: 200, body: { codeSent: true } });
-    const limited = await passwordFlow("reset", { email: "ghost@example.com" });
-    expect(limited.status).toBe(429);
-    expect(limited.body.error).toContain("Too many codes requested for this email");
+    // Over the limit the answer doesn't change (a refusal would let anyone lock the address out); nothing is sent.
+    expect(await passwordFlow("reset", { email: "ghost@example.com" })).toEqual({ status: 200, body: { codeSent: true } });
     await Bun.sleep(50);
     expect(inbox.sent.some((m) => m.email === "ghost@example.com")).toBe(false);
   });

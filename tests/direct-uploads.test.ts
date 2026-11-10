@@ -53,6 +53,7 @@ for (const [backend, filesUrl] of BACKENDS) describe(`direct uploads (${backend}
       }),
       meta: query({ args: { id: v.string() }, handler: (ctx, { id }) => ctx.storage.getMetadata(id) }),
       url: query({ args: { id: v.string() }, handler: (ctx, { id }) => ctx.storage.getUrl(id) }),
+      remove: mutation({ args: { id: v.string() }, handler: (ctx, { id }) => ctx.storage.delete(id) }),
       directUrlFromAction: action({ args: {}, handler: (ctx) => ctx.storage.generateUploadUrl({ direct: true }) }),
       confirmFromAction: action({ args: { id: v.string() }, handler: (ctx, { id }) => ctx.storage.confirmUpload(id, { contentTypes: ["text/*"] }) }),
     },
@@ -104,9 +105,13 @@ for (const [backend, filesUrl] of BACKENDS) describe(`direct uploads (${backend}
     else expect(meta.sha256).toBe(new Bun.CryptoHasher("sha256").update("hello direct").digest("base64"));
     expect(await call("query", "files:meta", { id: u.storageId })).toEqual(meta);
 
-    // Idempotent, and a stricter second confirm doesn't touch a file already accepted.
-    expect(await call("mutation", "files:confirm", { id: u.storageId, maxBytes: 1, contentTypes: ["image/*"] })).toEqual(meta);
+    // Idempotent. A stricter second confirm refuses the file (confirmUpload doesn't know where an
+    // existing id came from) but doesn't delete a file already accepted.
+    expect(await call("mutation", "files:confirm", { id: u.storageId, contentTypes: ["text/*"] })).toEqual(meta);
+    await expect(call("mutation", "files:confirm", { id: u.storageId, maxBytes: 1 })).rejects.toThrow("more than the 1 allowed");
+    await expect(call("mutation", "files:confirm", { id: u.storageId, contentTypes: ["image/*"] })).rejects.toThrow("isn't one of image/*");
     expect(await stat(u.storageId)).not.toBeNull();
+    expect(await call("query", "files:meta", { id: u.storageId })).toEqual(meta);
 
     const served = await fetch(await call("query", "files:url", { id: u.storageId }));
     expect(served.status).toBe(200);
@@ -196,6 +201,42 @@ for (const [backend, filesUrl] of BACKENDS) describe(`direct uploads (${backend}
     const after = await send(u, "four");
     expect(after.status).toBe(400);
     expect(((await after.json()) as any).error).toContain("already confirmed");
+  });
+
+  test("an existing file passed to confirmUpload must meet its limits", async () => {
+    // Say, uploaded through plain generateUploadUrl(), which checks nothing.
+    const plain = await call("mutation", "files:plainUrl", {});
+    const { storageId } = (await (await fetch(plain, { method: "POST", headers: { "Content-Type": "text/html" }, body: "<b>hi</b>" })).json()) as any;
+    await expect(call("mutation", "files:confirm", { id: storageId, contentTypes: ["image/*"] })).rejects.toThrow('"text/html" isn\'t one of image/*');
+    await expect(call("mutation", "files:confirm", { id: storageId, maxBytes: 3 })).rejects.toThrow("more than the 3 allowed");
+    expect(await call("mutation", "files:confirm", { id: storageId, contentTypes: ["text/*"] })).toMatchObject({ _id: storageId, size: 9 });
+    expect(await call("query", "files:meta", { id: storageId })).not.toBeNull();
+  });
+
+  test.if(isS3)("the presigned URL can't replace, or re-create, a confirmed file", async () => {
+    const u = await directUrl({ contentType: "image/png" });
+    expect((await send(u, "tiny png")).status).toBe(200);
+    const meta = await call("mutation", "files:confirm", { id: u.storageId, maxBytes: 100, contentTypes: ["image/*"] });
+    expect(meta).toMatchObject({ size: 8, contentType: "image/png" });
+    // The URL still works (S3 can't revoke it), but it points at a staging object, not the file.
+    expect((await send(u, new Uint8Array(MAX), { "Content-Type": "text/html" })).status).toBe(200);
+    expect(await stat(u.storageId)).toEqual({ size: 8, contentType: "image/png" });
+    const served = await fetch(`${base}/api/storage/${u.storageId}`);
+    expect(await served.text()).toBe("tiny png");
+    expect(await call("mutation", "files:confirm", { id: u.storageId, maxBytes: 100 })).toEqual(meta);
+
+    // Deleted, it stays deleted.
+    await call("mutation", "files:remove", { id: u.storageId });
+    expect((await send(u, "again")).status).toBe(200);
+    expect(await stat(u.storageId)).toBeNull();
+    expect(await call("query", "files:meta", { id: u.storageId })).toBeNull();
+    await expect(call("mutation", "files:confirm", { id: u.storageId })).rejects.toThrow("no upload");
+
+    // Bytes PUT after the confirm are swept once the URL is long expired.
+    const staged = () => app.runtime.files.backend.direct!.stat(u.storageId);
+    expect(await staged()).not.toBeNull();
+    expect(await app.runtime.sweepUploads(u.expiresAt + 2 * RESERVATION_GRACE_MS + 1)).toBeGreaterThanOrEqual(1);
+    expect(await staged()).toBeNull();
   });
 
   test("unconfirmed uploads are deleted once expired, confirmed ones never", async () => {

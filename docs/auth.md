@@ -157,7 +157,9 @@ Confirmed emails are stored in `users.emailVerificationTime`, which also lets an
 | Codes sent | 5 per email per hour, so nobody can flood an inbox |
 | Unknown emails | a reset request answers `{ codeSent: true }` either way, so it doesn't reveal which emails have accounts |
 
-Wrong passwords and wrong codes are counted per email *and* per network (the client IP), so guessing at someone's address from elsewhere can't lock them out. Everyone signing in through one proxy or office NAT shares that network's count; pass `--trust-proxy` behind a reverse proxy so real client IPs are used.
+Wrong passwords and wrong codes are counted per email *and* per network (the client IP; for IPv6, the /64), so guessing at someone's address from elsewhere can't lock them out. They're also capped at 100 an hour per email across every network, so many addresses don't buy unlimited guesses; a password reset clears that count. Everyone signing in through one proxy or office NAT shares that network's count; pass `--trust-proxy` behind a reverse proxy so real client IPs are used (and `--proxy-hops <n>` if more than one proxy appends to `X-Forwarded-For`).
+
+Emailed codes (sign-in, reset, verification) are limited to 5 an hour per address and network, and 20 an hour per address overall. Over the limit the request still answers `{ codeSent: true }` but nothing is sent, and the code already sent stays valid: refusing would let anyone keep a chosen address from signing in or resetting by asking for codes for it.
 
 ### Use the user in functions
 
@@ -296,7 +298,7 @@ await client.signIn("email", { flow: "start", email });                    // em
 await client.signIn("email", { flow: "verify", email, code, name: "Sam" }); // signs in
 ```
 
-Codes last 15 minutes and work once; asking for a new one replaces the old one. At most 5 codes an hour are sent per address, and wrong guesses are limited per address and network (with 6 digits, also per address overall). The address counts as verified, so it signs into an existing account with the same verified email. Like `apple()`, it takes `profile` for the new user's fields.
+Codes last 15 minutes and work once; asking for a new one replaces the old one. At most 5 codes an hour are sent per address and network (20 per address overall; past that, requests answer as usual but send nothing), and wrong guesses are limited per address and network (with 6 digits, also per address overall). The address counts as verified, so it signs into an existing account with the same verified email. Like `apple()`, it takes `profile` for the new user's fields.
 
 ### Device sign-in
 
@@ -346,7 +348,7 @@ await client.device.approve({ code, approve: true });
 ### Sessions and security
 
 - **Sessions** last 30 days from their last use (`sessionDays` in `auth.config.ts`). Signing out ends the session at once, including for open WebSocket connections on every server instance. Open connections also re-check their identity about once a minute, so a session that expires (or whose user is deleted) signs its connection out without waiting for a reconnect. `POST /api/auth/signout` with `{ "everywhere": true }` ends all of a user's sessions.
-- **Passwords** are hashed with argon2id and must be at least 8 characters (`password({ minLength })`). After 10 failed attempts for an email from one network in an hour, sign-in for that email is blocked from that network for the rest of the hour. `--rate-limit` also applies to sign-in requests.
+- **Passwords** are hashed with argon2id and must be at least 8 characters (`password({ minLength })`). After 10 failed attempts for an email from one network in an hour, sign-in for that email is blocked from that network for the rest of the hour; after 100 from all networks together, it's blocked everywhere until the hour is up or the password is reset. `--rate-limit` also applies to sign-in requests.
 - **Tokens and codes** are stored only as SHA-256 hashes. OAuth uses PKCE, and the one-time code the provider's redirect brings back only works with a verifier kept by the browser that started the sign-in.
 - **Stored separately:** password hashes, OAuth links, sessions and email codes are in system tables that functions and the dashboard can't read.
 

@@ -2,16 +2,16 @@
 // heartbeats stop. Rooms are live queries, so clients see people come and go.
 //
 //   // onebase/components.ts
-//   export default defineComponents({ here: presence({ heartbeatInterval: 10_000 }) });
+//   export default defineComponents({ here: presence({ auth: true, expose: ["heartbeat", "list"] }) });
 //
-//   // client, every few seconds (expose heartbeat and list when mounting)
-//   api.components.here.heartbeat({ room: "lobby", user: userId, sessionId });
+//   // client, every few seconds, signed in: the user is the caller's identity
+//   api.components.here.heartbeat({ room: "lobby", sessionId });
 //   // live query
 //   useQuery(api.components.here.list, { room: "lobby" }) // [{ id, user, online, lastActive }]
 
 import { componentServer, defineComponent, splitMountOptions, type ComponentFn, type Mount, type MountOptions } from "..";
 import { defineSchema, defineTable, type DataModelFromSchema } from "../../schema";
-import { v } from "../../values";
+import { OneBaseError, v } from "../../values";
 
 type Config = {
   /** How long after a heartbeat a session is still counted online (default 10_000 ms). */
@@ -21,6 +21,9 @@ type Config = {
   /** How long an offline session stays in `list` before it's forgotten (default 1 hour). */
   offlineRetentionMs?: number;
 };
+
+/** Set from the mount's `auth: true`: heartbeats then need a signed-in caller, who is the user. */
+type InternalConfig = Config & { userFromAuth?: boolean };
 
 const schema = defineSchema({
   presence: defineTable({
@@ -40,7 +43,7 @@ const schema = defineSchema({
     .index("by_online_disconnectedAt", ["online", "disconnectedAt"]),
 });
 
-const { query, mutation, internalMutation } = componentServer<DataModelFromSchema<typeof schema>, Config>();
+const { query, mutation, internalMutation } = componentServer<DataModelFromSchema<typeof schema>, InternalConfig>();
 
 /** The longest `interval` a heartbeat may ask for, so a client can't stay online long after it's gone. */
 const MAX_SESSION_INTERVAL = 5 * 60_000;
@@ -56,10 +59,26 @@ async function scheduleCheck(ctx: { db: any; scheduler: any }, id: unknown, sess
   await ctx.db.patch(id, { checkAt: at });
 }
 
-/** Records a heartbeat, making sure a check is due to mark the session offline if it goes quiet. */
+/**
+ * Records a heartbeat, making sure a check is due to mark the session offline if it goes quiet.
+ * Mounted with `auth: true`, the user is the caller's identity (`subject`, the user id with
+ * built-in auth), and a `user` argument, if any, must match it: otherwise anyone could appear as
+ * anyone. Without it, `user` is whatever the caller passes, so only the app's own functions,
+ * which set it themselves, should call heartbeat.
+ */
 const heartbeat = mutation({
-  args: { room: v.string(), user: v.string(), sessionId: v.string(), interval: v.optional(v.number()) },
-  handler: async (ctx, args) => {
+  args: { room: v.string(), user: v.optional(v.string()), sessionId: v.string(), interval: v.optional(v.number()) },
+  handler: async (ctx, input) => {
+    const identity = await ctx.auth.getUserIdentity();
+    let user = input.user;
+    if (identity) {
+      if (user !== undefined && user !== identity.subject) throw new OneBaseError("presence.heartbeat: `user` must be the signed-in user; leave it out.");
+      user = identity.subject;
+    } else if (ctx.config.userFromAuth) {
+      throw new OneBaseError("presence.heartbeat: sign in first (this presence is mounted with auth: true).");
+    }
+    if (user === undefined) throw new OneBaseError("presence.heartbeat: pass `user`, or mount with auth: true to take it from the caller's identity.");
+    const args = { ...input, user };
     const now = Date.now();
     const interval = intervalFor(ctx.config, args.interval);
     const window = staleAfter(ctx.config, interval);
@@ -141,7 +160,8 @@ export const definition = defineComponent({
 export type PresenceEntry = { id: string; user: string; online: boolean; lastActive: number; disconnectedAt: number | null };
 
 export type PresenceApi = {
-  heartbeat: ComponentFn<"mutation", (args: { room: string; user: string; sessionId: string; interval?: number }) => Promise<null>>;
+  /** `user` comes from the caller's identity when mounted with `auth: true`; otherwise pass it. */
+  heartbeat: ComponentFn<"mutation", (args: { room: string; user?: string; sessionId: string; interval?: number }) => Promise<null>>;
   list: ComponentFn<"query", (args: { room: string }) => Promise<PresenceEntry[]>>;
   disconnect: ComponentFn<"mutation", (args: { sessionId: string }) => Promise<boolean>>;
 };
@@ -149,5 +169,6 @@ export type PresenceApi = {
 /** Mounts presence: `presence({ heartbeatInterval: 10_000 })`. */
 export function presence<const E extends keyof PresenceApi = never>(opts: Config & MountOptions<E> = {}): Mount<PresenceApi, E> {
   const { config, options } = splitMountOptions(opts);
-  return definition.mount(config, options) as unknown as Mount<PresenceApi, E>;
+  const internal: InternalConfig = options.auth ? { ...config, userFromAuth: true } : config;
+  return definition.mount(internal, options) as unknown as Mount<PresenceApi, E>;
 }

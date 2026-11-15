@@ -7,7 +7,7 @@ import type { ComponentsDefinition } from "../components";
 import { parseCron } from "../cron";
 import type { SchemaDefinition } from "../schema";
 import { isRegisteredFunction, type CronJob, type HttpAction, type HttpRouter, type RegisteredFunction, type UserIdentity } from "../server";
-import { OneBaseError, isPlainObject, validate, type AnyValidator } from "../values";
+import { OneBaseError, describeValue, isPlainObject, validate, type AnyValidator } from "../values";
 import { ActionPool, defaultActionWorkers, defaultWorkerEntry } from "./action-pool";
 import { QueryPool } from "./query-pool";
 import type { CodeSource } from "./action-wire";
@@ -18,7 +18,19 @@ import { BACKFILL_BATCH, backfilled, coalesce, hookState, readProgress, writePro
 import { applySchema, DatabaseImpl, OnebaseError, readerView, writerView, type ReadSet, type VectorSearchQuery, type Write } from "./database";
 import { isIdForTable, newId } from "./dialect";
 import { envNumber, savepoint, Semaphore, SerialQueue, SqliteDriver, type Driver, type Exec } from "./driver";
-import { FileStore, LocalBlobs, type BlobBackend } from "./files";
+import {
+  CONFIRMED,
+  DIRECT_UPLOAD_DEFAULT_SECONDS,
+  DIRECT_UPLOAD_MAX_SECONDS,
+  FileStore,
+  LocalBlobs,
+  RESERVATION_GRACE_MS,
+  typeAllowed,
+  type BlobBackend,
+  type BlobStat,
+  type FileMetadata,
+} from "./files";
+import { DEFAULT_MAX_BODY_BYTES } from "./http";
 import { addLine, CallLog, callLines, type CallSource } from "./calllog";
 import { CallBudget, DEFAULT_CALL_LIMITS, type CallLimits } from "./limits";
 import { currentFunction, installGuards } from "./guard";
@@ -160,7 +172,35 @@ export type RuntimeOptions = {
   envVars?: EnvVars;
   /** The caller already ran driver.init() (to read stored variables before loading the code). */
   driverReady?: boolean;
+  /** Largest file confirmUpload() accepts unless told otherwise; the server's --max-upload (default 1 GB). */
+  maxUploadBytes?: number;
 };
+
+/** ctx.storage.generateUploadUrl({ direct: true, ... }) */
+export type DirectUploadOptions = { direct: true; contentType?: string; expiresIn?: number };
+
+/** Where and how the client sends a file's bytes; then a mutation calls confirmUpload(storageId). */
+export type DirectUploadUrl = {
+  storageId: string;
+  url: string;
+  /** PUT: straight to the bucket. POST: this server's upload endpoint (a backend without presigned uploads, like local disk). */
+  method: "PUT" | "POST";
+  /** Headers to send with the request (Content-Type, when one was given). */
+  headers: Record<string, string>;
+  /** When the URL stops working, in ms since the epoch. */
+  expiresAt: number;
+  /** Whether the bytes go straight to storage, bypassing this server. */
+  direct: boolean;
+};
+
+export type ConfirmUploadOptions = {
+  /** Largest size accepted, in bytes (default: the server's --max-upload). */
+  maxBytes?: number;
+  /** Types accepted, exact ("image/png") or by family ("image/*"); default: any. */
+  contentTypes?: string[];
+};
+
+const SWEEP_INTERVAL_MS = 10 * 60_000;
 
 /** What an environment variable change did. */
 export type EnvChange = {
@@ -357,6 +397,8 @@ export class Runtime {
   static heartbeatMs = 30_000;
   static jobLeaseMs = 150_000;
   private heartbeat: ReturnType<typeof setInterval> | null = null;
+  private uploadSweeper: ReturnType<typeof setInterval> | null = null;
+  readonly maxUploadBytes: number;
   private lastCreationTime = 0;
   private readonly warnedQueries = new Set<string>();
   /** Signs function handles; loaded from the database by init(). */
@@ -403,6 +445,7 @@ export class Runtime {
     }
     this.files = new FileStore(opts.blobs ?? new LocalBlobs(mkdtempSync(join(tmpdir(), "onebase-files-"))), () => this.nextCreationTime());
     this.siteUrl = (opts.siteUrl ?? "http://localhost:8090").replace(/\/$/, "");
+    this.maxUploadBytes = opts.maxUploadBytes ?? DEFAULT_MAX_BODY_BYTES;
     const code = {
       schema: opts.schema,
       modules: opts.modules,
@@ -1261,10 +1304,157 @@ export class Runtime {
     state.afterCommit.push(() => this.files.backend.remove(id));
   }
 
+  /** generateUploadUrl(): the Convex-style POST URL; with { direct: true }, a DirectUploadUrl. */
+  private async uploadUrl(tx: Exec, opts: unknown): Promise<string | DirectUploadUrl> {
+    if (opts === undefined || opts === null || (isPlainObject(opts) && !opts.direct)) {
+      return `${this.siteUrl}/api/storage/upload?token=${await this.files.createUploadToken(tx)}`;
+    }
+    if (!isPlainObject(opts)) throw new OnebaseError("generateUploadUrl() takes no argument, or { direct: true, contentType?, expiresIn? }.");
+    const { contentType, expiresIn = DIRECT_UPLOAD_DEFAULT_SECONDS } = opts as Partial<DirectUploadOptions>;
+    if (contentType !== undefined && (typeof contentType !== "string" || /[\r\n]/.test(contentType))) {
+      throw new OnebaseError("generateUploadUrl(): contentType must be a string like \"image/png\".");
+    }
+    if (typeof expiresIn !== "number" || !Number.isInteger(expiresIn) || expiresIn < 1 || expiresIn > DIRECT_UPLOAD_MAX_SECONDS) {
+      throw new OnebaseError(`generateUploadUrl(): expiresIn must be a whole number of seconds from 1 to ${DIRECT_UPLOAD_MAX_SECONDS} (7 days).`);
+    }
+    const r = await this.files.reserve(tx, expiresIn);
+    const headers: Record<string, string> = contentType ? { "Content-Type": contentType } : {};
+    const direct = this.files.backend.direct;
+    if (direct) return { storageId: r.id, url: direct.presign(r.id, expiresIn), method: "PUT", headers, expiresAt: r.expires, direct: true };
+    const url = `${this.siteUrl}/api/storage/upload?id=${r.id}&token=${r.token}`;
+    return { storageId: r.id, url, method: "POST", headers, expiresAt: r.expires, direct: false };
+  }
+
+  /** What the client uploaded for a reservation: recorded by our own endpoint, else asked of the backend. */
+  private async uploadedStat(id: string, recorded: { size: number | null; contentType: string | null }): Promise<BlobStat | null> {
+    const stat = await this.files.backend.stat(id);
+    // A rejected upload's bytes are gone even when its record was rolled back with the mutation.
+    if (!stat || recorded.size === null) return stat;
+    return { size: recorded.size, contentType: recorded.contentType };
+  }
+
+  /**
+   * Copies a direct upload's staged bytes to the file's own key and returns what is there now (null:
+   * nothing was staged). The copy is what gets checked, not the staged object: the client can PUT
+   * to that again at any time, but only the server writes the file's key.
+   */
+  private async promoteUpload(id: string): Promise<BlobStat | null> {
+    const direct = this.files.backend.direct!;
+    const staged = await direct.stat(id);
+    if (!staged) return null;
+    await direct.promote(id, staged.contentType);
+    const copied = await this.files.backend.stat(id);
+    // The size is the copy's; the type is the one the copy was written with (the store may add a
+    // charset to what it reports, and downloads are served with the recorded type anyway).
+    return copied && { size: copied.size, contentType: staged.contentType };
+  }
+
+  /** Deletes an unconfirmed upload's bytes, wherever they are. */
+  private async removeUpload(id: string) {
+    await Promise.all([this.files.backend.direct?.remove(id), this.files.backend.remove(id)]);
+  }
+
+  /**
+   * ctx.storage.confirmUpload(): turns a reservation into a file once its bytes check out. A file
+   * already confirmed is returned if it meets these limits too, so calling it again is safe. `stat`
+   * is passed in when it was looked up before the transaction (actions): for a staged direct
+   * upload, what promoteUpload() found.
+   */
+  private async confirmUpload(state: TxState, id: unknown, opts: unknown, stat?: BlobStat | null): Promise<FileMetadata> {
+    if (typeof id !== "string" || !/^[0-9a-z]+$/.test(id)) throw new OnebaseError(`confirmUpload(): expected a storage id, got ${describeValue(id)}.`);
+    if (opts !== undefined && !isPlainObject(opts)) throw new OnebaseError("confirmUpload(): options must be { maxBytes?, contentTypes? }.");
+    const { maxBytes = this.maxUploadBytes, contentTypes } = (opts ?? {}) as ConfirmUploadOptions;
+    if (typeof maxBytes !== "number" || !(maxBytes >= 0)) throw new OnebaseError("confirmUpload(): maxBytes must be a number of bytes.");
+    if (contentTypes !== undefined && (!Array.isArray(contentTypes) || contentTypes.some((t) => typeof t !== "string"))) {
+      throw new OnebaseError("confirmUpload(): contentTypes must be an array of types like \"image/*\".");
+    }
+    const problem = (found: BlobStat) =>
+      found.size > maxBytes
+        ? `the file is ${found.size} bytes, more than the ${maxBytes} allowed.`
+        : contentTypes && !typeAllowed(found.contentType, contentTypes)
+          ? `the file's type ${found.contentType ? `"${found.contentType}"` : "(none)"} isn't one of ${contentTypes.join(", ")}.`
+          : null;
+    const existing = await this.files.metadata(state.tx, id);
+    if (existing) {
+      // Any existing id can be passed in (another feature's upload, someone else's file), so it has
+      // to meet these limits too. It isn't deleted: it was accepted before, possibly elsewhere.
+      const why = problem(existing);
+      if (why) throw new OnebaseError(`confirmUpload(): ${why}`);
+      return existing;
+    }
+    const r = await this.files.reservation(state.tx, id);
+    if (!r || r.size === CONFIRMED) {
+      throw new OnebaseError(`confirmUpload(): no upload "${id}". Its URL may have expired; get a new one from generateUploadUrl({ direct: true }).`);
+    }
+    if (r.size === -1) throw new OnebaseError(`confirmUpload(): upload "${id}" is still in progress.`);
+    if (r.expires + RESERVATION_GRACE_MS < Date.now()) {
+      await this.files.dropReservation(state.tx, id);
+      await this.removeUpload(id).catch(() => {});
+      throw new OnebaseError(`confirmUpload(): upload "${id}" expired. Get a new URL from generateUploadUrl({ direct: true }).`);
+    }
+    const direct = this.files.backend.direct;
+    const found = direct
+      ? stat !== undefined
+        ? stat
+        : await this.promoteUpload(id)
+      : stat !== undefined && r.size === null
+        ? stat
+        : await this.uploadedStat(id, r);
+    // Nothing there (yet, or any more after a rejection): the reservation stays, so the client can
+    // still send a file before the URL expires.
+    if (!found) throw new OnebaseError(`confirmUpload(): nothing was uploaded for "${id}" yet.`);
+    const why = problem(found);
+    if (why) {
+      await this.files.dropReservation(state.tx, id);
+      await this.removeUpload(id).catch(() => {});
+      throw new OnebaseError(`confirmUpload(): ${why} The upload was deleted.`);
+    }
+    const meta: FileMetadata = { _id: id, _creationTime: this.nextCreationTime(), sha256: r.sha256, size: found.size, contentType: found.contentType };
+    await this.files.insert(state.tx, meta);
+    if (direct) {
+      // The staging URL can't be revoked; the reservation stays (marked) so the sweep deletes
+      // whatever is PUT there later. The file itself is only ever read from its own key.
+      await this.files.markConfirmed(state.tx, id);
+      state.afterCommit.push(() => direct.remove(id).catch(() => {}));
+    } else {
+      await this.files.dropReservation(state.tx, id);
+    }
+    state.writes.push({ table: "_storage", id, before: null, after: null });
+    return meta;
+  }
+
+  /**
+   * Deletes the bytes of direct uploads nobody confirmed, once their URL and grace period are long
+   * gone. Runs at startup and every 10 minutes; needs no bucket lifecycle rule.
+   */
+  async sweepUploads(now = Date.now()): Promise<number> {
+    let removed = 0;
+    for (;;) {
+      const rows = await this.withReader((tx) => this.files.expiredReservations(tx, now));
+      if (!rows.length) return removed;
+      const ids = rows.map((r) => r.id);
+      const gone: string[] = [];
+      for (const { id, confirmed } of rows) {
+        try {
+          // A confirmed file stays; only what was PUT to its staging object since goes.
+          if (confirmed) await this.files.backend.direct?.remove(id);
+          else await this.removeUpload(id);
+          gone.push(id);
+        } catch (err) {
+          this.log.warn(`Uploads: couldn't delete unconfirmed upload ${id}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      if (gone.length) await this.withWriter((tx) => this.files.dropExpiredReservations(tx, gone, now));
+      removed += gone.length;
+      if (gone.length < ids.length || this.stopped) return removed;
+    }
+  }
+
   private storageWriter(state: TxState) {
     return {
       ...this.storageReader(state.tx),
-      generateUploadUrl: async () => `${this.siteUrl}/api/storage/upload?token=${await this.files.createUploadToken(state.tx)}`,
+      generateUploadUrl: (opts?: unknown) => this.uploadUrl(state.tx, opts),
+      confirmUpload: (id: unknown, opts?: unknown) => this.confirmUpload(state, id, opts),
       delete: (id: string) => this.removeFile(state, id),
     };
   }
@@ -1274,7 +1464,14 @@ export class Runtime {
     return {
       getUrl: async (id: string) => ((await read((tx) => this.files.metadata(tx, id))) ? this.fileUrl(id) : null),
       getMetadata: (id: string) => read((tx) => this.files.metadata(tx, id)),
-      generateUploadUrl: async () => `${this.siteUrl}/api/storage/upload?token=${await this.withWriter((tx) => this.files.createUploadToken(tx))}`,
+      generateUploadUrl: (opts?: unknown) => this.withWriter((tx) => this.uploadUrl(tx, opts)),
+      /** Asks the bucket before taking the write lock, so the lock isn't held over a network call. */
+      confirmUpload: async (id: unknown, opts?: unknown) => {
+        const pending = typeof id === "string" && /^[0-9a-z]+$/.test(id) ? await read((tx) => this.files.reservation(tx, id)) : null;
+        const waiting = pending && pending.size === null;
+        const stat = waiting ? await (this.files.backend.direct ? this.promoteUpload(id as string) : this.files.backend.stat(id as string)) : undefined;
+        return this.transact((state) => this.confirmUpload(state, id, opts, stat));
+      },
       delete: (id: string) => this.transact((state) => this.removeFile(state, id)),
       /** Saves a Blob (e.g. from fetch) and returns its storage id. */
       store: async (blob: Blob) => {
@@ -1287,8 +1484,14 @@ export class Runtime {
     };
   }
 
-  /** Handles POST /api/storage/upload?token=... */
-  async upload(token: string | null, request: Request): Promise<string> {
+  /** Handles POST /api/storage/upload?token=... (and ?id=...&token=... for a direct upload without presigned URLs). */
+  async upload(token: string | null, request: Request, reservedId: string | null = null): Promise<string> {
+    if (reservedId !== null) {
+      if (!token) throw new OnebaseError("Upload URL is invalid: it has no token.");
+      if (!request.body) throw new OnebaseError("Upload body is empty. POST the file as the request body.");
+      await this.files.writeReserved((fn) => this.withWriter(fn), reservedId, token, request.body, request.headers.get("Content-Type"));
+      return reservedId;
+    }
     if (!token || !(await this.withWriter((tx) => this.files.consumeToken(tx, token)))) {
       throw new OnebaseError("Upload URL is invalid or expired. Get a fresh one from ctx.storage.generateUploadUrl() (each works once, for 1 hour).");
     }
@@ -1303,7 +1506,7 @@ export class Runtime {
     if (!/^[0-9a-z]+$/.test(id)) return null;
     const meta = await this.withReader((tx) => this.files.metadata(tx, id));
     if (!meta) return null;
-    if (request.headers.get("If-None-Match") === `"${meta.sha256}"`) return new Response(null, { status: 304 });
+    if (meta.sha256 && request.headers.get("If-None-Match") === `"${meta.sha256}"`) return new Response(null, { status: 304 });
     return this.files.backend.serve(id, meta);
   }
 
@@ -1823,18 +2026,28 @@ export class Runtime {
 
   async startScheduler() {
     await this.withWriter((tx) => tx.run("DELETE FROM _scheduled WHERE state <> 'pending' AND run_at < ?", [Date.now() - 7 * 86400_000]));
-    await this.recoverJobs();
+    await this.recoverInterruptedJobs();
     this.pokeScheduler();
     // With a shared database, pick up jobs left by instances that went away.
     // Also catch up on a deploy whose broadcast was missed (say, while reconnecting).
     if (this.driver.shared) {
       await this.keepJobs();
       this.heartbeat = setInterval(() => {
-        void this.keepJobs().then(() => this.pokeScheduler());
+        void this.keepJobs()
+          .then(() => this.recoverInterruptedJobs())
+          .then(() => this.pokeScheduler());
         void this.syncDeployment();
       }, Runtime.heartbeatMs);
     }
     this.schedulerStarted = true;
+    // Unconfirmed direct uploads: at startup, then every 10 minutes. Never fails startup.
+    const sweep = () =>
+      void this.sweepUploads()
+        .then((n) => n && this.log.info(`Uploads: deleted ${n} unconfirmed upload(s).`))
+        .catch((err) => this.log.error(`Uploads: ${err instanceof Error ? err.message : String(err)}`));
+    sweep();
+    this.uploadSweeper = setInterval(sweep, SWEEP_INTERVAL_MS);
+    this.uploadSweeper.unref?.();
     await this.startCrons();
   }
 
@@ -1845,18 +2058,6 @@ export class Runtime {
   }
 
   /**
-   * Jobs still marked running when the server starts were cut off by a crash or a restart, and
-   * nothing would ever finish them: they go back in the queue. A mutation job marks itself done
-   * in its own transaction, so one still marked running never committed. An action may have got
-   * part of the way before it runs again, as the scheduling docs say.
-   * Only with a database of our own: on a shared one, another instance may be running the job.
-   */
-  private async recoverJobs() {
-    if (this.driver.shared) return;
-    const { changes } = await this.withWriter((tx) => tx.run("UPDATE _scheduled SET state = 'pending' WHERE state = 'running'"));
-    if (changes) this.log.warn(`${changes} scheduled job(s) were cut off when the server last stopped. They will run again now.`);
-  }
-
   /**
    * On a shared database a job belongs to the instance that claimed it, and that instance may be
    * gone. So a claim is a lease: the instance running a job renews it on every heartbeat, and a
@@ -1914,6 +2115,41 @@ export class Runtime {
       .catch((err) => this.log.error(`Scheduler: ${err instanceof Error ? err.message : String(err)}`));
   }
 
+  /**
+   * Jobs left `running` by a process that died mid-job (a crash, SIGKILL, a lost machine) go back
+   * to pending and run again (docs/scheduling.md): a migration's or workflow's next step continues
+   * on its own. A mutation job never committed (it's marked done in its own transaction), so it
+   * still runs exactly once; an action may run a second time, as documented.
+   *
+   * With a database only this process uses, every running job at startup is such a leftover. With
+   * a shared one, a job with a lease is left to keepJobs(). One without (claimed by an older
+   * onebase) counts as abandoned once it was claimed (run_at is set to the claim time) longer ago
+   * than its time limit allows, plus a minute.
+   */
+  async recoverInterruptedJobs(now = Date.now()) {
+    if (this.stopped) return;
+    const limitOf = (ms: number) => (ms > 0 ? ms : 60 * 60_000) + 60_000;
+    const cutoff = (type: string | undefined) =>
+      !this.driver.shared ? Infinity : now - limitOf(type === "mutation" ? this.timeLimits.mutationMs : this.timeLimits.actionMs);
+    try {
+      const recovered = await this.withWriter(async (tx) => {
+        const jobs = (await tx.all("SELECT id, fn, run_at, error FROM _scheduled WHERE state = 'running'")) as { id: string; fn: string; run_at: number; error: string | null }[];
+        let n = 0;
+        for (const job of jobs) {
+          // On a shared database a leased job is alive while its lease is renewed: keepJobs decides.
+          if (this.driver.shared && String(job.error ?? "").startsWith("lease:")) continue;
+          const type = this.functions.get(job.fn)?.type;
+          if (Number(job.run_at) >= cutoff(type)) continue;
+          n += (await tx.run("UPDATE _scheduled SET state = 'pending', run_at = ?, error = NULL WHERE id = ? AND state = 'running'", [now, job.id])).changes;
+        }
+        return n;
+      });
+      if (recovered) this.log.info(`Scheduler: recovered ${recovered} job(s) interrupted by a stopped server.`);
+    } catch (err) {
+      this.log.error(`Scheduler: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   private async runDueJobs() {
     // Every slot is taken: a finishing job pokes the scheduler again.
     const free = MAX_RUNNING_JOBS - this.runningJobs;
@@ -1926,7 +2162,9 @@ export class Runtime {
       )) as { id: string; fn: string; args: string }[];
       const claimed = [];
       for (const job of jobs) {
-        const { changes } = await tx.run("UPDATE _scheduled SET state = 'running', error = ? WHERE id = ? AND state = 'pending'", [this.driver.shared ? leaseMark(Date.now()) : null, job.id]);
+        // run_at becomes the claim time (recoverInterruptedJobs); on a shared database the claim is also a lease (keepJobs).
+        const now = Date.now();
+        const { changes } = await tx.run("UPDATE _scheduled SET state = 'running', run_at = ?, error = ? WHERE id = ? AND state = 'pending'", [now, this.driver.shared ? leaseMark(now) : null, job.id]);
         if (changes === 1) claimed.push(job);
       }
       return claimed;
@@ -1974,6 +2212,7 @@ export class Runtime {
     this.cronRunner?.stop();
     if (this.schedulerTimer) clearTimeout(this.schedulerTimer);
     if (this.heartbeat) clearInterval(this.heartbeat);
+    if (this.uploadSweeper) clearInterval(this.uploadSweeper);
   }
 }
 

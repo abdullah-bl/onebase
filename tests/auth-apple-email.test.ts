@@ -377,9 +377,10 @@ describe("Sign in with Apple and email codes", () => {
     test("rejects bad addresses and unknown flows, and limits how many codes an address can ask for", async () => {
       expect((await start("not-an-email")).status).toBe(400);
       expect((await post("signin", { provider: "email", params: { flow: "nope", email: "x@example.com" } })).status).toBe(400);
-      let last = 0;
-      for (let i = 0; i < 7; i++) last = (await start("flood@example.com")).status;
-      expect(last).toBe(429);
+      // Over the limit the request still reads as sent (so nobody can lock the address out), but nothing goes out.
+      const before = sent.filter((m) => m.email === "flood@example.com").length;
+      for (let i = 0; i < 7; i++) expect((await start("flood@example.com")).status).toBe(200);
+      expect(sent.filter((m) => m.email === "flood@example.com").length - before).toBe(5);
     });
 
     test("behind a proxy that sets Fly-Client-IP, rotating X-Forwarded-For does not dodge the guess limit", async () => {

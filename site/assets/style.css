@@ -139,7 +139,7 @@ code, pre { font-family: var(--mono); font-size: 0.9em; }
 .dash-main { padding: 22px 24px; min-height: 520px; position: relative; }
 .dash-view { position: absolute; inset: 22px 24px; opacity: 0; visibility: hidden; transition: opacity 400ms ease, visibility 0s 400ms; }
 .dash-view.on { opacity: 1; visibility: visible; transition: opacity 400ms ease 350ms, visibility 0s 350ms; }
-.dash-view h3 { font-size: 18px; }
+.dash-view .dash-h { margin: 0; font-size: 18px; font-weight: 650; letter-spacing: -0.025em; line-height: 1.15; }
 .dash-view .meta { margin-top: 2px; color: var(--muted); }
 .kpis { margin-top: 18px; display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
 .kpis div { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }

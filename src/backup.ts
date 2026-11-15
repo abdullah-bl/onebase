@@ -1,21 +1,58 @@
-// SQLite backups to S3: periodic consistent snapshots (VACUUM INTO), gzipped and uploaded,
-// with old snapshots pruned. Local files (<data>/files) are synced incrementally next to them.
+// SQLite backups to S3: periodic consistent snapshots (VACUUM INTO), checked, gzipped, encrypted
+// when $ONEBASE_SECRET_KEY is set, and uploaded, with old snapshots pruned. Local files
+// (<data>/files) are synced incrementally next to them.
 
+import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { newId } from "./engine/dialect";
 import { SqliteDriver, type Driver } from "./engine/driver";
 import { LocalBlobs, parseS3Url, type BlobBackend, type S3Location } from "./engine/files";
 import type { Logger } from "./engine/runtime";
+import { decryptStream, encryptStream, SECRET_KEY_ENV, secretKey } from "./engine/secrets";
 
-export type BackupOptions = { url: string; everyMs: number; keep: number };
+export type BackupOptions = { url: string; everyMs: number; keep: number; keepDaily?: number };
+export const DEFAULT_KEEP_DAILY = 7;
 export type BackupResult = { key: string; bytes: number; filesUploaded: number };
 
 const SNAPSHOT_PREFIX = "db/onebase-";
 
 function stamp(date = new Date()): string {
   return date.toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+}
+
+/**
+ * The snapshots to delete: everything but the newest `keep`, and the newest of each of the last
+ * `keepDaily` days that have one. The hourly ones give a fine-grained recent past; the daily ones
+ * are for the mistake noticed days later.
+ */
+export function snapshotsToDelete(keys: string[], keep: number, keepDaily: number): string[] {
+  const newestFirst = [...keys].sort().reverse();
+  const kept = new Set(newestFirst.slice(0, keep));
+  const days = new Set<string>();
+  for (const key of newestFirst) {
+    const day = /onebase-(\d{8})T/.exec(key)?.[1];
+    if (!day || days.has(day) || days.size >= keepDaily) continue;
+    days.add(day);
+    kept.add(key);
+  }
+  return newestFirst.filter((key) => !kept.has(key));
+}
+
+/** Throws unless the SQLite file at `path` is sound. quick_check skips the slow index comparison, which a copy can't get wrong. */
+function checkDatabase(path: string, what: string) {
+  let result: string;
+  try {
+    const db = new Database(path, { readonly: true });
+    try {
+      result = String((db.query("PRAGMA quick_check").get() as Record<string, unknown> | null)?.quick_check ?? "no answer");
+    } finally {
+      db.close();
+    }
+  } catch (err) {
+    result = err instanceof Error ? err.message : String(err);
+  }
+  if (result !== "ok") throw new Error(`${what} failed its integrity check (${result}).`);
 }
 
 async function listKeys(loc: S3Location, prefix: string): Promise<{ key: string; size: number }[]> {
@@ -30,22 +67,25 @@ async function listKeys(loc: S3Location, prefix: string): Promise<{ key: string;
 }
 
 /** Takes one snapshot now. Only for the SQLite driver: Postgres and Turso have their own backups. */
-export async function backupNow(driver: Driver, url: string, keep: number, blobs?: BlobBackend): Promise<BackupResult> {
+export async function backupNow(driver: Driver, url: string, keep: number, blobs?: BlobBackend, keepDaily = DEFAULT_KEEP_DAILY): Promise<BackupResult> {
   if (!(driver instanceof SqliteDriver) || driver.path === ":memory:") {
     throw new Error("S3 backups work with the SQLite driver. For Postgres or Turso, use your provider's backups.");
   }
   const loc = parseS3Url(url);
-  const tmp = join(tmpdir(), `onebase-snapshot-${newId()}.sqlite`);
+  const secret = secretKey();
+  // Next to the database, not in /tmp: that is often memory, and a snapshot is as big as the database.
+  const tmp = join(dirname(driver.path), `.onebase-snapshot-${newId()}.sqlite`);
   try {
     await driver.snapshot(tmp);
-    const key = `${loc.prefix}${SNAPSHOT_PREFIX}${stamp()}.sqlite.gz`;
+    // A snapshot that can't be restored is worse than none: it would push a good one out.
+    checkDatabase(tmp, "The snapshot");
+    const key = `${loc.prefix}${SNAPSHOT_PREFIX}${stamp()}.sqlite.gz${secret ? ".enc" : ""}`;
     const gz = Bun.file(tmp).stream().pipeThrough(new CompressionStream("gzip"));
-    await loc.client.write(key, new Response(gz), { type: "application/gzip" });
+    await loc.client.write(key, new Response(secret ? gz.pipeThrough(encryptStream(secret)) : gz), { type: secret ? "application/octet-stream" : "application/gzip" });
     const bytes = (await loc.client.file(key).stat()).size;
 
-    // Keep the newest `keep` snapshots.
-    const snapshots = (await listKeys(loc, SNAPSHOT_PREFIX)).map((o) => o.key).sort().reverse();
-    for (const old of snapshots.slice(keep)) await loc.client.delete(old);
+    const snapshots = (await listKeys(loc, SNAPSHOT_PREFIX)).map((o) => o.key);
+    for (const old of snapshotsToDelete(snapshots, keep, keepDaily)) await loc.client.delete(old);
 
     // Files never change once written, so only new ones are uploaded.
     let filesUploaded = 0;
@@ -74,7 +114,7 @@ export function startBackups(driver: Driver, opts: BackupOptions, log: Logger, b
     if (running) return;
     running = true;
     try {
-      const r = await backupNow(driver, opts.url, opts.keep, blobs);
+      const r = await backupNow(driver, opts.url, opts.keep, blobs, opts.keepDaily);
       log.info(`backup: ${r.key} (${(r.bytes / 1024).toFixed(1)} KB${r.filesUploaded ? `, +${r.filesUploaded} files` : ""})`);
     } catch (err) {
       log.error(`backup failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -113,8 +153,20 @@ export async function restore(url: string, dbPath: string, filesDir: string, opt
 
   mkdirSync(dirname(dbPath), { recursive: true });
   const tmp = `${dbPath}.restore-${newId()}`;
-  const plain = loc.client.file(chosen.key).stream().pipeThrough(new DecompressionStream("gzip"));
-  await Bun.write(tmp, new Response(plain));
+  let stored: ReadableStream<any> = loc.client.file(chosen.key).stream();
+  if (chosen.key.endsWith(".enc")) {
+    const secret = secretKey();
+    if (!secret) throw new Error(`${chosen.key} is encrypted. Set $${SECRET_KEY_ENV} to the key the server had when it was made.`);
+    stored = stored.pipeThrough(decryptStream(secret));
+  }
+  try {
+    await Bun.write(tmp, new Response(stored.pipeThrough(new DecompressionStream("gzip"))));
+    // Checked before it replaces anything: a damaged download leaves the database that was there.
+    checkDatabase(tmp, `The backup ${chosen.key}`);
+  } catch (err) {
+    rmSync(tmp, { force: true });
+    throw err;
+  }
   for (const suffix of ["-wal", "-shm"]) rmSync(dbPath + suffix, { force: true });
   renameSync(tmp, dbPath);
 

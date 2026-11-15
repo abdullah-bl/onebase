@@ -55,7 +55,7 @@ export class SerialQueue {
 }
 
 /** Runs at most `limit` tasks at once; the rest wait in order. */
-class Semaphore {
+export class Semaphore {
   private active = 0;
   private readonly waiting: (() => void)[] = [];
 
@@ -503,7 +503,8 @@ export class PostgresDriver implements Driver {
   private readonly sql: InstanceType<typeof Bun.SQL>;
 
   constructor(private readonly url: string) {
-    this.sql = new Bun.SQL(url, { max: 10 });
+    // $ONEBASE_DB_POOL: connections this instance may hold. Reads, writes and live-query re-runs share them.
+    this.sql = new Bun.SQL(url, { max: Math.max(2, envNumber("ONEBASE_DB_POOL") ?? 10) });
   }
 
   get description() {

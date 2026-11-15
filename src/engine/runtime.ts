@@ -16,7 +16,7 @@ import { CronRunner } from "./crons";
 import { BACKFILL_BATCH, backfilled, coalesce, hookState, readProgress, writeProgress, type HookProgress, type ResolvedHook } from "./hooks";
 import { applySchema, DatabaseImpl, OnebaseError, readerView, writerView, type ReadSet, type VectorSearchQuery, type Write } from "./database";
 import { isIdForTable, newId } from "./dialect";
-import { envNumber, savepoint, SerialQueue, type Driver, type Exec } from "./driver";
+import { envNumber, savepoint, Semaphore, SerialQueue, type Driver, type Exec } from "./driver";
 import { FileStore, LocalBlobs, type BlobBackend } from "./files";
 import { CallLog, type CallSource } from "./calllog";
 import { CallBudget, DEFAULT_CALL_LIMITS, type CallLimits } from "./limits";
@@ -28,7 +28,8 @@ import { compareVersions, compatibleVersions, VERSION } from "../version";
 import { isMcpToken, McpService } from "./mcp";
 import { isMcpTool, type McpDefinition } from "../mcp";
 import { createAuthenticate, type AuthConfig, type AuthenticateCtx } from "./jwt";
-import { checkEnvVar, processEnvVars, readEnvVars, writeEnvVars, type EnvVars, type StoredEnvVar } from "./env-vars";
+import { checkEnvVar, encryptStoredEnvVars, processEnvVars, readEnvVars, writeEnvVars, type EnvVars, type StoredEnvVar } from "./env-vars";
+import { secretKey } from "./secrets";
 import {
   activeDeployment,
   activeDeploymentId,
@@ -270,6 +271,8 @@ type TxState = {
 
 /** Scheduled jobs one instance runs at the same time. */
 const MAX_RUNNING_JOBS = 20;
+/** A running job's lease, as text that sorts by time (13 digits until the year 2286). */
+export const leaseMark = (at: number) => `lease:${String(Math.floor(at)).padStart(13, "0")}`;
 /** Commit broadcasts above this size only list the tables (Postgres NOTIFY caps payloads at 8000 bytes). */
 const MAX_BROADCAST = 7000;
 /** Ended sessions per broadcast message; more go in extra messages, so the cap above holds. */
@@ -326,12 +329,16 @@ export class Runtime {
   private readonly actionWorkerEntry: string | URL;
   private schedulerStarted = false;
   /** Mutations from this process run one at a time; other instances are handled by the driver. */
-  private readonly mutations = new SerialQueue();
+  private readonly mutations: { run<T>(fn: () => Promise<T>): Promise<T> };
   /** Deploys and rollbacks, one at a time, so the code running is always the one recorded. */
   private readonly deploys = new SerialQueue();
   private commitListeners: ((event: CommitEvent) => Promise<void>)[] = [];
   private schedulerTimer: ReturnType<typeof setTimeout> | null = null;
   private runningJobs = 0;
+  private readonly runningJobIds = new Set<string>();
+  /** How often a shared database is checked for missed work, and how long a job's claim lasts without being renewed. */
+  static heartbeatMs = 30_000;
+  static jobLeaseMs = 150_000;
   private heartbeat: ReturnType<typeof setInterval> | null = null;
   private lastCreationTime = 0;
   private readonly warnedQueries = new Set<string>();
@@ -351,6 +358,10 @@ export class Runtime {
   constructor(opts: RuntimeOptions) {
     installGuards();
     this.driver = opts.driver;
+    // Postgres decides which transactions conflict (and those are retried), so this process's
+    // mutations needn't queue behind each other there: $ONEBASE_WRITE_CONCURRENCY run at once.
+    const writers = this.driver.kind === "postgres" ? Math.max(1, Math.floor(envNumber("ONEBASE_WRITE_CONCURRENCY") ?? 1)) : 1;
+    this.mutations = writers > 1 ? new Semaphore(writers) : new SerialQueue();
     this.customAuthenticate = opts.authenticate ?? null;
     this.dev = opts.dev ?? false;
     this.log = opts.log ?? consoleLogger;
@@ -399,6 +410,11 @@ export class Runtime {
       this.log.warn(`This database was last opened by onebase ${storage.previous}, newer than this ${VERSION}. It runs, but go back to ${storage.previous} when you can.`);
     }
     this.handleKey = await this.loadHandleKey();
+    // Values saved before $ONEBASE_SECRET_KEY was set are encrypted now.
+    if (secretKey()) {
+      const sealed = await this.withWriter(encryptStoredEnvVars);
+      if (sealed) this.log.info(`Encrypted ${sealed} stored environment variable(s) with $ONEBASE_SECRET_KEY.`);
+    }
     // Before a deployment loads, so its top level sees them. Local code was loaded already
     // (startApp reads them first when it can); prepare it again in case they changed anything.
     if (this.envVars.apply(await this.driver.read(readEnvVars)).length) this.setCode(this.prepare(this.current.code), null);
@@ -1777,10 +1793,11 @@ export class Runtime {
     // With a shared database, pick up jobs left by instances that went away.
     // Also catch up on a deploy whose broadcast was missed (say, while reconnecting).
     if (this.driver.shared) {
+      await this.keepJobs();
       this.heartbeat = setInterval(() => {
-        this.pokeScheduler();
+        void this.keepJobs().then(() => this.pokeScheduler());
         void this.syncDeployment();
-      }, 30_000);
+      }, Runtime.heartbeatMs);
     }
     this.schedulerStarted = true;
     await this.startCrons();
@@ -1803,6 +1820,33 @@ export class Runtime {
     if (this.driver.shared) return;
     const { changes } = await this.withWriter((tx) => tx.run("UPDATE _scheduled SET state = 'pending' WHERE state = 'running'"));
     if (changes) this.log.warn(`${changes} scheduled job(s) were cut off when the server last stopped. They will run again now.`);
+  }
+
+  /**
+   * On a shared database a job belongs to the instance that claimed it, and that instance may be
+   * gone. So a claim is a lease: the instance running a job renews it on every heartbeat, and a
+   * job whose lease ran out goes back in the queue for any instance to take.
+   *
+   * The lease is kept in the job's `error` column while it runs (nothing else uses it then), which
+   * needs no change to the table: instances of an older onebase leave it empty, and their jobs
+   * are never taken from them.
+   */
+  private async keepJobs() {
+    if (this.stopped) return;
+    const now = Date.now();
+    try {
+      const reclaimed = await this.withWriter(async (tx) => {
+        for (const id of this.runningJobIds) await tx.run("UPDATE _scheduled SET error = ? WHERE id = ? AND state = 'running'", [leaseMark(now), id]);
+        const { changes } = await tx.run(
+          "UPDATE _scheduled SET state = 'pending', error = NULL WHERE state = 'running' AND error LIKE 'lease:%' AND error < ?",
+          [leaseMark(now - Runtime.jobLeaseMs)],
+        );
+        return changes;
+      });
+      if (reclaimed) this.log.warn(`${reclaimed} scheduled job(s) were left running by an instance that went away. They will run again.`);
+    } catch (err) {
+      this.log.error(`Scheduler: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   /**
@@ -1847,7 +1891,7 @@ export class Runtime {
       )) as { id: string; fn: string; args: string }[];
       const claimed = [];
       for (const job of jobs) {
-        const { changes } = await tx.run("UPDATE _scheduled SET state = 'running' WHERE id = ? AND state = 'pending'", [job.id]);
+        const { changes } = await tx.run("UPDATE _scheduled SET state = 'running', error = ? WHERE id = ? AND state = 'pending'", [this.driver.shared ? leaseMark(Date.now()) : null, job.id]);
         if (changes === 1) claimed.push(job);
       }
       return claimed;
@@ -1858,8 +1902,10 @@ export class Runtime {
     // Jobs run on their own, so a slow or stuck one never holds up the jobs due after it.
     for (const job of due) {
       this.runningJobs++;
+      this.runningJobIds.add(job.id);
       void this.runJob(job).finally(() => {
         this.runningJobs--;
+        this.runningJobIds.delete(job.id);
         this.pokeScheduler();
       });
     }

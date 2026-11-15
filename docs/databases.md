@@ -41,7 +41,7 @@ onebase serve --db mysql://onebase:secret@db.internal:3306/app
 ```
 
 - **Tables:** `documents` (with a `JSON` column) plus the system tables, created on first start.
-- **Indexes:** MySQL can't index a JSON value, so schema indexes are recorded but not built. `withIndex` and `.filter()` give the same results as on the other databases, but each query reads the table's documents and sorts them. Fine for small and medium tables; use Postgres when tables get large.
+- **Indexes:** MySQL can't index a JSON value, so schema indexes are recorded but not built. `withIndex` and `.filter()` give the same results as on the other databases, but each query reads the table's documents and sorts them. Fine for small and medium tables; use Postgres when tables get large. That makes MySQL a fit for small tables only; for anything larger use Postgres.
 - **Search:** each search index is a `FULLTEXT` side table. MySQL skips words shorter than 3 characters and [stopwords](https://dev.mysql.com/doc/refman/8.4/en/fulltext-stopwords.html) like "the".
 - **Isolation:** queries run in `REPEATABLE READ` read-only snapshots, mutations in `SERIALIZABLE`. Deadlocks are retried automatically.
 - **Live queries** across instances use a small commit log that each instance polls every 200 ms, as with Turso.
@@ -70,6 +70,8 @@ onebase serve --db $DATABASE_URL --files s3://bucket/files --port 8090   # machi
 What onebase guarantees:
 
 - **Live queries everywhere.** A commit on any instance updates subscribers on all of them: through `NOTIFY` on Postgres, and through a small commit log on MySQL and Turso that each instance polls every 200 ms.
+- **Scheduled jobs survive an instance.** The instance running a job renews its claim every 30 seconds. If it goes away, the claim runs out after two and a half minutes and another instance runs the job again.
+- **Writes on Postgres.** Each instance runs one mutation at a time by default. Postgres can decide by itself which transactions conflict, so `ONEBASE_WRITE_CONCURRENCY=4` lets an instance run four at once: in our test that took independent 1 KB writes from about 340 to about 800 a second on one instance. The cost is on rows many mutations change at once (a single counter): conflicting mutations are retried up to 8 times, and under heavy contention a few ran out of retries and failed. Leave it at 1 unless your writes mostly touch different documents. Raise `ONEBASE_DB_POOL` (default 10) with it, since reads and live queries share the pool.
 - **No lost updates.** Mutations are serializable. When two instances conflict, one of them is retried automatically. This is why side effects belong in actions, not mutations.
 - **Each job runs once.** Each scheduled job and cron run is claimed by exactly one instance.
 

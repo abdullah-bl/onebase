@@ -169,7 +169,7 @@ for (const D of DRIVERS) {
 for (const D of DRIVERS.filter((d) => d.name !== "sqlite")) {
   describe(`${D.name} > job leases`, () => {
     test("a job left running by an instance that went away runs again; one still being renewed is left alone", async () => {
-      const { Runtime, leaseMark } = await import("../src/engine/runtime");
+      const { Scheduler, leaseMark } = await import("../src/engine/scheduler");
       const jobs = {
         jobs: {
           note: mutation({ args: { text: v.string() }, handler: (ctx, a) => ctx.db.insert("notes", a) }),
@@ -177,9 +177,9 @@ for (const D of DRIVERS.filter((d) => d.name !== "sqlite")) {
         },
       };
       const { driver, runtime } = await openRuntime(() => D.make(""), { schema, modules: jobs });
-      const [heartbeat, lease] = [Runtime.heartbeatMs, Runtime.jobLeaseMs];
-      Runtime.heartbeatMs = 100;
-      Runtime.jobLeaseMs = 1000;
+      const [heartbeat, lease] = [Scheduler.heartbeatMs, Scheduler.jobLeaseMs];
+      Scheduler.heartbeatMs = 100;
+      Scheduler.jobLeaseMs = 1000;
       try {
         const now = Date.now();
         const row = (id: string, text: string, mark: string | null) =>
@@ -198,8 +198,8 @@ for (const D of DRIVERS.filter((d) => d.name !== "sqlite")) {
           { id: "older", state: "running" },
         ]);
       } finally {
-        Runtime.heartbeatMs = heartbeat;
-        Runtime.jobLeaseMs = lease;
+        Scheduler.heartbeatMs = heartbeat;
+        Scheduler.jobLeaseMs = lease;
         runtime.stop();
         await driver.close();
       }

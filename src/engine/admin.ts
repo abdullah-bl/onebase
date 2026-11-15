@@ -253,7 +253,7 @@ export function createAdmin(opts: { runtime: Runtime; key: string; assets: Dashb
         const rows = state
           ? await tx.all("SELECT id, fn, args, run_at, state, error FROM _scheduled WHERE state = ? ORDER BY run_at DESC LIMIT 200", [state])
           : await tx.all("SELECT id, fn, args, run_at, state, error FROM _scheduled ORDER BY run_at DESC LIMIT 200");
-        // While a job runs, the column holds its lease (see Runtime.keepJobs), not an error.
+        // While a job runs, the column holds its lease (see Scheduler.renewLeases), not an error.
         return rows.map((r) => ({ id: r.id, fn: r.fn, args: JSON.parse(r.args), runAt: Number(r.run_at), state: r.state, error: r.state === "running" ? null : r.error }));
       }),
 

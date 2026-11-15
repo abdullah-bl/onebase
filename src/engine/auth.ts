@@ -20,6 +20,35 @@ const DAY = 86_400_000;
 const STATE_TTL = 10 * 60_000;
 const LOGIN_CODE_TTL = 2 * 60_000;
 const MAX_FAILURES = 10;
+
+/**
+ * Hashing a password takes about 64 MB and a core for a moment, and anyone can ask for it by
+ * posting to sign-in. Only a few run at once and a bounded number wait; past that the request is
+ * turned away, so a flood of sign-ins can slow sign-in down but can't take the server's memory.
+ */
+class HashGate {
+  private running = 0;
+  private readonly waiting: (() => void)[] = [];
+  constructor(private readonly parallel: number, private readonly queue: number) {}
+
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.running >= this.parallel) {
+      if (this.waiting.length >= this.queue) throw new AuthError("Sign-in is busy right now. Try again in a moment.", 503);
+      await new Promise<void>((resolve) => this.waiting.push(resolve));
+    } else {
+      this.running++;
+    }
+    try {
+      return await fn();
+    } finally {
+      // Hand the slot straight to the next in line, or free it.
+      const next = this.waiting.shift();
+      if (next) next();
+      else this.running--;
+    }
+  }
+}
+const hashing = new HashGate(4, 200);
 const FAILURE_WINDOW = 3_600_000;
 const MAX_PASSWORD = 1024;
 const EMAIL_CODE_TTL = 15 * 60_000;
@@ -206,6 +235,15 @@ export class AuthService {
     return token;
   }
 
+  /**
+   * Ends the user's MCP connections and API keys. Whoever got into an account could have made
+   * one, and they never expire, so they go wherever every session goes.
+   */
+  private async endMcpConnections(tx: Exec, userId: string) {
+    await tx.run("DELETE FROM _mcp_tokens WHERE connection_id IN (SELECT id FROM _mcp_connections WHERE user_id = ?)", [userId]);
+    await tx.run("DELETE FROM _mcp_connections WHERE user_id = ?", [userId]);
+  }
+
   private async signOut(token: string | null, everywhere: boolean) {
     if (!token?.startsWith(SESSION_PREFIX)) throw new AuthError("Signing out needs the session token: Authorization: Bearer <token>.", 401);
     await this.runtime.authWrite(async ({ tx, revoke }) => {
@@ -214,6 +252,7 @@ export class AuthService {
       if (everywhere) {
         revoke((await tx.all("SELECT id FROM _auth_sessions WHERE user_id = ?", [row.user_id])).map((r) => r.id as string));
         await tx.run("DELETE FROM _auth_sessions WHERE user_id = ?", [row.user_id]);
+        await this.endMcpConnections(tx, row.user_id as string);
       } else {
         revoke([row.id]);
         await tx.run("DELETE FROM _auth_sessions WHERE id = ?", [row.id]);
@@ -349,7 +388,7 @@ export class AuthService {
     await this.countAttempt(key, MAX_FAILURES, "failed sign-in attempts");
     const found = await this.passwordUser(email);
     // Verify against a dummy hash for unknown emails, so timing doesn't reveal which emails have accounts.
-    const valid = found ? await Bun.password.verify(password, found.secret) : (await Bun.password.verify(password, await this.dummy()), false);
+    const valid = found ? await hashing.run(() => Bun.password.verify(password, found.secret)) : (await hashing.run(async () => Bun.password.verify(password, await this.dummy())), false);
     if (!valid) throw new AuthError("Invalid email or password.", 401);
     await this.runtime.withWriter((tx) => tx.run("DELETE FROM _auth_attempts WHERE \"key\" = ?", [key]));
     const user = found!.user;
@@ -365,7 +404,7 @@ export class AuthService {
     // Only a confirmed code marks an email verified (OAuth sign-ins join users by verified email).
     const fields = method.profile ? { ...method.profile(publicParams(params)), email, emailVerificationTime: undefined } : defined({ email, name });
     // Hashed either way, so the time a sign-up takes doesn't reveal whether the email is taken.
-    const secret = await Bun.password.hash(password);
+    const secret = await hashing.run(() => Bun.password.hash(password));
     let existing = false;
     let created: SignInResult | null = null;
     try {
@@ -526,8 +565,10 @@ export class AuthService {
   ): Promise<{ secret?: string }> {
     const key = `code:${email}|${client}`;
     await this.countAttempt(key, MAX_FAILURES, "wrong codes");
-    // A 6-digit code is guessable across many networks, so wrong guesses for the address are also counted overall.
-    if (length < 8) await this.countAttempt(`code:${email}`, MAX_FAILURES * 3, "wrong codes");
+    // Wrong guesses for the address are also counted overall, so guessing from many networks (or
+    // behind a proxy that passes on a made-up client address) ends too. A 6-digit code gets 30 tries;
+    // an 8-digit one gets 1,000, still a 1 in 100,000 chance, and too many for anyone to use up by accident.
+    await this.countAttempt(`code:${email}`, length < 8 ? MAX_FAILURES * 3 : MAX_FAILURES * 100, "wrong codes");
     const entered = typeof code === "string" ? code.replace(/\s/g, "") : "";
     const hash = sha256(`${purpose}|${email}|${entered}`);
     const row = new RegExp(`^\\d{${length}}$`).test(entered)
@@ -535,7 +576,7 @@ export class AuthService {
       : null;
     const data = row && Number(row.expires) >= Date.now() ? (JSON.parse(row.data as string) as { secret?: string }) : null;
     if (!data) throw new AuthError("That code is wrong or has expired. Request a new one.", 401);
-    if (password !== undefined && !(data.secret && (await Bun.password.verify(password, data.secret)))) {
+    if (password !== undefined && !(data.secret && (await hashing.run(() => Bun.password.verify(password, data.secret!))))) {
       throw new AuthError("Enter the code together with the password you signed up with.", 401);
     }
     const { changes } = await this.runtime.withWriter((tx) => tx.run("DELETE FROM _auth_codes WHERE code_hash = ?", [hash]));
@@ -558,7 +599,7 @@ export class AuthService {
   /** Step 2 of a reset: a new password, signed in, and every other session ended. */
   private async resetPassword(method: PasswordMethod, email: string, code: unknown, newPassword: string, client: string): Promise<SignInResult> {
     await this.takeEmailCode("reset", email, code, client);
-    const secret = await Bun.password.hash(newPassword);
+    const secret = await hashing.run(() => Bun.password.hash(newPassword));
     return this.runtime.authWrite(async ({ db, tx, revoke }) => {
       const account = await tx.get("SELECT user_id FROM _auth_accounts WHERE provider = 'password' AND account_id = ?", [email]);
       const user = account ? await db.get(account.user_id) : null;
@@ -566,6 +607,7 @@ export class AuthService {
       await tx.run("UPDATE _auth_accounts SET secret = ? WHERE provider = 'password' AND account_id = ?", [secret, email]);
       revoke((await tx.all("SELECT id FROM _auth_sessions WHERE user_id = ?", [user._id])).map((r) => r.id as string));
       await tx.run("DELETE FROM _auth_sessions WHERE user_id = ?", [user._id]);
+      await this.endMcpConnections(tx, user._id);
       // The owner has proven the inbox: their failed-password count ends, on every network.
       await tx.run("DELETE FROM _auth_attempts WHERE \"key\" = ? OR \"key\" LIKE ?", [`password:${email}`, `password:${email}|%`]);
       // The code proves they read this inbox.
@@ -609,6 +651,7 @@ export class AuthService {
         if (secret) await tx.run("UPDATE _auth_accounts SET secret = ? WHERE provider = 'password' AND account_id = ?", [secret, email]);
         revoke((await tx.all("SELECT id FROM _auth_sessions WHERE user_id = ?", [user._id])).map((r) => r.id as string));
         await tx.run("DELETE FROM _auth_sessions WHERE user_id = ?", [user._id]);
+        await this.endMcpConnections(tx, user._id);
       }
       return { userId: user._id, token: await this.createSession(tx, user._id) };
     });

@@ -134,12 +134,12 @@ Every flag also has an environment variable, and environment variables can come 
 | `--backup` | `ONEBASE_BACKUP` | none (see [Backups](./backups.md)) |
 | `--backup-every` | `ONEBASE_BACKUP_EVERY` | `1h` |
 | `--backup-keep` | `ONEBASE_BACKUP_KEEP` | `24` |
-| `--cors` | `ONEBASE_CORS` | any origin; comma-separated list of allowed browser origins |
+| `--cors` | `ONEBASE_CORS` | any origin for function calls, and only your own site (`--url`) and `localhost` for sign-in; comma-separated list of allowed browser origins, or `*` for any origin everywhere |
 | `--rate-limit` | `ONEBASE_RATE_LIMIT` | off; per-IP limit on calls, e.g. `100/10s` or `600/m` |
 | `--trust-proxy` | `ONEBASE_TRUST_PROXY=1` | off; read the client IP from `X-Forwarded-For` (set it behind a proxy) |
 | `--no-dashboard` | `ONEBASE_DASHBOARD=off` | dashboard on at `/_admin` (see [Dashboard](./dashboard.md)) |
 | `--no-deploy` | `ONEBASE_DEPLOY=off` | deploys on (see [onebase deploy](#onebase-deploy)) |
-| | `ONEBASE_ADMIN_KEY` | generated into `<data>/admin.key` |
+| | `ONEBASE_ADMIN_KEY` | generated into `<data>/admin.key`; your own needs at least 16 characters |
 
 ### .env files
 
@@ -265,5 +265,8 @@ systemctl restart onebase # or however you run it
 - **Before deploying:** run `onebase doctor` (`onebase deploy` runs it for you), and try a risky schema change with `onebase deploy --dry-run`.
 - **Behind a proxy:** pass `--trust-proxy` so `--rate-limit` counts real client IPs.
 - **Dashboard:** keep the admin key secret, or block `/_admin` at the proxy (see [Dashboard](./dashboard.md)).
+- **A frontend on another origin:** list it in `--cors`. Without it, browsers on other sites can call your functions but can't read a sign-in answer, which carries the session token. The server logs the origin it turned away.
+- **Health checks:** `GET /api/health` answers 200 when the database answers, and 503 when it doesn't or the server is shutting down. The Docker image checks it by itself.
+- **Stopping:** on `SIGTERM` or `SIGINT` the server stops taking connections and gives running calls and jobs up to 10 seconds to finish. Give it that long before a kill: `TimeoutStopSec=15` in systemd, `stop_grace_period: 15s` in Compose.
 - **Errors:** in production (no `--dev`), unexpected errors reach clients as `Server Error`. Use `OneBaseError` for messages users should see.
 - **Memory:** expect about 40 MB at startup with SQLite; Postgres adds a few MB for its connection pool.

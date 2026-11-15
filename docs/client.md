@@ -26,7 +26,7 @@ const client = new OnebaseClient("https://api.example.com");
 
 - **WebSocket:** derived automatically (`https://api.example.com` → `wss://api.example.com/api/sync`).
 - **Per environment:** keep the URL in an environment variable, e.g. `new OnebaseClient(import.meta.env.VITE_ONEBASE_URL)`.
-- **CORS:** any origin can call the API by default. Restrict it with `--cors https://app.example.com` (comma-separate several origins).
+- **CORS:** any origin can call your functions by default, but only your own site and `localhost` can read a sign-in answer. A frontend on another origin needs `--cors https://app.example.com` (comma-separate several origins), which also restricts function calls to those origins.
 - **File URLs:** start the server with `--url https://api.example.com`, so `ctx.storage.getUrl()` returns public addresses instead of `localhost`.
 
 ## Browser

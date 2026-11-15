@@ -122,7 +122,9 @@ export async function restore(url: string, dbPath: string, filesDir: string, opt
   mkdirSync(filesDir, { recursive: true });
   for (const { key } of await listKeys(loc, "files/")) {
     const name = key.slice(`${loc.prefix}files/`.length);
-    if (!name || existsSync(join(filesDir, name))) continue;
+    // Storage ids are lowercase letters and digits. Any other key isn't one of ours, and a name
+    // like "../../x" would be written outside the files folder.
+    if (!/^[0-9a-z]+$/.test(name) || existsSync(join(filesDir, name))) continue;
     await Bun.write(join(filesDir, name), loc.client.file(key));
     files++;
   }

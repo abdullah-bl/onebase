@@ -17,6 +17,10 @@ USER onebase
 WORKDIR /app
 VOLUME /app/onebase_data
 EXPOSE 8090
+# The image has no curl, so the check speaks HTTP over bash's /dev/tcp. /api/health answers 200
+# only when the database answers, and 503 while the server is shutting down.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/${PORT:-8090} && printf 'GET /api/health HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && head -n 1 <&3 | grep -q ' 200 '"]
 CMD ["onebase", "serve"]
 
 # This image runs a bare server. Push your functions to it with `onebase deploy`

@@ -318,6 +318,11 @@ export class Runtime {
   /** Signs function handles; loaded from the database by init(). */
   private handleKey: Buffer | null = null;
   private stopped = false;
+  private draining = false;
+  /** True once a shutdown has begun. */
+  get shuttingDown() {
+    return this.draining || this.stopped;
+  }
   private readonly envVars: EnvVars;
   private readonly driverReady: boolean;
   /** The code being run, so a change of environment variables can prepare it again. */
@@ -1724,6 +1729,7 @@ export class Runtime {
 
   async startScheduler() {
     await this.withWriter((tx) => tx.run("DELETE FROM _scheduled WHERE state <> 'pending' AND run_at < ?", [Date.now() - 7 * 86400_000]));
+    await this.recoverJobs();
     this.pokeScheduler();
     // With a shared database, pick up jobs left by instances that went away.
     // Also catch up on a deploy whose broadcast was missed (say, while reconnecting).
@@ -1743,8 +1749,37 @@ export class Runtime {
     await this.cronRunner.start().catch((err) => this.log.error(`Crons: ${err instanceof Error ? err.message : String(err)}`));
   }
 
+  /**
+   * Jobs still marked running when the server starts were cut off by a crash or a restart, and
+   * nothing would ever finish them: they go back in the queue. A mutation job marks itself done
+   * in its own transaction, so one still marked running never committed. An action may have got
+   * part of the way before it runs again, as the scheduling docs say.
+   * Only with a database of our own: on a shared one, another instance may be running the job.
+   */
+  private async recoverJobs() {
+    if (this.driver.shared) return;
+    const { changes } = await this.withWriter((tx) => tx.run("UPDATE _scheduled SET state = 'pending' WHERE state = 'running'"));
+    if (changes) this.log.warn(`${changes} scheduled job(s) were cut off when the server last stopped. They will run again now.`);
+  }
+
+  /**
+   * Before a shutdown: starts no more scheduled jobs or crons, then waits for the calls and jobs
+   * already running, up to `ms`. Resolves to whether everything finished.
+   */
+  async drain(ms: number): Promise<boolean> {
+    this.draining = true;
+    this.cronRunner?.stop();
+    if (this.schedulerTimer) clearTimeout(this.schedulerTimer);
+    const until = Date.now() + ms;
+    while (this.calls.active > 0 || this.runningJobs > 0) {
+      if (Date.now() >= until) return false;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    return true;
+  }
+
   pokeScheduler() {
-    if (this.stopped) return;
+    if (this.stopped || this.draining) return;
     void this.withReader((tx) => tx.get("SELECT MIN(run_at) AS at FROM _scheduled WHERE state = 'pending'"))
       .then((next) => {
         if (this.stopped) return;
@@ -1760,7 +1795,7 @@ export class Runtime {
   private async runDueJobs() {
     // Every slot is taken: a finishing job pokes the scheduler again.
     const free = MAX_RUNNING_JOBS - this.runningJobs;
-    if (free <= 0) return;
+    if (free <= 0 || this.draining) return;
     // Claim each job with a conditional update so that no two runs (or instances) take the same one.
     const due = await this.withWriter(async (tx) => {
       const jobs = (await tx.all(

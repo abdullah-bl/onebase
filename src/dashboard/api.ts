@@ -1,4 +1,5 @@
-// Talks to /_admin/api. The admin key lives in localStorage (it can come from a #key=… link).
+// Talks to /_admin/api. The admin key lives in sessionStorage (it can come from a #key=… link):
+// it lasts as long as the tab, and other tabs on this origin (the app itself) can't read it.
 
 const STORAGE_KEY = "ob-admin-key";
 
@@ -13,7 +14,13 @@ function readKey(): string | null {
     return key;
   }
   try {
-    return localStorage.getItem(STORAGE_KEY);
+    // Earlier versions kept the key in localStorage, where any script on this origin could read it.
+    const old = localStorage.getItem(STORAGE_KEY);
+    if (old) {
+      localStorage.removeItem(STORAGE_KEY);
+      sessionStorage.setItem(STORAGE_KEY, old);
+    }
+    return sessionStorage.getItem(STORAGE_KEY);
   } catch {
     return null;
   }
@@ -28,8 +35,8 @@ export function getKey() {
 export function setKey(value: string | null) {
   key = value;
   try {
-    if (value) localStorage.setItem(STORAGE_KEY, value);
-    else localStorage.removeItem(STORAGE_KEY);
+    if (value) sessionStorage.setItem(STORAGE_KEY, value);
+    else sessionStorage.removeItem(STORAGE_KEY);
   } catch {}
 }
 

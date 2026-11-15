@@ -168,6 +168,8 @@ export class CallLog {
   private minutes = new TimeRing(60, 60_000);
   private fnSlots: { at: number; fns: Map<string, FnSlot> }[] = [];
   readonly totals = { calls: 0, errors: 0 };
+  /** Calls running right now; a shutdown waits for this to reach zero. */
+  active = 0;
 
   constructor(private readonly max = 1000) {
     this.records = new Array(max);
@@ -178,6 +180,7 @@ export class CallLog {
     const lines: LogLine[] = [];
     const at = Date.now();
     const start = performance.now();
+    this.active++;
     try {
       const value = await capture.run(lines, fn);
       this.add({ id: this.nextId++, at, name, type, source, ms: performance.now() - start, ok: true, lines });
@@ -186,6 +189,8 @@ export class CallLog {
       const error = err instanceof Error ? err.message : String(err);
       this.add({ id: this.nextId++, at, name, type, source, ms: performance.now() - start, ok: false, error, lines });
       throw err;
+    } finally {
+      this.active--;
     }
   }
 

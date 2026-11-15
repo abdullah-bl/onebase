@@ -23,7 +23,9 @@ Every onebase server includes a dashboard at **`/_admin`**. It's built into the 
 The dashboard is protected by an **admin key**:
 
 - **Generated key:** on first start, onebase generates one and saves it to `<data>/admin.key`, readable only by its owner.
-- **Your own key:** set `ONEBASE_ADMIN_KEY` instead. Do this when you run several instances, so they all accept the same key.
+- **Your own key:** set `ONEBASE_ADMIN_KEY` instead, at least 16 characters (`openssl rand -base64 24` makes a good one). Do this when you run several instances, so they all accept the same key.
+- **In the browser:** the dashboard keeps the key for as long as its tab is open, so a new tab asks for it again.
+- **Wrong keys:** after 10 wrong keys in a minute from one address, that address has to wait. The right key always works.
 - **In dev:** `onebase dev` prints a link that signs you in directly. The key is in the URL's `#` fragment, which browsers never send to the server.
 
 ```

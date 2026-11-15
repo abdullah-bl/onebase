@@ -108,6 +108,8 @@ export function embeddedAssets(files: Record<string, string>): AssetResolver {
 }
 
 export async function startApp(opts: AppOptions) {
+  // First: a refused key should stop the server before it has opened the database.
+  const adminKey = opts.dashboard === false ? null : loadAdminKey(opts.dataDir, { dev: opts.dev });
   const driver = createDriver(opts.db ?? join(opts.dataDir, "db.sqlite"));
   const blobs = opts.files ? new S3Blobs(parseS3Url(opts.files)) : new LocalBlobs(join(opts.dataDir, "files"));
   let code: AppCode = opts;
@@ -139,7 +141,6 @@ export async function startApp(opts: AppOptions) {
     callLimits: opts.callLimits,
   });
   const { created, dropped } = await runtime.init();
-  const adminKey = opts.dashboard === false ? null : loadAdminKey(opts.dataDir);
   const server = serve({
     runtime,
     port: opts.port,
@@ -205,10 +206,18 @@ export async function startApp(opts: AppOptions) {
     }
   }
 
-  const close = async () => {
-    runtime.stop();
+  /**
+   * Stops taking new connections, gives the calls and jobs already running up to `graceMs` to
+   * finish, then closes everything. Whatever is still running after that is cut off.
+   */
+  const close = async (graceMs = 10_000) => {
     backups?.stop();
-    server.stop(true);
+    void server.stop();
+    if (!(await runtime.drain(graceMs))) {
+      runtime.log.warn(`Shutting down with ${runtime.calls.active} call(s) still running after ${formatMs(graceMs)}.`);
+    }
+    runtime.stop();
+    await server.stop(true);
     await driver.close();
   };
   if (!opts.quiet) {

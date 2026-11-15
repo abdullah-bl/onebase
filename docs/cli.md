@@ -44,7 +44,7 @@ Each flag can also be set with an environment variable, which can come from a [.
 | `--backup-keep <n>` | `24` / `$ONEBASE_BACKUP_KEEP` | Snapshots to keep |
 | `--at <time>` | newest | `restore`: pick a snapshot |
 | `--force` | | `restore`: overwrite an existing database |
-| `--cors <origins>` | any / `$ONEBASE_CORS` | Browser origins allowed to call the API, comma-separated |
+| `--cors <origins>` | any, but sign-in only from your site and `localhost` / `$ONEBASE_CORS` | Browser origins allowed to call the API, comma-separated; `*` allows any origin for sign-in too |
 | `--rate-limit <r>` | off / `$ONEBASE_RATE_LIMIT` | Per-IP limit on calls, subscriptions and uploads, e.g. `100/10s`, `600/m` |
 | `--max-upload <size>` | `1gb` / `$ONEBASE_MAX_UPLOAD` | Largest upload (and any request body), e.g. `512mb`, `2gb`. Larger ones get HTTP 413 with a JSON error |
 | `--trust-proxy` | off / `$ONEBASE_TRUST_PROXY=1` | Take the client IP from `X-Forwarded-For`: the entry the proxy appended (the rightmost), not the client-written leftmost one |

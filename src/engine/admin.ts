@@ -8,14 +8,28 @@ import { isPlainObject } from "../values";
 import type { CallRecord } from "./calllog";
 import { tableMount } from "./catalog";
 import { OnebaseError } from "./database";
+import { RateLimiter } from "./http";
 import type { Runtime } from "./runtime";
 
 export type DashboardAssets = { js: string; css: string };
 
+const MIN_ADMIN_KEY = 16;
+/** Wrong admin keys allowed per client before it has to wait. The right key always works. */
+const WRONG_KEYS = { max: 10, windowMs: 60_000 };
+
 /** $ONEBASE_ADMIN_KEY, or a random key kept in <data>/admin.key (created on first run). */
-export function loadAdminKey(dataDir: string): { key: string; source: string } {
+export function loadAdminKey(dataDir: string, opts: { dev?: boolean } = {}): { key: string; source: string } {
   const fromEnv = process.env.ONEBASE_ADMIN_KEY?.trim();
-  if (fromEnv) return { key: fromEnv, source: "$ONEBASE_ADMIN_KEY" };
+  if (fromEnv) {
+    // The key can deploy code, so a guessable one hands over the server.
+    if (fromEnv.length < MIN_ADMIN_KEY && !opts.dev) {
+      throw new Error(
+        `$ONEBASE_ADMIN_KEY is ${fromEnv.length} characters, which is short enough to guess: it needs at least ${MIN_ADMIN_KEY}. ` +
+          `Make one with: openssl rand -base64 24  (or unset it, and onebase creates one in ${join(dataDir, "admin.key")}).`,
+      );
+    }
+    return { key: fromEnv, source: "$ONEBASE_ADMIN_KEY" };
+  }
   const path = join(dataDir, "admin.key");
   if (existsSync(path)) return { key: readFileSync(path, "utf8").trim(), source: path };
   mkdirSync(dataDir, { recursive: true });
@@ -51,6 +65,7 @@ export const ADMIN_SECURITY_HEADERS: Record<string, string> = {
     `script-src 'self' 'sha256-${new Bun.CryptoHasher("sha256").update(THEME_SCRIPT).digest("base64")}'`,
     "style-src 'self' 'unsafe-inline'",
     "img-src * data: blob:",
+    "media-src * blob:",
     "connect-src 'self'",
     "font-src 'self' data:",
     "base-uri 'none'",
@@ -86,8 +101,8 @@ export function createAdmin(opts: { runtime: Runtime; key: string; assets: Dashb
     const given = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
     return given.length > 0 && sameDigest(digest(given), keyDigest);
   };
-  const json = (body: unknown, status = 200) =>
-    new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
+  const json = (body: unknown, status = 200, headers: Record<string, string> = {}) =>
+    new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", "Cache-Control": "no-store", ...headers } });
 
   const tableCounts = () =>
     runtime.adminRead(async (_db, tx) => {
@@ -379,7 +394,9 @@ export function createAdmin(opts: { runtime: Runtime; key: string; assets: Dashb
     });
   };
 
-  const handle = async (req: Request, url: URL): Promise<Response> => {
+  const wrongKeys = new RateLimiter(WRONG_KEYS);
+
+  const handle = async (req: Request, url: URL, client: string): Promise<Response> => {
     const path = url.pathname;
     if (path === "/_admin" || path === "/_admin/") {
       return new Response(HTML(assetsVersion), { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
@@ -387,7 +404,12 @@ export function createAdmin(opts: { runtime: Runtime; key: string; assets: Dashb
     if (path === "/_admin/app.js") return new Response(opts.assets.js, { headers: { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "public, max-age=3600" } });
     if (path === "/_admin/app.css") return new Response(opts.assets.css, { headers: { "Content-Type": "text/css; charset=utf-8", "Cache-Control": "public, max-age=3600" } });
     if (!path.startsWith("/_admin/api/")) return new Response("Not found", { status: 404 });
-    if (!authorized(req)) return json({ error: "Invalid or missing admin key." }, 401);
+    if (!authorized(req)) {
+      const retryMs = wrongKeys.take(client);
+      if (!retryMs) return json({ error: "Invalid or missing admin key." }, 401);
+      const seconds = Math.ceil(retryMs / 1000);
+      return json({ error: `Too many wrong admin keys. Try again in ${seconds}s.` }, 429, { "Retry-After": String(seconds) });
+    }
 
     const name = path.slice("/_admin/api/".length);
     if (name === "events" && req.method === "GET") return events(req);
@@ -407,8 +429,8 @@ export function createAdmin(opts: { runtime: Runtime; key: string; assets: Dashb
     }
   };
 
-  return async (req: Request, url: URL): Promise<Response> => {
-    const res = await handle(req, url);
+  return async (req: Request, url: URL, client = "unknown"): Promise<Response> => {
+    const res = await handle(req, url, client);
     for (const [name, value] of Object.entries(ADMIN_SECURITY_HEADERS)) res.headers.set(name, value);
     return res;
   };

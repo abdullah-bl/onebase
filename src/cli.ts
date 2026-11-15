@@ -69,7 +69,8 @@ Options (each $NAME can also come from a .env file):
   --backup <s3url>  Back up SQLite to s3://bucket/prefix ($ONEBASE_BACKUP)
   --backup-every <d>  Backup interval, e.g. 15m, 1h, 1d (default: 1h, or $ONEBASE_BACKUP_EVERY)
   --backup-keep <n>   Snapshots to keep (default: 24, or $ONEBASE_BACKUP_KEEP)
-  --cors <origins>  Browser origins allowed to call the API, comma-separated (default: any; $ONEBASE_CORS)
+  --cors <origins>  Browser origins allowed to call the API, comma-separated (default: any, but sign-in only from
+                    your site and localhost; $ONEBASE_CORS)
   --rate-limit <r>  Per-IP limit on function calls, e.g. 100/10s or 600/m (default: off; $ONEBASE_RATE_LIMIT)
   --max-upload <s>  Largest upload (any request body), e.g. 1gb or 512mb (default: 1gb; $ONEBASE_MAX_UPLOAD)
   --trust-proxy     Take the client IP from X-Forwarded-For (when behind a reverse proxy; $ONEBASE_TRUST_PROXY=1)

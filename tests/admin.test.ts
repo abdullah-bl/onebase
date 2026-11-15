@@ -42,7 +42,7 @@ describe("dashboard admin API", () => {
   let app: Awaited<ReturnType<typeof startApp>>;
   let dataDir: string;
   let base: string;
-  const KEY = "test-admin-key";
+  const KEY = "test-admin-key-0123456789";
 
   const admin = async (name: string, body: unknown = {}, key = KEY) => {
     const res = await fetch(`${base}/_admin/api/${name}`, {

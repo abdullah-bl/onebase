@@ -6,7 +6,8 @@ import { envNumber } from "./driver";
 import type { CommitEvent, Runtime } from "./runtime";
 
 export type QueryUpdate = { ok: true; value: unknown } | { ok: false; error: string; data?: unknown };
-type Listener = (update: QueryUpdate) => void;
+/** `json` is a successful update's value as JSON, already made, so each connection needn't make it again. */
+type Listener = (update: QueryUpdate, json?: string) => void;
 
 const QUERY_CACHE_MB = 64;
 /** Rough memory for a cached entry's bookkeeping (measured as process RSS), and each read it files, on top of its key and result. */
@@ -195,7 +196,7 @@ export class SubscriptionManager {
       this.uncache(entry);
       entry.source = "subscription";
       if (!entry.last && entry.ok) entry.last = { ok: true, value: JSON.parse(entry.lastJson!) };
-      if (entry.last) listener(entry.last);
+      if (entry.last) listener(entry.last, entry.last.ok ? (entry.lastJson ?? undefined) : undefined);
     }
     if (entry.listeners.size === 0) this.subscribed++;
     entry.listeners.add(listener);
@@ -314,7 +315,7 @@ export class SubscriptionManager {
     if (json === entry.lastJson && update.ok === entry.last?.ok) return;
     entry.last = update;
     entry.lastJson = json;
-    for (const listener of entry.listeners) listener(update);
+    for (const listener of entry.listeners) listener(update, update.ok ? json : undefined);
   }
 
   private affected(entry: Entry, event: CommitEvent): boolean {

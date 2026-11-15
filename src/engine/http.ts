@@ -25,7 +25,7 @@ export type ServeOptions = {
    */
   trustProxy?: boolean | number;
   /** Handles /_admin requests (the dashboard). */
-  admin?: ((req: Request, url: URL) => Promise<Response> | Response) | null;
+  admin?: ((req: Request, url: URL, client: string) => Promise<Response> | Response) | null;
   /** How often open connections re-check their auth token, in ms (default 60s; 0 disables). */
   sessionRecheckMs?: number;
   /** Largest request body, in bytes: uploads and everything else (default DEFAULT_MAX_BODY_BYTES, 1 GB). */
@@ -192,6 +192,20 @@ type SocketData = {
   held: { updates: unknown[]; results: Map<number, unknown> };
 };
 
+/** Live queries one connection may hold. Each one costs memory and a re-run when its data changes. */
+const MAX_SUBS_PER_SOCKET = 1000;
+/** Sign-in attempts per client address, with or without --rate-limit. */
+const SIGN_IN_LIMIT: RateLimit = { max: 60, windowMs: 60_000 };
+
+/**
+ * An address on this machine or a private network. Seen as the client's address, it usually means
+ * a reverse proxy without --trust-proxy, where every visitor shares it and a limit would lock them all out.
+ */
+const localAddress = (ip: string) => {
+  const v4 = ip.replace(/^::ffff:/i, "");
+  return /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.)/.test(v4) || /^(::1$|f[cd][0-9a-f]{2}:|fe[89ab][0-9a-f]:)/i.test(ip) || ip === "unknown";
+};
+
 const CORS_BASE = {
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization",
@@ -203,6 +217,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
   const sockets = new Set<ServerWebSocket<SocketData>>();
   const origins = opts.cors?.length && !opts.cors.includes("*") ? new Set(opts.cors.map((o) => o.replace(/\/$/, ""))) : null;
   const limiter = opts.rateLimit ? new RateLimiter(opts.rateLimit) : null;
+  const signInLimiter = new RateLimiter(SIGN_IN_LIMIT);
   const maxBody = opts.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
 
   const originAllowed = (req: Request) => {
@@ -215,6 +230,36 @@ export function serve(opts: ServeOptions): Server<SocketData> {
     if (!origins) return { "Access-Control-Allow-Origin": "*", ...CORS_BASE };
     const origin = req.headers.get("Origin");
     return origin && origins.has(origin) ? { "Access-Control-Allow-Origin": origin, Vary: "Origin", ...CORS_BASE } : { Vary: "Origin" };
+  };
+
+  // Sign-in answers carry a session token, so "any origin" isn't the default there. Without --cors,
+  // only the site itself and pages on this machine may read them; `--cors "*"` opens them up again.
+  const anyOrigin = Boolean(opts.cors?.includes("*"));
+  const refusedOrigins = new Set<string>();
+  const signInOrigin = (origin: string) => {
+    try {
+      const url = new URL(origin);
+      if (["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) return true;
+      return url.origin === new URL(runtime.siteUrl).origin;
+    } catch {
+      return false;
+    }
+  };
+  /** CORS headers for /api/auth/*. */
+  const authCors = (req: Request): Record<string, string> => {
+    if (origins || anyOrigin) return cors(req);
+    const origin = req.headers.get("Origin");
+    if (!origin) return { Vary: "Origin" };
+    if (signInOrigin(origin)) return { "Access-Control-Allow-Origin": origin, Vary: "Origin", ...CORS_BASE };
+    if (refusedOrigins.size < 100 && !refusedOrigins.has(origin)) {
+      refusedOrigins.add(origin);
+      runtime.log.warn(`A page on ${origin} called ${new URL(req.url).pathname}, and browsers will block the answer. If that's your frontend, start the server with --cors ${origin}`);
+    }
+    return { Vary: "Origin" };
+  };
+  const withHeaders = (res: Response, headers: Record<string, string>) => {
+    for (const [k, v] of Object.entries(headers)) res.headers.set(k, v);
+    return res;
   };
 
   const jsonText = (req: Request, text: string, status = 200, headers: Record<string, string> = {}) =>
@@ -265,6 +310,12 @@ export function serve(opts: ServeOptions): Server<SocketData> {
     else send(ws, msg);
   };
 
+  /** A live query's new result. A query many clients watch is turned into JSON once, not once per client. */
+  const pushQueryUpdate = (ws: ServerWebSocket<SocketData>, id: number, update: object, json?: string) => {
+    if (json === undefined || ws.data.committed.size) return pushUpdate(ws, { type: "update", id, ...update });
+    if (ws.readyState === 1) ws.send(`{"type":"update","id":${JSON.stringify(id ?? null)},"ok":true,"value":${json}}`);
+  };
+
   const reply = (ws: ServerWebSocket<SocketData>, msg: { requestId: number }) => {
     const d = ws.data;
     if (!d.committed.has(msg.requestId)) return send(ws, msg);
@@ -277,6 +328,9 @@ export function serve(opts: ServeOptions): Server<SocketData> {
 
   const subscribe = (ws: ServerWebSocket<SocketData>, id: number, path: string, args: unknown, counted = true) => {
     ws.data.subs.get(id)?.unsubscribe();
+    if (!ws.data.subs.has(id) && ws.data.subs.size >= MAX_SUBS_PER_SOCKET) {
+      return pushUpdate(ws, { type: "update", id, ok: false, error: `Too many live queries on one connection (limit: ${MAX_SUBS_PER_SOCKET}). Unsubscribe from some first.` });
+    }
     const limit = counted ? limited(ws.data.ip) : null;
     if (limit) {
       // Try again once a token is free, so the query starts on its own (the client keeps showing
@@ -290,7 +344,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
     }
     try {
       const { name } = runtime.resolve(path, "query", false);
-      const unsubscribe = subscriptions.subscribe(name, args, ws.data.identity, (update) => pushUpdate(ws, { type: "update", id, ...update }));
+      const unsubscribe = subscriptions.subscribe(name, args, ws.data.identity, (update, json) => pushQueryUpdate(ws, id, update, json));
       ws.data.subs.set(id, { path, args, unsubscribe });
     } catch (err) {
       const e = runtime.toClientError(err);
@@ -370,6 +424,10 @@ export function serve(opts: ServeOptions): Server<SocketData> {
 
   const handleMessage = async (ws: ServerWebSocket<SocketData>, msg: ClientMessage) => {
     if (msg.type === "auth") {
+      // Each one re-runs every query on the connection, so with a rate limit set it counts like a call.
+      // Signing out (no token) always goes through: a refused one would leave the connection signed in.
+      const limit = msg.token ? limited(ws.data.ip) : null;
+      if (limit) return send(ws, { type: "auth", ok: false, ended: false, error: limit.message });
       ws.data.token = msg.token ?? null;
       ws.data.ready = (async () => {
         try {
@@ -480,12 +538,21 @@ export function serve(opts: ServeOptions): Server<SocketData> {
         if (res) return res;
       }
       if (path.startsWith("/api/")) {
-        if (req.method === "OPTIONS") return new Response(null, { headers: cors(req) });
+        if (req.method === "OPTIONS") return new Response(null, { headers: path.startsWith("/api/auth/") ? authCors(req) : cors(req) });
         const kind = path.slice(5);
         const counted = req.method === "POST" && ["query", "mutation", "action", "run", "storage/upload", "auth/signin", "auth/device/start", "auth/device/approve"].includes(kind);
         const limit = counted ? limited(clientIp(req, server)) : null;
         if (limit) {
           return json(req, { status: "error", errorMessage: limit.message }, 429, { "Retry-After": String(Math.ceil(limit.retryMs / 1000)) });
+        }
+        if (req.method === "POST" && ["auth/signin", "auth/device/start", "auth/device/approve"].includes(kind)) {
+          const ip = clientIp(req, server);
+          const retryMs = localAddress(ip) ? 0 : signInLimiter.take(ip);
+          if (retryMs) {
+            const seconds = Math.ceil(retryMs / 1000);
+            const message = `Too many sign-in attempts from this network. Try again in ${seconds}s.`;
+            return withHeaders(json(req, { status: "error", error: message, errorMessage: message }, 429, { "Retry-After": String(seconds) }), authCors(req));
+          }
         }
         if (path === "/api/storage/upload" && req.method === "POST") {
           try {
@@ -503,9 +570,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
           return res;
         }
         if (path.startsWith("/api/auth/device/")) {
-          const res = (await runtime.device.handle(req, url))!;
-          for (const [k, v] of Object.entries(cors(req))) res.headers.set(k, v);
-          return res;
+          return withHeaders((await runtime.device.handle(req, url))!, authCors(req));
         }
         if (path.startsWith("/api/auth/")) {
           const res = runtime.auth ? await runtime.auth.handle(req, url, origins, clientIp(req, server)) : null;
@@ -513,17 +578,26 @@ export function serve(opts: ServeOptions): Server<SocketData> {
             const hint = runtime.auth ? "" : " Built-in auth is off: add methods: [password(), ...] to auth.config.ts.";
             return json(req, { error: `Unknown endpoint ${req.method} ${path}.${hint}` }, 404);
           }
-          if (res.status < 300 || res.status >= 400) for (const [k, v] of Object.entries(cors(req))) res.headers.set(k, v);
-          return res;
+          return res.status < 300 || res.status >= 400 ? withHeaders(res, authCors(req)) : res;
         }
-        if (path === "/api/health") return json(req, { ok: true, functions: runtime.functions.size, subscriptions: subscriptions.size, deployment: runtime.deployment?.id ?? null });
+        if (path === "/api/health") {
+          const info = { functions: runtime.functions.size, subscriptions: subscriptions.size, deployment: runtime.deployment?.id ?? null };
+          // 503 while shutting down, so a load balancer stops sending requests here.
+          if (runtime.shuttingDown) return json(req, { ok: false, error: "Shutting down.", ...info }, 503);
+          try {
+            await runtime.withReader((tx) => tx.get("SELECT 1 AS ok"));
+          } catch (err) {
+            return json(req, { ok: false, error: `The database isn't answering: ${err instanceof Error ? err.message : String(err)}`, ...info }, 503);
+          }
+          return json(req, { ok: true, ...info });
+        }
         if (req.method === "POST" && ["query", "mutation", "action", "run"].includes(kind)) return handleHttpApi(req, kind);
         return json(req, { status: "error", errorMessage: `Unknown endpoint ${req.method} ${path}` }, 404);
       }
       if (path === "/_onebase/client.js" && opts.clientBundle) {
         return new Response(opts.clientBundle, { headers: { "Content-Type": "text/javascript; charset=utf-8", ...cors(req) } });
       }
-      if (opts.admin && (path === "/_admin" || path.startsWith("/_admin/"))) return opts.admin(req, url);
+      if (opts.admin && (path === "/_admin" || path.startsWith("/_admin/"))) return opts.admin(req, url, clientIp(req, server));
 
       const route = runtime.lookupHttp(req.method, path);
       if (route) {

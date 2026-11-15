@@ -186,7 +186,7 @@ Don't let your own mutations change `email` or `emailVerificationTime`. An OAuth
 
 1. Register an OAuth app with the provider. Its callback URL is `<your public URL>/api/auth/callback/<method>`, e.g. `https://api.example.com/api/auth/callback/github`.
 2. Start the server with that public URL: `--url https://api.example.com` (or `$ONEBASE_URL`).
-3. If your frontend runs on another origin, allow it as a place to return to: list it in `--cors` or in `redirects`:
+3. If your frontend runs on another origin, start the server with `--cors <that origin>`. Browsers only let the origins listed there (plus your own site and `localhost`) read a sign-in answer. It also makes the origin a place sign-in can return to, which `redirects` can do too:
 
 ```ts
 export default {
@@ -347,7 +347,7 @@ await client.device.approve({ code, approve: true });
 
 ### Sessions and security
 
-- **Sessions** last 30 days from their last use (`sessionDays` in `auth.config.ts`). Signing out ends the session at once, including for open WebSocket connections on every server instance. Open connections also re-check their identity about once a minute, so a session that expires (or whose user is deleted) signs its connection out without waiting for a reconnect. `POST /api/auth/signout` with `{ "everywhere": true }` ends all of a user's sessions.
+- **Sessions** last 30 days from their last use (`sessionDays` in `auth.config.ts`). Signing out ends the session at once, including for open WebSocket connections on every server instance. Open connections also re-check their identity about once a minute, so a session that expires (or whose user is deleted) signs its connection out without waiting for a reconnect. `POST /api/auth/signout` with `{ "everywhere": true }` ends all of a user's sessions, and their [MCP connections and API keys](./mcp.md#connected-agents-and-api-keys). So does a password reset.
 - **Passwords** are hashed with argon2id and must be at least 8 characters (`password({ minLength })`). After 10 failed attempts for an email from one network in an hour, sign-in for that email is blocked from that network for the rest of the hour; after 100 from all networks together, it's blocked everywhere until the hour is up or the password is reset. `--rate-limit` also applies to sign-in requests.
 - **Tokens and codes** are stored only as SHA-256 hashes. OAuth uses PKCE, and the one-time code the provider's redirect brings back only works with a verifier kept by the browser that started the sign-in.
 - **Stored separately:** password hashes, OAuth links, sessions and email codes are in system tables that functions and the dashboard can't read.

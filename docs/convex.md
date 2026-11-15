@@ -14,6 +14,7 @@ onebase uses Convex's programming model and most of its API. If you know Convex,
 - `ctx.db.get / query / insert / patch / replace / delete / normalizeId`, `withIndex`, `filter`, `order`, `paginate`, `paginationOptsValidator`, including the table-first forms `ctx.db.get("messages", id)` and `ctx.db.patch("messages", id, value)`
 - `ctx.scheduler.runAfter / runAt / cancel`, `cronJobs()`
 - `ctx.storage.generateUploadUrl / getUrl / delete / store / get`, `v.id("_storage")`
+  - onebase adds `generateUploadUrl({ direct: true })` and `confirmUpload(id)` for uploads straight to an S3 bucket; direct uploads have `sha256: null`.
 - `ctx.auth.getUserIdentity()` and the `auth.config.ts` provider format
 - Built-in sign-in shaped like Convex Auth: `authTables`, `getAuthUserId`, `signIn("password" | "github" | …)`, `signOut()`, `useAuthActions()`, `<Authenticated>` (configured in `auth.config.ts` instead of a separate package)
 - `httpRouter` / `httpAction`

@@ -117,7 +117,7 @@ export function serveActions(embedded?: () => ProjectCode | Promise<ProjectCode>
         }
       : {
           auth: { getUserIdentity: async () => identity },
-          storage: Object.fromEntries(["getUrl", "getMetadata", "generateUploadUrl", "delete", "store", "get"].map((k) => [k, call("storage", k)])),
+          storage: Object.fromEntries(["getUrl", "getMetadata", "generateUploadUrl", "confirmUpload", "delete", "store", "get"].map((k) => [k, call("storage", k)])),
           scheduler,
           runQuery,
           runMutation,

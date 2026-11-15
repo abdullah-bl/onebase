@@ -6,6 +6,13 @@ on:
     branches: [main]
     paths: ["site/**", "docs/**", "package.json", ".github/workflows/pages.yml"]
   workflow_dispatch:
+  # Component pages come from github.com/abdullah-bl/onebase-components, so rebuild daily to
+  # pick up its changes. That repository can also trigger a rebuild right away with a
+  # repository_dispatch event of type "components-updated".
+  schedule:
+    - cron: "17 4 * * *"
+  repository_dispatch:
+    types: [components-updated]
 
 permissions:
   contents: read
@@ -21,6 +28,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Check out the component packages, whose docs the site includes
+        uses: actions/checkout@v4
+        with:
+          repository: abdullah-bl/onebase-components
+          path: site/.components
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4

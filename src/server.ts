@@ -154,7 +154,43 @@ export interface DatabaseWriter<DM> extends DatabaseReader<DM> {
 // ---- File storage ----
 
 export type StorageId = GenericId<"_storage">;
-export type FileMetadata = { _id: StorageId; _creationTime: number; sha256: string; size: number; contentType: string | null };
+/**
+ * `sha256` is the file's SHA-256 (base64). It's null for a file uploaded straight to an S3 bucket
+ * (`generateUploadUrl({ direct: true })`), whose bytes the server never sees.
+ */
+export type FileMetadata = { _id: StorageId; _creationTime: number; sha256: string | null; size: number; contentType: string | null };
+
+export type DirectUploadOptions = {
+  direct: true;
+  /** The type the client will send. Returned in `headers`; enforce it with confirmUpload({ contentTypes }). */
+  contentType?: string;
+  /** Seconds the URL works for (default 900, at most 604800). */
+  expiresIn?: number;
+};
+
+/**
+ * Where the client sends a file's bytes: `fetch(url, { method, headers, body: file })`, then a
+ * mutation calls `ctx.storage.confirmUpload(storageId)`. The same client code works on any backend.
+ */
+export type DirectUploadUrl = {
+  storageId: StorageId;
+  url: string;
+  /** "PUT": a presigned URL straight into the S3 bucket. "POST": this server's upload endpoint (local-disk storage). */
+  method: "PUT" | "POST";
+  /** Send these with the request. */
+  headers: Record<string, string>;
+  /** When the URL stops working, in ms since the epoch. */
+  expiresAt: number;
+  /** Whether the bytes bypass the server. */
+  direct: boolean;
+};
+
+export type ConfirmUploadOptions = {
+  /** Largest size accepted, in bytes (default: the server's --max-upload, 1 GB unless set). */
+  maxBytes?: number;
+  /** Types accepted: exact ("image/png") or a family ("image/*"). Default: any. */
+  contentTypes?: string[];
+};
 
 export interface StorageReader {
   /** A URL that serves the file, or null if it doesn't exist. */
@@ -165,6 +201,18 @@ export interface StorageReader {
 export interface StorageWriter extends StorageReader {
   /** A one-time URL (valid 1 hour). The client POSTs the file to it and gets back `{ storageId }`. */
   generateUploadUrl(): Promise<string>;
+  /**
+   * Reserves a storage id and returns where the client sends the bytes: a presigned PUT straight
+   * to the bucket with S3 storage, this server's upload endpoint with local disk. The file exists
+   * once `confirmUpload(storageId)` accepts it; an unconfirmed upload is deleted after it expires.
+   */
+  generateUploadUrl(opts: DirectUploadOptions): Promise<DirectUploadUrl>;
+  /**
+   * Checks what was uploaded for a `generateUploadUrl({ direct: true })` id and makes it a file.
+   * Throws (deleting the upload) when it's too large or of a type not allowed; throws, keeping the
+   * reservation, when nothing has arrived yet. Returns the metadata of a file already confirmed.
+   */
+  confirmUpload(id: StorageId | string, opts?: ConfirmUploadOptions): Promise<FileMetadata>;
   delete(id: StorageId | string): Promise<void>;
 }
 

@@ -86,7 +86,7 @@ presence: presence({ auth: true, expose: ["heartbeat", "list"] }),
 
 Clients then call `api.components.presence.heartbeat` like any of your functions: `useQuery(api.components.presence.list, { room })`. `_generated/api.ts` has `api.components` for exposed functions only, and `internal.components` for all of a component's public functions, which you can schedule or run from crons. Nested functions are exposed by their dotted path: `expose: ["lib.list"]`.
 
-Expose only what's safe for anyone to call with any arguments. A rate limiter's `reset`, for one, isn't.
+Expose only what's safe for anyone to call with any arguments. A rate limiter's `reset`, for one, isn't. A component that records who did something must take that from the caller's identity, not from an argument: presence's `heartbeat`, mounted with `auth: true` as above, uses the signed-in user and refuses anyone else's id. Without `auth: true`, wrap such functions in your own and pass the user from `getAuthUserId(ctx)`.
 
 ## Function handles
 
@@ -147,6 +147,19 @@ Renaming a mount is like removing one and adding another: the new name starts wi
 | [Agent](./agent.md) | `onebase/components/agent` | AI agents with threads, tool calling, usage and streams, over any provider |
 | [Presence](./presence.md) | `onebase/components/presence` | Who's online per room, with heartbeats and live lists |
 | [Action cache](./action-cache.md) | `onebase/components/action-cache` | A TTL cache for expensive actions, with deduped concurrent runs |
+
+## Optional component packages
+
+These live in their own repository, [onebase-components](https://github.com/abdullah-bl/onebase-components), as separate packages: install only the ones your app uses.
+
+| Package | |
+|---|---|
+| [`@onebase/teams`](https://github.com/abdullah-bl/onebase-components/tree/main/packages/teams) | Teams with opt-in roles (`owner`, `admin`, `member` by default) |
+| [`@onebase/app-store`](https://github.com/abdullah-bl/onebase-components/tree/main/packages/app-store) | Apple App Store billing: signed notifications, StoreKit 2 transaction sync, subscription state |
+| [`@onebase/entitlements`](https://github.com/abdullah-bl/onebase-components/tree/main/packages/entitlements) | Plans, limits and usage per user or team, which App Store events can drive |
+| [`@onebase/push`](https://github.com/abdullah-bl/onebase-components/tree/main/packages/push) | Push notifications over APNs and FCM, with a device registry and dead-token cleanup |
+| [`@onebase/email`](https://github.com/abdullah-bl/onebase-components/tree/main/packages/email) | Email over Resend, Postmark or SMTP, and a ready `sendCode` for [password auth](./auth.md) |
+| [`@onebase/notifications`](https://github.com/abdullah-bl/onebase-components/tree/main/packages/notifications) | An in-app notification feed with live queries and an optional email channel |
 
 To write your own, see [Writing components](./components-authoring.md).
 

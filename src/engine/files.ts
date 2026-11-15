@@ -6,7 +6,11 @@ import { OnebaseError } from "./database";
 import { newId } from "./dialect";
 import type { Exec } from "./driver";
 
-export type FileMetadata = { _id: string; _creationTime: number; sha256: string; size: number; contentType: string | null };
+/** `sha256` is null for a file uploaded straight to the bucket (`generateUploadUrl({ direct: true })`): the server never saw its bytes. */
+export type FileMetadata = { _id: string; _creationTime: number; sha256: string | null; size: number; contentType: string | null };
+
+/** What the backend knows about stored bytes. */
+export type BlobStat = { size: number; contentType: string | null };
 
 export interface BlobBackend {
   readonly description: string;
@@ -15,6 +19,26 @@ export interface BlobBackend {
   get(id: string): Blob;
   /** Response for GET /api/storage/<id>. */
   serve(id: string, meta: FileMetadata): Response;
+  remove(id: string): Promise<void>;
+  /** Size and type of the stored bytes, or null when there are none. */
+  stat(id: string): Promise<BlobStat | null>;
+  /** Uploads straight into storage. Absent when the backend can't take them (local disk). */
+  direct?: DirectUploads;
+}
+
+/**
+ * Direct uploads go to a staging object, never to the file's own key: a presigned URL can't be
+ * revoked, so a URL for the file itself would let the client replace (or re-create) the file after
+ * confirmUpload() checked it. Confirming copies the staged bytes to the file's key.
+ */
+export interface DirectUploads {
+  /** A URL the client can PUT the bytes to (the staging object), valid for `expiresIn` seconds. */
+  presign(id: string, expiresIn: number): string;
+  /** Size and type of the staged bytes, or null when there are none. */
+  stat(id: string): Promise<BlobStat | null>;
+  /** Copies the staged bytes to the file's own key, stored with `contentType`. Throws when nothing is staged. */
+  promote(id: string, contentType: string | null): Promise<void>;
+  /** Deletes the staged bytes (nothing there is fine). */
   remove(id: string): Promise<void>;
 }
 
@@ -34,10 +58,25 @@ function singleType(contentType: string | null): string | null {
   return /^[\w!#$&^.+-]+\/[\w!#$&^.+-]+$/.test(type) ? type : null;
 }
 
+/** Whether a browser may show this type inline (see INLINE_TYPE). */
+function isInline(contentType: string | null): boolean {
+  const type = singleType(contentType);
+  return type !== null && INLINE_TYPE.test(type);
+}
+
+/** Whether `contentType` matches one of `allowed`: exact types ("image/png") or a family ("image/*"). */
+export function typeAllowed(contentType: string | null, allowed: readonly string[]): boolean {
+  const type = singleType(contentType);
+  if (!type) return false;
+  return allowed.some((a) => {
+    const want = a.trim().toLowerCase();
+    return want === "*/*" || want === type || (want.endsWith("/*") && type.startsWith(want.slice(0, -1)));
+  });
+}
+
 /** Headers that keep an uploaded file from being treated as a page on this origin. */
 function fileSafetyHeaders(contentType: string | null): Record<string, string> {
-  const type = singleType(contentType);
-  const inline = type !== null && INLINE_TYPE.test(type);
+  const inline = isInline(contentType);
   return {
     "X-Content-Type-Options": "nosniff",
     ...(inline ? {} : { "Content-Disposition": "attachment", "Content-Security-Policy": "sandbox; default-src 'none'" }),
@@ -71,13 +110,18 @@ export class LocalBlobs implements BlobBackend {
       headers: {
         "Content-Type": singleType(meta.contentType) ? meta.contentType! : "application/octet-stream",
         "Cache-Control": "public, max-age=31536000, immutable",
-        ETag: `"${meta.sha256}"`,
+        ...(meta.sha256 ? { ETag: `"${meta.sha256}"` } : {}),
         ...fileSafetyHeaders(meta.contentType),
       },
     });
   }
   async remove(id: string) {
     rmSync(this.path(id), { force: true });
+  }
+  async stat(id: string) {
+    const file = Bun.file(this.path(id));
+    // A local file has no type of its own: the upload records it.
+    return (await file.exists()) ? { size: file.size, contentType: null } : null;
   }
 }
 
@@ -106,7 +150,11 @@ export function parseS3Url(url: string): S3Location {
   return { client, bucket, prefix, description: `s3://${bucket}/${prefix}` };
 }
 
-/** Files in S3 / R2 / MinIO. Downloads redirect to short-lived presigned URLs, so bytes don't pass through the server. */
+/**
+ * Files in any S3-compatible store (AWS S3, R2, MinIO, B2, Spaces, Wasabi…). Downloads redirect to
+ * short-lived presigned URLs, and direct uploads PUT to presigned URLs, so bytes don't pass through
+ * the server. Only plain S3 calls are used: PUT, GET, HEAD and DELETE of single objects.
+ */
 export class S3Blobs implements BlobBackend {
   constructor(private readonly loc: S3Location) {}
   get description() {
@@ -121,16 +169,71 @@ export class S3Blobs implements BlobBackend {
   get(id: string) {
     return this.loc.client.file(this.key(id));
   }
-  serve(id: string) {
-    const url = this.loc.client.presign(this.key(id), { expiresIn: 3600 });
+  serve(id: string, meta: FileMetadata) {
+    // The type and disposition the bucket answers with are pinned here (response-content-type /
+    // response-content-disposition, plain S3 GET parameters), not taken from the stored object:
+    // a client that uploaded directly chose the object's own Content-Type.
+    const url = this.loc.client.presign(this.key(id), {
+      expiresIn: 3600,
+      type: singleType(meta.contentType) ? meta.contentType! : "application/octet-stream",
+      ...(isInline(meta.contentType) ? {} : { contentDisposition: "attachment" }),
+    });
     return new Response(null, { status: 302, headers: { Location: url, "Cache-Control": "private, max-age=3000" } });
   }
   async remove(id: string) {
     await this.loc.client.delete(this.key(id));
   }
+  stat(id: string) {
+    return this.statKey(this.key(id));
+  }
+  private async statKey(key: string): Promise<BlobStat | null> {
+    try {
+      const stat = await this.loc.client.file(key).stat();
+      return { size: stat.size, contentType: stat.type || null };
+    } catch (err) {
+      if ((err as { code?: string })?.code === "NoSuchKey" || (err as { code?: string })?.code === "NotFound") return null;
+      throw err;
+    }
+  }
+  /** Where direct uploads land until confirmUpload() copies them to the file's key. Ids have no "/", so this never names a file. */
+  private stagingKey(id: string) {
+    return `${this.loc.prefix}uploads/${checkId(id)}`;
+  }
+  readonly direct: DirectUploads = {
+    // Content-Type isn't part of the signature (Bun signs only the host), so any type is accepted
+    // here and checked by confirmUpload; serve() pins the type downloads are answered with.
+    presign: (id, expiresIn) => this.loc.client.presign(this.stagingKey(id), { method: "PUT", expiresIn }),
+    stat: (id) => this.statKey(this.stagingKey(id)),
+    promote: async (id, contentType) => {
+      const staged = this.loc.client.file(this.stagingKey(id));
+      await this.loc.client.write(this.key(id), staged, contentType ? { type: contentType } : undefined);
+    },
+    remove: async (id) => {
+      await this.loc.client.delete(this.stagingKey(id));
+    },
+  };
 }
 
 const UPLOAD_URL_TTL_MS = 60 * 60_000;
+
+/** Direct-upload URLs last 15 minutes unless asked otherwise, and at most 7 days (S3's limit for presigned URLs). */
+export const DIRECT_UPLOAD_DEFAULT_SECONDS = 15 * 60;
+export const DIRECT_UPLOAD_MAX_SECONDS = 7 * 24 * 3600;
+/**
+ * After a reservation expires, an upload started just before then still has this long to finish
+ * and be confirmed; the sweep removes what's left only after twice as long, so it never races a confirm.
+ */
+export const RESERVATION_GRACE_MS = 60 * 60_000;
+
+export type Reservation = { id: string; token: string; expires: number; size: number | null; contentType: string | null; sha256: string | null };
+
+/** size while a POST to a local reservation is still streaming. */
+const UPLOADING = -1;
+/**
+ * size once confirmed, on a backend with staged direct uploads. The row stays until the URL (and
+ * grace period) is past, so the sweep can delete anything PUT to the staging object after the confirm.
+ */
+export const CONFIRMED = -2;
 
 export class FileStore {
   constructor(
@@ -151,8 +254,7 @@ export class FileStore {
   }
 
   /** Streams the body to the backend, hashing it on the way (never buffers the whole file). */
-  async write(body: ReadableStream<Uint8Array>, contentType: string | null): Promise<FileMetadata> {
-    const id = newId("_storage");
+  async write(body: ReadableStream<Uint8Array>, contentType: string | null, id: string = newId("_storage")): Promise<FileMetadata> {
     const hasher = new Bun.CryptoHasher("sha256");
     let size = 0;
     const counted = body.pipeThrough(
@@ -164,7 +266,13 @@ export class FileStore {
         },
       }),
     );
-    await this.backend.put(id, counted, contentType || null);
+    try {
+      await this.backend.put(id, counted, contentType || null);
+    } catch (err) {
+      // Say, the upload went over the size limit or the client went away: drop what was written.
+      await this.backend.remove(id).catch(() => {});
+      throw err;
+    }
     return { _id: id, _creationTime: this.nextCreationTime(), sha256: hasher.digest("base64"), size, contentType: contentType || null };
   }
 
@@ -172,7 +280,7 @@ export class FileStore {
     await tx.run("INSERT INTO _storage (id, ct, sha256, size, content_type) VALUES (?, ?, ?, ?, ?)", [
       meta._id,
       meta._creationTime,
-      meta.sha256,
+      meta.sha256 ?? "",
       meta.size,
       meta.contentType,
     ]);
@@ -181,9 +289,85 @@ export class FileStore {
   async metadata(tx: Exec, id: unknown): Promise<FileMetadata | null> {
     if (typeof id !== "string") throw new OnebaseError(`Expected a storage id (string), got ${typeof id}.`);
     const row = await tx.get("SELECT id, ct, sha256, size, content_type FROM _storage WHERE id = ?", [id]);
+    // The column is NOT NULL (older onebases read it); a file with no known hash stores "".
     return row
-      ? { _id: row.id, _creationTime: Number(row.ct), sha256: row.sha256, size: Number(row.size), contentType: row.content_type }
+      ? { _id: row.id, _creationTime: Number(row.ct), sha256: row.sha256 || null, size: Number(row.size), contentType: row.content_type }
       : null;
+  }
+
+  // ---- Direct uploads: reserve an id, the client sends the bytes, confirmUpload() makes it a file ----
+
+  async reserve(tx: Exec, expiresInSeconds: number): Promise<Reservation> {
+    const r: Reservation = { id: newId("_storage"), token: newId() + newId(), expires: Date.now() + expiresInSeconds * 1000, size: null, contentType: null, sha256: null };
+    await tx.run("INSERT INTO _upload_reservations (id, token, expires) VALUES (?, ?, ?)", [r.id, r.token, r.expires]);
+    return r;
+  }
+
+  async reservation(tx: Exec, id: string): Promise<Reservation | null> {
+    const row = await tx.get("SELECT id, token, expires, size, content_type, sha256 FROM _upload_reservations WHERE id = ?", [id]);
+    if (!row) return null;
+    return {
+      id: row.id,
+      token: row.token,
+      expires: Number(row.expires),
+      size: row.size === null || row.size === undefined ? null : Number(row.size),
+      contentType: row.content_type ?? null,
+      sha256: row.sha256 ?? null,
+    };
+  }
+
+  async dropReservation(tx: Exec, id: string) {
+    await tx.run("DELETE FROM _upload_reservations WHERE id = ?", [id]);
+  }
+
+  /** Keeps a confirmed reservation until its URL is long expired, so the sweep clears its staging object. */
+  async markConfirmed(tx: Exec, id: string) {
+    await tx.run("UPDATE _upload_reservations SET size = ? WHERE id = ?", [CONFIRMED, id]);
+  }
+
+  /**
+   * The upload endpoint's half of a reservation on a backend without presigned PUTs: claims it
+   * (one upload at a time, before it expires), streams and hashes the bytes, and records what came.
+   * Like a presigned PUT, the URL may be used again (replacing the bytes) until confirmUpload().
+   */
+  async writeReserved(
+    writer: <T>(fn: (tx: Exec) => Promise<T>) => Promise<T>,
+    id: string,
+    token: string,
+    body: ReadableStream<Uint8Array>,
+    contentType: string | null,
+  ): Promise<void> {
+    checkId(id);
+    const claimed = await writer(async (tx) => {
+      const { changes } = await tx.run("UPDATE _upload_reservations SET size = ? WHERE id = ? AND token = ? AND (size IS NULL OR size >= 0) AND expires > ?", [
+        UPLOADING,
+        id,
+        token,
+        Date.now(),
+      ]);
+      return changes === 1;
+    });
+    if (!claimed) throw new OnebaseError("Upload URL is invalid or expired, its file was already confirmed, or another upload to it is in progress. Get a fresh one from ctx.storage.generateUploadUrl({ direct: true }).");
+    let meta: FileMetadata;
+    try {
+      meta = await this.write(body, contentType, id);
+    } catch (err) {
+      await writer((tx) => tx.run("UPDATE _upload_reservations SET size = NULL WHERE id = ?", [id])).catch(() => {});
+      throw err;
+    }
+    await writer((tx) =>
+      tx.run("UPDATE _upload_reservations SET size = ?, content_type = ?, sha256 = ? WHERE id = ?", [meta.size, meta.contentType, meta.sha256, id]),
+    );
+  }
+
+  /** Reservations whose time (plus twice the grace period) is up: their uploaded bytes can go. */
+  async expiredReservations(tx: Exec, now = Date.now(), limit = 500): Promise<{ id: string; confirmed: boolean }[]> {
+    const rows = await tx.all(`SELECT id, size FROM _upload_reservations WHERE expires < ? ORDER BY expires LIMIT ${limit}`, [now - 2 * RESERVATION_GRACE_MS]);
+    return rows.map((r) => ({ id: r.id as string, confirmed: Number(r.size) === CONFIRMED }));
+  }
+
+  async dropExpiredReservations(tx: Exec, ids: string[], now = Date.now()) {
+    for (const id of ids) await tx.run("DELETE FROM _upload_reservations WHERE id = ? AND expires < ?", [id, now - 2 * RESERVATION_GRACE_MS]);
   }
 
   /** Removes the metadata row; the caller deletes the bytes once the transaction commits. */

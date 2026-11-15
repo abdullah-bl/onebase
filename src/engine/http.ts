@@ -19,8 +19,11 @@ export type ServeOptions = {
   cors?: string[] | null;
   /** Per-IP limit on function calls, subscriptions and uploads. */
   rateLimit?: RateLimit | null;
-  /** Take the client IP from X-Forwarded-For (behind a reverse proxy). */
-  trustProxy?: boolean;
+  /**
+   * Take the client IP from X-Forwarded-For (behind a reverse proxy). `true` or a number: how many
+   * proxies in front of the server append to X-Forwarded-For (default 1). See forwardedClient.
+   */
+  trustProxy?: boolean | number;
   /** Handles /_admin requests (the dashboard). */
   admin?: ((req: Request, url: URL, client: string) => Promise<Response> | Response) | null;
   /**
@@ -30,7 +33,103 @@ export type ServeOptions = {
   adminHost?: string;
   /** How often open connections re-check their auth token, in ms (default 60s; 0 disables). */
   sessionRecheckMs?: number;
+  /** Largest request body, in bytes: uploads and everything else (default DEFAULT_MAX_BODY_BYTES, 1 GB). */
+  maxBodyBytes?: number;
 };
+
+/**
+ * The client address from an X-Forwarded-For value, given how many proxies in front of the server
+ * append to it (`hops`). Proxies append the address they got the request from, so the entries a
+ * client sent itself come first: the client is the `hops`-th entry from the right, never the
+ * leftmost (which is whatever the client wrote). A header with fewer entries than hops gives the
+ * leftmost one, as a proxy that overwrites the header leaves a single entry.
+ */
+export function forwardedClient(header: string | null | undefined, hops = 1): string | null {
+  const entries = (header ?? "").split(",").map((e) => e.trim()).filter(Boolean);
+  if (!entries.length) return null;
+  return entries[Math.max(0, entries.length - Math.max(1, hops))]!;
+}
+
+/**
+ * The key a client's address is counted under. An IPv6 user usually controls a whole /64 (and can
+ * pick any address in it), so IPv6 addresses count per /64; IPv4-mapped IPv6 addresses count as the
+ * IPv4 address. Anything that doesn't parse as IPv6 (IPv4, "unknown") is used as is.
+ */
+export function networkKey(address: string): string {
+  let ip = address.trim().toLowerCase();
+  if (ip.startsWith("[")) ip = ip.slice(1, ip.indexOf("]") > 0 ? ip.indexOf("]") : undefined);
+  ip = ip.replace(/%.*$/, ""); // zone id
+  if (!ip.includes(":")) return address.trim();
+  const mapped = /^(?:0*:)*:?ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(ip) ?? /^::(\d+\.\d+\.\d+\.\d+)$/.exec(ip);
+  if (mapped) return mapped[1]!;
+  const halves = ip.split("::");
+  if (halves.length > 2) return address.trim();
+  const head = halves[0] ? halves[0].split(":") : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  // An embedded IPv4 tail takes two groups.
+  if (tail.length && tail[tail.length - 1]!.includes(".")) tail.splice(tail.length - 1, 1, "0", "0");
+  if (head.length && head[head.length - 1]!.includes(".")) head.splice(head.length - 1, 1, "0", "0");
+  const missing = 8 - head.length - tail.length;
+  if (missing < 0 || (halves.length === 1 && missing !== 0)) return address.trim();
+  const groups = [...head, ...Array(missing).fill("0"), ...tail];
+  if (!groups.every((g) => /^[0-9a-f]{1,4}$/.test(g))) return address.trim();
+  return `${groups.slice(0, 4).map((g) => parseInt(g, 16).toString(16)).join(":")}::/64`;
+}
+
+/** The largest request body (and so upload) a server accepts unless told otherwise: 1 GB. */
+export const DEFAULT_MAX_BODY_BYTES = 2 ** 30;
+
+/** Parses a size like "1gb", "512mb", "100k" or a number of bytes. */
+export function parseSize(text: string): number {
+  const m = /^(\d+(?:\.\d+)?)\s*(b|k|kb|m|mb|g|gb|t|tb)?$/i.exec(text.trim().replace(/_/g, ""));
+  const unit = { b: 1, k: 2 ** 10, m: 2 ** 20, g: 2 ** 30, t: 2 ** 40 }[(m?.[2]?.[0] ?? "b").toLowerCase() as "b"];
+  const bytes = m ? Math.floor(Number(m[1]) * unit) : NaN;
+  if (!(bytes >= 1) || !Number.isSafeInteger(bytes)) throw new Error(`Invalid size "${text}": use e.g. 1gb, 512mb or a number of bytes.`);
+  return bytes;
+}
+
+/** Thrown while reading a request body that turned out bigger than the limit. */
+export class BodyTooLarge extends Error {
+  constructor(readonly limit: number) {
+    super(`Request body is larger than this server accepts (${describeSize(limit)}; set --max-upload or $ONEBASE_MAX_UPLOAD to change it).`);
+  }
+}
+
+function describeSize(bytes: number): string {
+  for (const [n, unit] of [[2 ** 40, "TB"], [2 ** 30, "GB"], [2 ** 20, "MB"], [2 ** 10, "KB"]] as const) {
+    if (bytes >= n) return `${+(bytes / n).toFixed(2)} ${unit}`;
+  }
+  return `${bytes} bytes`;
+}
+
+/** A request whose body is counted as it streams: the one Bun handed over, and whether it went over. */
+type Capped = { original: Request; over: boolean };
+const cappedRequests = new WeakMap<Request, Capped>();
+
+/**
+ * `req` with a body that errors once more than `max` bytes went through, for a body sent without
+ * a Content-Length (chunked). Whoever reads it sees a stream error, which `tooLarge` recognizes.
+ */
+function capBody(req: Request, max: number): Request {
+  const state: Capped = { original: req, over: false };
+  let size = 0;
+  const body = req.body!.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        size += chunk.byteLength;
+        if (size <= max) return controller.enqueue(chunk);
+        state.over = true;
+        controller.error(new BodyTooLarge(max));
+      },
+    }),
+  );
+  const capped = new Request(req, { body, duplex: "half" } as RequestInit);
+  cappedRequests.set(capped, state);
+  return capped;
+}
+
+/** Whether `err` (from reading `req`'s body) is because the body went over the limit. */
+const tooLarge = (req: Request, err: unknown) => err instanceof BodyTooLarge || cappedRequests.get(req)?.over === true;
 
 export type RateLimit = { max: number; windowMs: number };
 
@@ -125,6 +224,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
   const limiter = opts.rateLimit ? new RateLimiter(opts.rateLimit) : null;
   const signInLimiter = new RateLimiter(SIGN_IN_LIMIT);
   const adminHost = opts.adminHost?.replace(/^https?:\/\//i, "").replace(/\/.*$/, "").toLowerCase() || null;
+  const maxBody = opts.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
 
   const originAllowed = (req: Request) => {
     const origin = req.headers.get("Origin");
@@ -174,15 +274,19 @@ export function serve(opts: ServeOptions): Server<SocketData> {
   const json = (req: Request, body: unknown, status = 200, headers: Record<string, string> = {}) =>
     jsonText(req, JSON.stringify(body), status, headers);
 
+  const proxyHops = opts.trustProxy === true ? 1 : typeof opts.trustProxy === "number" && opts.trustProxy > 0 ? Math.floor(opts.trustProxy) : 0;
+
+  /** The client's network, the key for rate limits and sign-in lockouts (an IPv6 /64, see networkKey). */
   const clientIp = (req: Request, server: Server<SocketData>) => {
-    if (opts.trustProxy) {
-      // On Fly (which sets FLY_APP_NAME) the edge sets Fly-Client-IP itself, while X-Forwarded-For can start with
-      // whatever the client sent. Anywhere else Fly-Client-IP is just a header the client chose, so it's ignored.
+    if (proxyHops) {
+      // On Fly (which sets FLY_APP_NAME) the edge sets Fly-Client-IP itself. Anywhere else
+      // Fly-Client-IP is just a header the client chose, so it's ignored.
       const fly = process.env.FLY_APP_NAME ? req.headers.get("Fly-Client-IP")?.trim() : undefined;
-      const forwarded = fly || req.headers.get("X-Forwarded-For")?.split(",")[0]?.trim() || req.headers.get("X-Real-IP");
-      if (forwarded) return forwarded;
+      // X-Real-IP only when there's no X-Forwarded-For: a proxy that sets it (nginx) overwrites it.
+      const forwarded = fly || forwardedClient(req.headers.get("X-Forwarded-For"), proxyHops) || req.headers.get("X-Real-IP")?.trim();
+      if (forwarded) return networkKey(forwarded);
     }
-    return server.requestIP(req)?.address ?? "unknown";
+    return networkKey(server.requestIP(cappedRequests.get(req)?.original ?? req)?.address ?? "unknown");
   };
 
   /** Null if allowed, otherwise the error to send. */
@@ -235,7 +339,13 @@ export function serve(opts: ServeOptions): Server<SocketData> {
     }
     const limit = counted ? limited(ws.data.ip) : null;
     if (limit) {
-      ws.data.subs.set(id, { path, args, unsubscribe: () => {}, failed: true });
+      // Try again once a token is free, so the query starts on its own (the client keeps showing
+      // the error until then). Unsubscribing, a new sub with this id, or closing cancels the retry.
+      const entry = { path, args, unsubscribe: () => clearTimeout(retry), failed: true };
+      const retry = setTimeout(() => {
+        if (ws.readyState === 1 && ws.data.subs.get(id) === entry) subscribe(ws, id, path, args);
+      }, limit.retryMs);
+      ws.data.subs.set(id, entry);
       return pushUpdate(ws, { type: "update", id, ok: false, error: limit.message });
     }
     try {
@@ -374,7 +484,8 @@ export function serve(opts: ServeOptions): Server<SocketData> {
     let body: any;
     try {
       body = await req.json();
-    } catch {
+    } catch (err) {
+      if (tooLarge(req, err)) return json(req, { status: "error", errorMessage: new BodyTooLarge(maxBody).message }, 413);
       return json(req, { status: "error", errorMessage: 'Body must be JSON: { "path": "messages:list", "args": {} }' }, 400);
     }
     try {
@@ -398,9 +509,21 @@ export function serve(opts: ServeOptions): Server<SocketData> {
   return Bun.serve<SocketData>({
     port: opts.port ?? 8090,
     hostname: opts.hostname ?? "0.0.0.0",
+    // Bun's own limit answers 413 with an empty body before fetch runs; the limit is enforced
+    // below instead, so the client gets a JSON error that says what the limit is.
+    maxRequestBodySize: Number.MAX_SAFE_INTEGER,
     async fetch(req, server) {
       const url = new URL(req.url);
       const path = url.pathname;
+      if (req.body) {
+        const length = Number(req.headers.get("Content-Length") ?? NaN);
+        if (length > maxBody) {
+          const err = new BodyTooLarge(maxBody);
+          return path.startsWith("/api/") ? json(req, { status: "error", errorMessage: err.message, error: err.message }, 413) : new Response(err.message, { status: 413 });
+        }
+        // No length up front (chunked): count while it streams.
+        if (!(length >= 0)) req = capBody(req, maxBody);
+      }
 
       if (path === "/api/sync") {
         if (!originAllowed(req)) return new Response("Origin not allowed", { status: 403 });
@@ -439,9 +562,10 @@ export function serve(opts: ServeOptions): Server<SocketData> {
         }
         if (path === "/api/storage/upload" && req.method === "POST") {
           try {
-            const storageId = await runtime.upload(url.searchParams.get("token"), req);
+            const storageId = await runtime.upload(url.searchParams.get("token"), req, url.searchParams.get("id"));
             return json(req, { storageId });
           } catch (err) {
+            if (tooLarge(req, err)) return json(req, { error: new BodyTooLarge(maxBody).message }, 413);
             return json(req, { error: runtime.toClientError(err).message }, 400);
           }
         }
@@ -492,6 +616,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
         } catch (err) {
           // A bad or expired session token is the caller's problem, not a server error.
           if (err instanceof AuthError) return new Response(err.message, { status: err.status });
+          if (tooLarge(req, err)) return new Response(new BodyTooLarge(maxBody).message, { status: 413 });
           runtime.log.error(`HTTP ${req.method} ${path}: ${err instanceof Error ? err.message : String(err)}`);
           return new Response(runtime.toClientError(err).message, { status: 500 });
         }

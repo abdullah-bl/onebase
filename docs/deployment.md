@@ -136,7 +136,9 @@ Every flag also has an environment variable, and environment variables can come 
 | `--backup-keep` | `ONEBASE_BACKUP_KEEP` | `24` |
 | `--cors` | `ONEBASE_CORS` | any origin for function calls, and only your own site (`--url`) and `localhost` for sign-in; comma-separated list of allowed browser origins, or `*` for any origin everywhere |
 | `--rate-limit` | `ONEBASE_RATE_LIMIT` | off; per-IP limit on calls, e.g. `100/10s` or `600/m` |
+| `--max-upload` | `ONEBASE_MAX_UPLOAD` | 1gb; largest upload (and any request body), e.g. `512mb` or `2gb` |
 | `--trust-proxy` | `ONEBASE_TRUST_PROXY=1` | off; read the client IP from `X-Forwarded-For` (set it behind a proxy) |
+| `--proxy-hops <n>` | `ONEBASE_TRUST_PROXY=<n>` | 1; how many proxies append to `X-Forwarded-For` |
 | `--no-dashboard` | `ONEBASE_DASHBOARD=off` | dashboard on at `/_admin` (see [Dashboard](./dashboard.md)) |
 | `--admin-host` | `ONEBASE_ADMIN_HOST` | any host; a host name such as `admin.example.com` to serve the dashboard and admin API only there |
 | | `ONEBASE_LOG_FORMAT=json` | coloured text; `json` writes one JSON object per line (`time`, `level`, `msg`) |
@@ -275,7 +277,7 @@ systemctl restart onebase # or however you run it
 - **Durable data:** keep `onebase_data` on persistent disk, and add `--backup` (or use Postgres or Turso).
 - **Before upgrading:** take a backup, and read the release notes. See [Upgrading onebase](#upgrading-onebase).
 - **Before deploying:** run `onebase doctor` (`onebase deploy` runs it for you), and try a risky schema change with `onebase deploy --dry-run`.
-- **Behind a proxy:** pass `--trust-proxy` so `--rate-limit` counts real client IPs.
+- **Behind a proxy:** pass `--trust-proxy` so `--rate-limit` and sign-in lockouts count real client IPs. The client is taken from the right end of `X-Forwarded-For` (what your proxy appended), so set `--proxy-hops` to the number of proxies that append to it, e.g. `2` for a CDN in front of a load balancer. Counting the wrong number lets clients choose their own address (too many) or counts everyone as the proxy (too few).
 - **Dashboard:** keep the admin key secret, or block `/_admin` at the proxy (see [Dashboard](./dashboard.md)).
 - **A frontend on another origin:** list it in `--cors`. Without it, browsers on other sites can call your functions but can't read a sign-in answer, which carries the session token. The server logs the origin it turned away.
 - **Dashboard on its own host:** point a second name at the server (`admin.example.com`) and start it with `--admin-host admin.example.com`. The dashboard keeps the admin key in the browser, and on its own origin a script injected into your app can't reach it. Deploy to that host too: `ONEBASE_DEPLOY_URL=https://admin.example.com`.

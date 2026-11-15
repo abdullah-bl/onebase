@@ -1,11 +1,18 @@
-// Talks to /_admin/api. The admin key lives in sessionStorage (it can come from a #key=… link):
-// it lasts as long as the tab, and other tabs on this origin (the app itself) can't read it.
+// Talks to /_admin/api. The admin key lives in this tab's sessionStorage (it can come from a
+// #key=… link), never localStorage: the dashboard shares its origin with the app, and anything in
+// localStorage would be readable by any script on any app page, in any tab, until cleared.
 
 const STORAGE_KEY = "ob-admin-key";
 
 export class AuthError extends Error {}
 
 function readKey(): string | null {
+  // Earlier versions kept the key in localStorage; take it out of there.
+  try {
+    const legacy = localStorage.getItem(STORAGE_KEY);
+    localStorage.removeItem(STORAGE_KEY);
+    if (legacy && !sessionStorage.getItem(STORAGE_KEY)) sessionStorage.setItem(STORAGE_KEY, legacy);
+  } catch {}
   const fromHash = /[#&]key=([^&]+)/.exec(location.hash)?.[1];
   if (fromHash) {
     const key = decodeURIComponent(fromHash);
@@ -14,12 +21,6 @@ function readKey(): string | null {
     return key;
   }
   try {
-    // Earlier versions kept the key in localStorage, where any script on this origin could read it.
-    const old = localStorage.getItem(STORAGE_KEY);
-    if (old) {
-      localStorage.removeItem(STORAGE_KEY);
-      sessionStorage.setItem(STORAGE_KEY, old);
-    }
     return sessionStorage.getItem(STORAGE_KEY);
   } catch {
     return null;

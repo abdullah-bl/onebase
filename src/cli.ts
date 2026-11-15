@@ -12,7 +12,7 @@ import { upgrade } from "./upgrade";
 import { doctor, printFindings } from "./doctor";
 import { SqliteDriver } from "./engine/driver";
 import { LocalBlobs } from "./engine/files";
-import { parseRateLimit } from "./engine/http";
+import { parseRateLimit, parseSize } from "./engine/http";
 import { CALL_LIMIT_ENV } from "./engine/limits";
 import type { AuthConfig } from "./engine/jwt";
 import type { Modules } from "./engine/runtime";
@@ -72,7 +72,10 @@ Options (each $NAME can also come from a .env file):
   --cors <origins>  Browser origins allowed to call the API, comma-separated (default: any, but sign-in only from
                     your site and localhost; $ONEBASE_CORS)
   --rate-limit <r>  Per-IP limit on function calls, e.g. 100/10s or 600/m (default: off; $ONEBASE_RATE_LIMIT)
+  --max-upload <s>  Largest upload (any request body), e.g. 1gb or 512mb (default: 1gb; $ONEBASE_MAX_UPLOAD)
   --trust-proxy     Take the client IP from X-Forwarded-For (when behind a reverse proxy; $ONEBASE_TRUST_PROXY=1)
+  --proxy-hops <n>  With --trust-proxy: how many proxies append to X-Forwarded-For (default: 1;
+                    $ONEBASE_TRUST_PROXY=<n> sets both). The client is the n-th entry from the right.
   --at <time>       restore: snapshot to use, e.g. 20261022T0300 (default: newest)
   --force           restore: overwrite an existing database
   --admin-host <h>  Serve the dashboard and admin API only on this host name, e.g. admin.example.com, so they
@@ -132,6 +135,8 @@ function options(argv: string[]) {
       cors: { type: "string" },
       "rate-limit": { type: "string" },
       "trust-proxy": { type: "boolean" },
+      "proxy-hops": { type: "string" },
+      "max-upload": { type: "string" },
       at: { type: "string" },
       force: { type: "boolean", default: false },
       "no-dashboard": { type: "boolean" },
@@ -177,7 +182,9 @@ function options(argv: string[]) {
     "backup-keep": values["backup-keep"] ?? env.ONEBASE_BACKUP_KEEP ?? "24",
     cors: values.cors ?? env.ONEBASE_CORS,
     "rate-limit": values["rate-limit"] ?? env.ONEBASE_RATE_LIMIT,
-    "trust-proxy": values["trust-proxy"] ?? enabled(env.ONEBASE_TRUST_PROXY),
+    "trust-proxy": values["trust-proxy"] ?? (enabled(env.ONEBASE_TRUST_PROXY) || /^[1-9]\d*$/.test(env.ONEBASE_TRUST_PROXY ?? "")),
+    "proxy-hops": values["proxy-hops"] ?? (/^[1-9]\d*$/.test(env.ONEBASE_TRUST_PROXY ?? "") ? env.ONEBASE_TRUST_PROXY : undefined),
+    "max-upload": values["max-upload"] ?? env.ONEBASE_MAX_UPLOAD,
     "no-dashboard": values["no-dashboard"] ?? off("ONEBASE_DASHBOARD", env.ONEBASE_DASHBOARD),
     "admin-host": values["admin-host"] ?? env.ONEBASE_ADMIN_HOST,
     "no-deploy": values["no-deploy"] ?? off("ONEBASE_DEPLOY", env.ONEBASE_DEPLOY),
@@ -214,6 +221,18 @@ function callLimit(name: string, mb = false): number | undefined {
   return mb ? Math.round(n * 2 ** 20) : n;
 }
 
+/** --trust-proxy and --proxy-hops as the number of appending proxies (false: X-Forwarded-For isn't read). */
+function proxyHops(trust: boolean | undefined, hops: string | undefined): number | false {
+  if (!trust) {
+    if (hops !== undefined) throw new Error("--proxy-hops needs --trust-proxy.");
+    return false;
+  }
+  if (hops === undefined) return 1;
+  const n = Number(hops);
+  if (!Number.isInteger(n) || n < 1 || n > 16) throw new Error(`--proxy-hops must be a whole number from 1 to 16, got "${hops}".`);
+  return n;
+}
+
 /** Database, storage, backup and HTTP settings shared by `serve` and embedded binaries. */
 function serverOptions(opts: ReturnType<typeof options>) {
   const keep = Number(opts["backup-keep"]);
@@ -224,7 +243,8 @@ function serverOptions(opts: ReturnType<typeof options>) {
     backup: opts.backup ? { url: opts.backup, everyMs: duration(opts["backup-every"]), keep } : undefined,
     cors: opts.cors ? opts.cors.split(",").map((o) => o.trim()).filter(Boolean) : undefined,
     rateLimit: opts["rate-limit"] ? parseRateLimit(opts["rate-limit"]) : null,
-    trustProxy: opts["trust-proxy"],
+    trustProxy: proxyHops(opts["trust-proxy"], opts["proxy-hops"]),
+    maxBodyBytes: opts["max-upload"] ? parseSize(opts["max-upload"]) : undefined,
     dashboard: !opts["no-dashboard"],
     adminHost: opts["admin-host"]?.trim() || undefined,
     deploys: !opts["no-deploy"],

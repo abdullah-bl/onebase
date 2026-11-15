@@ -518,7 +518,7 @@ export class AuthService {
   private readonly sendCtx = {
     runQuery: async (fn: FunctionLike, args?: Record<string, unknown>) =>
       (await this.runtime.runQuery(fn, args ?? {}, { allowInternal: true, source: "auth" })).value,
-    runMutation: (fn: FunctionLike, args?: Record<string, unknown>) => this.runtime.runMutation(fn, args ?? {}, { allowInternal: true, source: "auth" }),
+    runMutation: (fn: FunctionLike, args?: Record<string, unknown>) => this.runtime.runMutation(fn, args ?? {}, { allowInternal: true, source: "auth", settle: "none" }),
     runAction: (fn: FunctionLike, args?: Record<string, unknown>) => this.runtime.runAction(fn, args ?? {}, { allowInternal: true, source: "auth" }),
   };
 

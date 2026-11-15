@@ -140,6 +140,8 @@ Every flag also has an environment variable, and environment variables can come 
 | `--trust-proxy` | `ONEBASE_TRUST_PROXY=1` | off; read the client IP from `X-Forwarded-For` (set it behind a proxy) |
 | `--proxy-hops <n>` | `ONEBASE_TRUST_PROXY=<n>` | 1; how many proxies append to `X-Forwarded-For` |
 | `--no-dashboard` | `ONEBASE_DASHBOARD=off` | dashboard on at `/_admin` (see [Dashboard](./dashboard.md)) |
+| `--admin-host` | `ONEBASE_ADMIN_HOST` | any host; a host name such as `admin.example.com` to serve the dashboard and admin API only there |
+| | `ONEBASE_LOG_FORMAT=json` | coloured text; `json` writes one JSON object per line (`time`, `level`, `msg`) |
 | `--no-deploy` | `ONEBASE_DEPLOY=off` | deploys on (see [onebase deploy](#onebase-deploy)) |
 | | `ONEBASE_ADMIN_KEY` | generated into `<data>/admin.key`; your own needs at least 16 characters |
 
@@ -228,18 +230,28 @@ sudo systemctl enable --now onebase
 
 ## Docker
 
-```dockerfile
-FROM debian:bookworm-slim
-WORKDIR /app
-COPY onebase-linux-x64 /usr/local/bin/onebase
-COPY onebase/ ./onebase/
-COPY public/ ./public/
-VOLUME /app/onebase_data
-EXPOSE 8090
-CMD ["onebase", "serve"]
+Each release publishes an image for amd64 and arm64: `ghcr.io/abdullah-bl/onebase:<tag>` (and `:latest`). It runs a bare server as a non-root user, with a health check, and keeps everything in the `/app/onebase_data` volume. Push your code to it with `onebase deploy`:
+
+```bash
+docker run -d -p 8090:8090 -v onebase_data:/app/onebase_data -e ONEBASE_ADMIN_KEY=… ghcr.io/abdullah-bl/onebase:latest
 ```
 
-Pass settings with `docker run --env-file .env`, or mount a `.env` into `/app`. To ship code with `onebase deploy` instead of baking it into the image, leave out the two `COPY` lines for `onebase/` and `public/`. The deployment lives in the database on the volume, so it survives a new container.
+To check that an image or a release binary was built by this repository's release workflow:
+
+```bash
+gh attestation verify oci://ghcr.io/abdullah-bl/onebase:latest --repo abdullah-bl/onebase
+gh attestation verify onebase-linux-x64 --repo abdullah-bl/onebase
+```
+
+To bake your code into an image instead, build on the published one:
+
+```dockerfile
+FROM ghcr.io/abdullah-bl/onebase:latest
+COPY onebase/ ./onebase/
+COPY public/ ./public/
+```
+
+Pass settings with `docker run --env-file .env`, or mount a `.env` into `/app`. A pushed deployment lives in the database on the volume, so it survives a new container.
 
 ## Upgrading onebase
 
@@ -268,6 +280,9 @@ systemctl restart onebase # or however you run it
 - **Behind a proxy:** pass `--trust-proxy` so `--rate-limit` and sign-in lockouts count real client IPs. The client is taken from the right end of `X-Forwarded-For` (what your proxy appended), so set `--proxy-hops` to the number of proxies that append to it, e.g. `2` for a CDN in front of a load balancer. Counting the wrong number lets clients choose their own address (too many) or counts everyone as the proxy (too few).
 - **Dashboard:** keep the admin key secret, or block `/_admin` at the proxy (see [Dashboard](./dashboard.md)).
 - **A frontend on another origin:** list it in `--cors`. Without it, browsers on other sites can call your functions but can't read a sign-in answer, which carries the session token. The server logs the origin it turned away.
+- **Dashboard on its own host:** point a second name at the server (`admin.example.com`) and start it with `--admin-host admin.example.com`. The dashboard keeps the admin key in the browser, and on its own origin a script injected into your app can't reach it. Deploy to that host too: `ONEBASE_DEPLOY_URL=https://admin.example.com`.
+- **Metrics:** `GET /_admin/api/metrics` with `Authorization: Bearer <admin key>` answers in the Prometheus text format: calls and errors, open connections, live queries (and how many are waiting for a background re-run), time writes spent queued, the longest the server's thread was held up since the last scrape, memory and scheduled jobs by state.
+- **Logs:** `ONEBASE_LOG_FORMAT=json` for a log collector.
 - **Health checks:** `GET /api/health` answers 200 when the database answers, and 503 when it doesn't or the server is shutting down. The Docker image checks it by itself.
 - **Stopping:** on `SIGTERM` or `SIGINT` the server stops taking connections and gives running calls and jobs up to 10 seconds to finish. Give it that long before a kill: `TimeoutStopSec=15` in systemd, `stop_grace_period: 15s` in Compose.
 - **Errors:** in production (no `--dev`), unexpected errors reach clients as `Server Error`. Use `OneBaseError` for messages users should see.

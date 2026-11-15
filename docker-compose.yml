@@ -5,8 +5,12 @@
 #   ONEBASE_DEPLOY_URL=http://localhost:8090 ONEBASE_DEPLOY_KEY=<key> onebase deploy
 services:
   onebase:
+    # Each release publishes this image; `--build` builds it from this checkout instead.
+    image: ghcr.io/abdullah-bl/onebase:latest
     build: .
     restart: unless-stopped
+    # Longer than the 10 seconds the server gives running calls to finish.
+    stop_grace_period: 15s
     ports:
       - "8090:8090"
     environment:

@@ -49,6 +49,7 @@ Each flag can also be set with an environment variable, which can come from a [.
 | `--max-upload <size>` | `1gb` / `$ONEBASE_MAX_UPLOAD` | Largest upload (and any request body), e.g. `512mb`, `2gb`. Larger ones get HTTP 413 with a JSON error |
 | `--trust-proxy` | off / `$ONEBASE_TRUST_PROXY=1` | Take the client IP from `X-Forwarded-For`: the entry the proxy appended (the rightmost), not the client-written leftmost one |
 | `--proxy-hops <n>` | `1` / `$ONEBASE_TRUST_PROXY=<n>` | With `--trust-proxy`: how many proxies in front append to `X-Forwarded-For` (e.g. `2` for a CDN plus a load balancer). The client is the n-th entry from the right |
+| `--admin-host <host>` | any host / `$ONEBASE_ADMIN_HOST` | Serve the dashboard and admin API only on this host name |
 | `--no-dashboard` | dashboard on / `$ONEBASE_DASHBOARD=off` | Don't serve the dashboard or admin API at `/_admin` (this also turns off deploys) |
 | `--no-deploy` | deploys on / `$ONEBASE_DEPLOY=off` | Refuse `onebase deploy` and run the local code instead of what was pushed |
 | `--check` | | `upgrade`: only say whether a newer release exists |

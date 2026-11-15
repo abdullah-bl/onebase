@@ -8,6 +8,12 @@ import type { CommitEvent, Runtime } from "./runtime";
 export type QueryUpdate = { ok: true; value: unknown } | { ok: false; error: string; data?: unknown };
 /** `json` is a successful update's value as JSON, already made, so each connection needn't make it again. */
 type Listener = (update: QueryUpdate, json?: string) => void;
+/** One subscription: who asked, on whose behalf (a connection, say), and the entry serving it now. */
+type Sub = { identity: UserIdentity | null; owner: object | undefined; entry: Entry };
+
+/** Live queries re-run in the background this many at a time, giving way to other work every few milliseconds. */
+const BACKGROUND_BATCH = 8;
+const BACKGROUND_SLICE_MS = 8;
 
 const QUERY_CACHE_MB = 64;
 /** Rough memory for a cached entry's bookkeeping (measured as process RSS), and each read it files, on top of its key and result. */
@@ -24,9 +30,16 @@ type Entry = {
   key: string;
   name: string;
   args: unknown;
+  /** The identity it runs as. A shared entry serves every identity, and runs as whoever asked first. */
   identity: UserIdentity | null;
+  /** Keyed without the identity: the function hasn't been seen reading it, so everyone gets the same result. */
+  shared: boolean;
   source: CallSource;
-  listeners: Set<Listener>;
+  listeners: Map<Listener, Sub>;
+  /** How many listeners each owner has here, to find the entries a mutation's caller is waiting on. */
+  owners: Map<object, number>;
+  /** A commit affected it and it hasn't re-run yet: its result must not answer anyone new. */
+  stale: boolean;
   readSet: ReadSet | null;
   /** The latest result. A cached entry keeps only `lastJson`, which is smaller and can't be mutated. */
   last: QueryUpdate | null;
@@ -134,6 +147,10 @@ export function stableStringify(value: unknown): string {
 /**
  * Shared, reactive query results. Identical subscriptions (same function, args and user)
  * share one execution; after each commit only queries whose reads overlap the writes re-run.
+ * A function that never looks at who is asking is shared between users too.
+ *
+ * A commit waits only for the queries its own caller is subscribed to (so that client gets its
+ * result and its updates together). Everyone else's re-run in the background.
  *
  * One-off reads share these results too. An entry nobody subscribes to stays as a cache entry until
  * a commit could affect it or room runs out; it's dropped rather than re-run, so nothing is
@@ -150,7 +167,15 @@ export class SubscriptionManager {
   private executing = new Set<Entry>();
   /** Queries seen reading the clock or a random source: every read of them runs. */
   private impure = new Set<string>();
+  /** Queries whose runs so far never read the caller's identity, and ones seen reading it. Reset by a deploy. */
+  private anonymous = new Set<string>();
+  private personal = new Set<string>();
   private subscribed = 0;
+  /** Entries waiting for a background re-run. */
+  private backlog = new Set<Entry>();
+  private pumping = false;
+  /** Counters for /api/metrics. */
+  readonly counts = { runs: 0, background: 0, shared: 0, split: 0 };
 
   constructor(
     private readonly runtime: Runtime,
@@ -161,6 +186,7 @@ export class SubscriptionManager {
     this.cacheBytes = runtime.driver.shared ? 0 : (opts.cacheBytes ?? (envNumber("ONEBASE_QUERY_CACHE_MB") ?? QUERY_CACHE_MB) * 2 ** 20);
     runtime.onCommit((event) => this.invalidate(event));
     runtime.stats.subscriptions = () => this.size;
+    runtime.stats.sync = () => ({ ...this.counts, waiting: this.backlog.size });
   }
 
   get size() {
@@ -171,15 +197,18 @@ export class SubscriptionManager {
     return { entries: this.cache.size, bytes: this.cacheUsed };
   }
 
+  /**
+   * A function that hasn't been seen reading the identity gets one entry for everyone. Otherwise the
+   * key holds the whole identity: a function can read any of its claims, not just who the user is.
+   */
   private key(name: string, args: unknown, identity: UserIdentity | null) {
-    // The whole identity: a function can read any of its claims, not just who the user is.
-    return `${name}|${stableStringify(args ?? {})}|${stableStringify(identity)}`;
+    return `${name}|${stableStringify(args ?? {})}|${this.anonymous.has(name) ? "*" : stableStringify(identity)}`;
   }
 
   private create(key: string, name: string, args: unknown, identity: UserIdentity | null, source: CallSource) {
     const entry: Entry = {
-      key, name, args, identity, source, listeners: new Set(), readSet: null, last: null, lastJson: null, ok: false,
-      running: null, dirty: false, execution: null, pending: [], keys: [], bytes: 0,
+      key, name, args, identity, shared: this.anonymous.has(name), source, listeners: new Map(), owners: new Map(), stale: false,
+      readSet: null, last: null, lastJson: null, ok: false, running: null, dirty: false, execution: null, pending: [], keys: [], bytes: 0,
     };
     this.entries.set(key, entry);
     this.index.add(entry);
@@ -187,11 +216,24 @@ export class SubscriptionManager {
     return entry;
   }
 
-  subscribe(name: string, args: unknown, identity: UserIdentity | null, listener: Listener): () => void {
-    const key = this.key(name, args, identity);
+  /** `owner` groups a caller's subscriptions (a connection, say), so its mutations can wait for just those. */
+  subscribe(name: string, args: unknown, identity: UserIdentity | null, listener: Listener, owner?: object): () => void {
+    const sub: Sub = { identity, owner, entry: undefined as unknown as Entry };
+    this.join(name, args, listener, sub);
+    return () => {
+      const e = sub.entry;
+      if (!this.detach(listener, sub) || e.listeners.size > 0) return;
+      // Still executing: the run decides what happens to the entry when it finishes.
+      if (this.entries.get(e.key) === e && !e.running) this.park(e);
+    };
+  }
+
+  /** Puts a subscription on the entry for its query, creating it if needed, and sends what is known so far. */
+  private join(name: string, args: unknown, listener: Listener, sub: Sub): Entry {
+    const key = this.key(name, args, sub.identity);
     let entry = this.entries.get(key);
     if (!entry) {
-      entry = this.create(key, name, args, identity, "subscription");
+      entry = this.create(key, name, args, sub.identity, "subscription");
     } else {
       this.uncache(entry);
       entry.source = "subscription";
@@ -199,14 +241,32 @@ export class SubscriptionManager {
       if (entry.last) listener(entry.last, entry.last.ok ? (entry.lastJson ?? undefined) : undefined);
     }
     if (entry.listeners.size === 0) this.subscribed++;
-    entry.listeners.add(listener);
-    const e = entry;
-    return () => {
-      if (!e.listeners.delete(listener) || e.listeners.size > 0) return;
-      this.subscribed--;
-      // Still executing: the run decides what happens to the entry when it finishes.
-      if (this.entries.get(e.key) === e && !e.running) this.park(e);
-    };
+    entry.listeners.set(listener, sub);
+    if (sub.owner) entry.owners.set(sub.owner, (entry.owners.get(sub.owner) ?? 0) + 1);
+    sub.entry = entry;
+    return entry;
+  }
+
+  private detach(listener: Listener, sub: Sub): boolean {
+    const e = sub.entry;
+    if (!e.listeners.delete(listener)) return false;
+    if (sub.owner) {
+      const n = (e.owners.get(sub.owner) ?? 1) - 1;
+      if (n <= 0) e.owners.delete(sub.owner);
+      else e.owners.set(sub.owner, n);
+    }
+    if (e.listeners.size === 0) this.subscribed--;
+    return true;
+  }
+
+  /** Takes every subscription off an entry and drops it; each one joins the entry its key now names. */
+  private rehome(entry: Entry): Entry | null {
+    const subs = [...entry.listeners];
+    for (const [listener, sub] of subs) this.detach(listener, sub);
+    this.discard(entry);
+    let last: Entry | null = null;
+    for (const [listener, sub] of subs) last = this.join(entry.name, entry.args, listener, sub);
+    return last;
   }
 
   /**
@@ -224,11 +284,12 @@ export class SubscriptionManager {
       // Its snapshot may predate a commit this caller already knows about.
       if (entry.pending.length) return run();
       const shared = await entry.execution;
-      if (shared.readSet.impure) return run();
+      // A run that read the identity answers only the one it ran as.
+      if (shared.readSet.impure || (entry.shared && shared.readSet.identity)) return run();
       this.runtime.calls.record(name, "query", source);
       return shared.json;
     }
-    if (!entry.ok) return run();
+    if (!entry.ok || entry.stale) return run();
     if (this.cache.delete(key)) this.cache.set(key, entry);
     this.runtime.calls.record(name, "query", source);
     return entry.lastJson!;
@@ -241,7 +302,7 @@ export class SubscriptionManager {
     // Strings take up to 2 bytes per character (only Latin-1 text fits in 1), so this is a real upper bound.
     const bytes = ENTRY_OVERHEAD_BYTES + reads * READ_OVERHEAD_BYTES + 2 * (entry.key.length + (entry.lastJson?.length ?? 0));
     // Too big means pushing out most of the cache for one result.
-    if (!entry.ok || entry.dirty || this.impure.has(entry.name) || bytes > this.cacheBytes / 4) return this.discard(entry);
+    if (!entry.ok || entry.dirty || entry.stale || this.impure.has(entry.name) || bytes > this.cacheBytes / 4) return this.discard(entry);
     entry.last = null;
     entry.bytes = bytes;
     this.cache.set(entry.key, entry);
@@ -279,17 +340,48 @@ export class SubscriptionManager {
     return entry.running;
   }
 
-  private async run(entry: Entry): Promise<Run> {
-    const { value, readSet } = await this.runtime.runQuery(entry.name, entry.args, { identity: entry.identity, source: entry.source });
+  /** `reads` is filled in as the query runs, so what it read is known even when it throws. */
+  private async run(entry: Entry, reads: ReadSet): Promise<Run> {
+    const { value, readSet } = await this.runtime.runQuery(entry.name, entry.args, { identity: entry.identity, source: entry.source, readSet: reads });
     return { value, readSet, json: valueJson(value) };
   }
 
   private async execute(entry: Entry) {
     entry.pending = [];
+    entry.stale = false;
     this.executing.add(entry);
-    const execution = (entry.execution = this.run(entry));
+    this.counts.runs++;
+    const reads: ReadSet = { ids: new Set(), ranges: [] };
+    const execution = (entry.execution = this.run(entry, reads));
     let update: QueryUpdate;
     let json: string;
+    try {
+      await execution;
+    } catch {}
+    if (reads.identity) {
+      this.personal.add(entry.name);
+      this.anonymous.delete(entry.name);
+      if (entry.shared) {
+        // It looked at who was asking after all, so this result (or error) belongs to one identity
+        // only. Nobody gets it: every subscriber moves to an entry of their own.
+        this.executing.delete(entry);
+        entry.execution = null;
+        this.counts.split++;
+        this.rehome(entry);
+        return;
+      }
+    } else if (!this.personal.has(entry.name)) {
+      this.anonymous.add(entry.name);
+      // This entry becomes the one for everyone, unless there is one already (then its
+      // subscribers move over the next time a commit affects it).
+      const shared = this.key(entry.name, entry.args, entry.identity);
+      if (!entry.shared && this.entries.get(entry.key) === entry && !this.entries.has(shared)) {
+        this.entries.delete(entry.key);
+        entry.key = shared;
+        entry.shared = true;
+        this.entries.set(shared, entry);
+      }
+    }
     try {
       const run = await execution;
       entry.readSet = run.readSet;
@@ -315,7 +407,7 @@ export class SubscriptionManager {
     if (json === entry.lastJson && update.ok === entry.last?.ok) return;
     entry.last = update;
     entry.lastJson = json;
-    for (const listener of entry.listeners) listener(update, update.ok ? json : undefined);
+    for (const listener of entry.listeners.keys()) listener(update, update.ok ? json : undefined);
   }
 
   private affected(entry: Entry, event: CommitEvent): boolean {
@@ -331,25 +423,81 @@ export class SubscriptionManager {
   /** Re-runs every query (after a deploy replaced the code); resolves once results are delivered. */
   async rerunAll(): Promise<void> {
     this.impure.clear();
+    this.anonymous.clear();
+    this.personal.clear();
     const all = [...this.entries.values()];
     for (const e of all) if (e.listeners.size === 0) this.discard(e);
     await Promise.all(all.filter((e) => e.listeners.size > 0).map((e) => this.refresh(e)));
   }
 
-  /** Re-runs affected queries; resolves once their new results have been delivered. */
+  /**
+   * Re-runs affected queries. Resolves once the ones `event.settle` asks for have delivered their
+   * new results: a caller's own, all of them, or (by default) none. The rest re-run in the background.
+   */
   async invalidate(event: CommitEvent): Promise<void> {
     for (const e of this.executing) e.pending.push(event);
     // Large commits from another instance only name tables: check everything, as before.
-    const pool = event.tables ? this.entries.values() : this.index.candidates(event.writes);
-    const refreshes: Promise<void>[] = [];
+    const pool = event.tables ? [...this.entries.values()] : this.index.candidates(event.writes);
+    const settle = event.settle;
+    const waiting: Promise<void>[] = [];
     for (const e of pool) {
-      if (e.listeners.size > 0) {
-        if (this.affected(e, event)) refreshes.push(this.refresh(e));
-      } else if (!e.running) {
+      if (e.listeners.size === 0) {
         // Dropped without the exact check, so a commit costs no more than the entries it removes.
-        this.discard(e);
+        if (!e.running) this.discard(e);
+        continue;
       }
+      if (this.entries.get(e.key) !== e || !this.affected(e, event)) continue;
+      let target = e;
+      let started: Promise<void> | null = null;
+      if (!e.shared && this.anonymous.has(e.name)) {
+        // Learned since it was created: this query is the same for everyone. Its subscribers move to
+        // the shared entry, which a run started now (or one that saw this commit) brings up to date.
+        target = this.rehome(e)!;
+        this.counts.shared++;
+        started = target.running;
+      }
+      if (settle === "all" || (settle && target.owners.has(settle))) waiting.push(started ?? this.refresh(target));
+      else if (!started) this.later(target);
     }
-    await Promise.all(refreshes);
+    await Promise.all(waiting);
+  }
+
+  /** Marks an entry out of date and queues its re-run. */
+  private later(entry: Entry) {
+    if (entry.running) return void this.refresh(entry); // re-runs as soon as the run in progress ends
+    entry.stale = true;
+    this.backlog.add(entry);
+    if (!this.pumping) void this.pump();
+  }
+
+  /** Works through the backlog a few entries at a time, letting requests and timers run in between. */
+  private async pump() {
+    this.pumping = true;
+    try {
+      let since = performance.now();
+      while (this.backlog.size) {
+        const batch: Promise<void>[] = [];
+        for (const e of this.backlog) {
+          this.backlog.delete(e);
+          // Unsubscribed or replaced meanwhile: there is nobody to tell.
+          if (e.listeners.size === 0 || this.entries.get(e.key) !== e) continue;
+          this.counts.background++;
+          batch.push(this.refresh(e));
+          if (batch.length >= BACKGROUND_BATCH) break;
+        }
+        await Promise.all(batch);
+        if (performance.now() - since >= BACKGROUND_SLICE_MS) {
+          await new Promise((resolve) => setImmediate(resolve));
+          since = performance.now();
+        }
+      }
+    } finally {
+      this.pumping = false;
+    }
+  }
+
+  /** Subscriptions waiting for a background re-run. */
+  get waiting() {
+    return this.backlog.size;
   }
 }

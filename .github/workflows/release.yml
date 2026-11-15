@@ -1,5 +1,8 @@
-# Push a tag like v0.1.0 to build single-file binaries for every platform
-# and attach them to a GitHub release.
+# Push a tag like v0.1.0 to build single-file binaries for every platform and attach them to a
+# GitHub release, and to publish the Docker image to ghcr.io. Both get a signed build provenance
+# attestation, which `gh attestation verify` checks against this repository.
+#
+# Actions are pinned to a commit: a tag can be moved to different code, a commit can't.
 name: Release
 
 on:
@@ -7,17 +10,29 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: write # the release
+  packages: write # the image
+  id-token: write # signing the attestations
+  attestations: write
 
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.4.4
+      - name: The tag is the version in the code
+        # `onebase upgrade` refuses a binary whose version isn't its release's tag.
+        run: |
+          version="$(bun -e 'import { VERSION } from "./src/version"; console.log(VERSION)')"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match src/version.ts ($version). Bump the version, or tag v$version."
+            exit 1
+          fi
       - run: bun install --frozen-lockfile
+      - run: bun run typecheck
       - run: bun test
       - run: bun run build:assets
       - name: Build binaries
@@ -28,7 +43,40 @@ jobs:
             bun build --compile --minify --no-compile-autoload-dotenv --target "bun-$target" src/cli.ts src/engine/action-worker.ts --outfile "release/onebase-$target$ext"
           done
           cd release && sha256sum onebase-* > SHA256SUMS
+      - name: Attest the binaries
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: release/onebase-*
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" release/* --title "$GITHUB_REF_NAME" --generate-notes
+
+  image:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}:latest
+      - name: Attest the image
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

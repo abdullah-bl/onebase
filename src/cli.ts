@@ -78,6 +78,8 @@ Options (each $NAME can also come from a .env file):
                     $ONEBASE_TRUST_PROXY=<n> sets both). The client is the n-th entry from the right.
   --at <time>       restore: snapshot to use, e.g. 20261022T0300 (default: newest)
   --force           restore: overwrite an existing database
+  --admin-host <h>  Serve the dashboard and admin API only on this host name, e.g. admin.example.com, so they
+                    don't share an origin with your app ($ONEBASE_ADMIN_HOST)
   --no-dashboard    Don't serve the dashboard or admin API at /_admin, which also turns off deploys ($ONEBASE_DASHBOARD=off)
   --no-deploy       Refuse onebase deploy and run the local code, not what was pushed ($ONEBASE_DEPLOY=off)
   --from-file <f>   env set: set every variable in this .env file
@@ -138,6 +140,7 @@ function options(argv: string[]) {
       at: { type: "string" },
       force: { type: "boolean", default: false },
       "no-dashboard": { type: "boolean" },
+      "admin-host": { type: "string" },
       "no-deploy": { type: "boolean" },
       "dry-run": { type: "boolean", default: false },
       check: { type: "boolean", default: false },
@@ -183,6 +186,7 @@ function options(argv: string[]) {
     "proxy-hops": values["proxy-hops"] ?? (/^[1-9]\d*$/.test(env.ONEBASE_TRUST_PROXY ?? "") ? env.ONEBASE_TRUST_PROXY : undefined),
     "max-upload": values["max-upload"] ?? env.ONEBASE_MAX_UPLOAD,
     "no-dashboard": values["no-dashboard"] ?? off("ONEBASE_DASHBOARD", env.ONEBASE_DASHBOARD),
+    "admin-host": values["admin-host"] ?? env.ONEBASE_ADMIN_HOST,
     "no-deploy": values["no-deploy"] ?? off("ONEBASE_DEPLOY", env.ONEBASE_DEPLOY),
   };
 }
@@ -242,6 +246,7 @@ function serverOptions(opts: ReturnType<typeof options>) {
     trustProxy: proxyHops(opts["trust-proxy"], opts["proxy-hops"]),
     maxBodyBytes: opts["max-upload"] ? parseSize(opts["max-upload"]) : undefined,
     dashboard: !opts["no-dashboard"],
+    adminHost: opts["admin-host"]?.trim() || undefined,
     deploys: !opts["no-deploy"],
     timeLimits: {
       queryMs: timeLimit("ONEBASE_QUERY_TIMEOUT"),

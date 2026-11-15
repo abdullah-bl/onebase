@@ -6,6 +6,7 @@
 
 import { OnebaseError } from "./database";
 import type { Exec } from "./driver";
+import { decryptValue, encryptValue, isEncrypted, secretKey } from "./secrets";
 
 const NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const MAX_NAME = 128;
@@ -27,19 +28,38 @@ export function checkEnvVar(name: unknown, value?: unknown): asserts name is str
   if (Buffer.byteLength(value) > MAX_VALUE) throw new OnebaseError(`${name}: values can be at most ${MAX_VALUE / 1024} KB.`);
 }
 
+/** The stored variables, decrypted. With $ONEBASE_SECRET_KEY set, values are encrypted in the database. */
 export async function readEnvVars(tx: Exec): Promise<StoredEnvVar[]> {
+  const secret = secretKey();
   const rows = await tx.all(`SELECT name, value, updated FROM _env ORDER BY name`);
-  return rows.map((r) => ({ name: r.name as string, value: r.value as string, updated: Number(r.updated) }));
+  return Promise.all(
+    rows.map(async (r) => ({ name: r.name as string, value: await decryptValue(secret, r.name as string, r.value as string), updated: Number(r.updated) })),
+  );
+}
+
+/** Encrypts values stored before $ONEBASE_SECRET_KEY was set. Returns how many. */
+export async function encryptStoredEnvVars(tx: Exec): Promise<number> {
+  const secret = secretKey();
+  if (!secret) return 0;
+  let n = 0;
+  for (const r of await tx.all(`SELECT name, value FROM _env`)) {
+    if (isEncrypted(r.value as string)) continue;
+    await tx.run(`UPDATE _env SET value = ? WHERE name = ?`, [await encryptValue(secret, r.name as string, r.value as string), r.name]);
+    n++;
+  }
+  return n;
 }
 
 /** Upserts `set` and deletes `remove`, in one transaction. Returns the names that changed. */
 export async function writeEnvVars(tx: Exec, set: Record<string, string>, remove: string[], now: number): Promise<string[]> {
   const changed: string[] = [];
+  const secret = secretKey();
   for (const [name, value] of Object.entries(set)) {
     const row = await tx.get(`SELECT value FROM _env WHERE name = ?`, [name]);
-    if (row && row.value === value) continue;
-    if (row) await tx.run(`UPDATE _env SET value = ?, updated = ? WHERE name = ?`, [value, now, name]);
-    else await tx.run(`INSERT INTO _env (name, value, updated) VALUES (?, ?, ?)`, [name, value, now]);
+    if (row && (await decryptValue(secret, name, row.value as string)) === value) continue;
+    const stored = secret ? await encryptValue(secret, name, value) : value;
+    if (row) await tx.run(`UPDATE _env SET value = ?, updated = ? WHERE name = ?`, [stored, now, name]);
+    else await tx.run(`INSERT INTO _env (name, value, updated) VALUES (?, ?, ?)`, [name, stored, now]);
     changed.push(name);
   }
   for (const name of remove) {

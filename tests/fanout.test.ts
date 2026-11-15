@@ -163,3 +163,46 @@ for (const D of DRIVERS) {
     });
   });
 }
+
+// ---------- Scheduled jobs on a shared database ----------
+
+for (const D of DRIVERS.filter((d) => d.name !== "sqlite")) {
+  describe(`${D.name} > job leases`, () => {
+    test("a job left running by an instance that went away runs again; one still being renewed is left alone", async () => {
+      const { Runtime, leaseMark } = await import("../src/engine/runtime");
+      const jobs = {
+        jobs: {
+          note: mutation({ args: { text: v.string() }, handler: (ctx, a) => ctx.db.insert("notes", a) }),
+          list: query({ args: {}, handler: async (ctx) => (await ctx.db.query("notes").collect()).map((n) => n.text).sort() }),
+        },
+      };
+      const { driver, runtime } = await openRuntime(() => D.make(""), { schema, modules: jobs });
+      const [heartbeat, lease] = [Runtime.heartbeatMs, Runtime.jobLeaseMs];
+      Runtime.heartbeatMs = 100;
+      Runtime.jobLeaseMs = 1000;
+      try {
+        const now = Date.now();
+        const row = (id: string, text: string, mark: string | null) =>
+          runtime.withWriter((tx) => tx.run("INSERT INTO _scheduled (id, fn, args, run_at, state, error) VALUES (?, 'jobs:note', ?, ?, 'running', ?)", [id, JSON.stringify({ text }), now, mark]));
+        await row("gone", "from the instance that went away", leaseMark(now - 60_000));
+        await row("alive", "still running elsewhere", leaseMark(now + 60_000));
+        await row("older", "claimed by an older onebase", null);
+
+        await runtime.startScheduler();
+        await sleep(600);
+        expect((await runtime.runQuery("jobs:list", {})).value).toEqual(["from the instance that went away"]);
+        const states = await runtime.withReader((tx) => tx.all("SELECT id, state FROM _scheduled ORDER BY id"));
+        expect(states).toEqual([
+          { id: "alive", state: "running" },
+          { id: "gone", state: "done" },
+          { id: "older", state: "running" },
+        ]);
+      } finally {
+        Runtime.heartbeatMs = heartbeat;
+        Runtime.jobLeaseMs = lease;
+        runtime.stop();
+        await driver.close();
+      }
+    });
+  });
+}

@@ -41,7 +41,8 @@ Each flag can also be set with an environment variable, which can come from a [.
 | `--files <s3url>` | local `<data>/files` / `$ONEBASE_FILES` | `s3://bucket/prefix` |
 | `--backup <s3url>` | / `$ONEBASE_BACKUP` | `s3://bucket/prefix` |
 | `--backup-every <d>` | `1h` / `$ONEBASE_BACKUP_EVERY` | `30m`, `6h`, `1d`, … |
-| `--backup-keep <n>` | `24` / `$ONEBASE_BACKUP_KEEP` | Snapshots to keep |
+| `--backup-keep <n>` | `24` / `$ONEBASE_BACKUP_KEEP` | Newest snapshots to keep |
+| `--backup-keep-daily <n>` | `7` / `$ONEBASE_BACKUP_KEEP_DAILY` | Also keep the newest snapshot of each of the last n days |
 | `--at <time>` | newest | `restore`: pick a snapshot |
 | `--force` | | `restore`: overwrite an existing database |
 | `--cors <origins>` | any, but sign-in only from your site and `localhost` / `$ONEBASE_CORS` | Browser origins allowed to call the API, comma-separated; `*` allows any origin for sign-in too |

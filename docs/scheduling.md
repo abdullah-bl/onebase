@@ -19,7 +19,7 @@ await ctx.scheduler.cancel(jobId);
 ```
 
 - **From a mutation:** the job is created only if the mutation commits. Throw, and nothing is scheduled.
-- **Storage:** jobs are kept in the database, so they survive restarts. A job that was running when the server stopped runs again on the next start. (That is for SQLite. On a shared database, where another instance may be running the job, a job cut off by a crash stays marked running.)
+- **Storage:** jobs are kept in the database, so they survive restarts. A job that was running when the server stopped runs again on the next start. On a shared database, the instance running a job renews its claim every 30 seconds, and a job whose instance went away runs again once the claim runs out (two and a half minutes).
 - **Mutations run exactly once:** a scheduled mutation is marked done inside its own transaction.
 - **Actions and queries run at most once,** unless the server crashes mid-run (then the job is retried).
 - **Failures:** a failed job is logged and kept with its error for 7 days.

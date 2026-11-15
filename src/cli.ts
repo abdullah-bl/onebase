@@ -68,7 +68,8 @@ Options (each $NAME can also come from a .env file):
   --files <s3url>   Keep uploaded files in S3/R2/MinIO: s3://bucket/prefix ($ONEBASE_FILES)
   --backup <s3url>  Back up SQLite to s3://bucket/prefix ($ONEBASE_BACKUP)
   --backup-every <d>  Backup interval, e.g. 15m, 1h, 1d (default: 1h, or $ONEBASE_BACKUP_EVERY)
-  --backup-keep <n>   Snapshots to keep (default: 24, or $ONEBASE_BACKUP_KEEP)
+  --backup-keep <n>   Newest snapshots to keep (default: 24, or $ONEBASE_BACKUP_KEEP)
+  --backup-keep-daily <n>  Also keep the newest snapshot of each of the last n days (default: 7, or $ONEBASE_BACKUP_KEEP_DAILY)
   --cors <origins>  Browser origins allowed to call the API, comma-separated (default: any, but sign-in only from
                     your site and localhost; $ONEBASE_CORS)
   --rate-limit <r>  Per-IP limit on function calls, e.g. 100/10s or 600/m (default: off; $ONEBASE_RATE_LIMIT)
@@ -132,6 +133,7 @@ function options(argv: string[]) {
       backup: { type: "string" },
       "backup-every": { type: "string" },
       "backup-keep": { type: "string" },
+      "backup-keep-daily": { type: "string" },
       cors: { type: "string" },
       "rate-limit": { type: "string" },
       "trust-proxy": { type: "boolean" },
@@ -180,6 +182,7 @@ function options(argv: string[]) {
     backup: values.backup ?? env.ONEBASE_BACKUP,
     "backup-every": values["backup-every"] ?? env.ONEBASE_BACKUP_EVERY ?? "1h",
     "backup-keep": values["backup-keep"] ?? env.ONEBASE_BACKUP_KEEP ?? "24",
+    "backup-keep-daily": values["backup-keep-daily"] ?? env.ONEBASE_BACKUP_KEEP_DAILY ?? "7",
     cors: values.cors ?? env.ONEBASE_CORS,
     "rate-limit": values["rate-limit"] ?? env.ONEBASE_RATE_LIMIT,
     "trust-proxy": values["trust-proxy"] ?? (enabled(env.ONEBASE_TRUST_PROXY) || /^[1-9]\d*$/.test(env.ONEBASE_TRUST_PROXY ?? "")),
@@ -237,10 +240,12 @@ function proxyHops(trust: boolean | undefined, hops: string | undefined): number
 function serverOptions(opts: ReturnType<typeof options>) {
   const keep = Number(opts["backup-keep"]);
   if (!Number.isInteger(keep) || keep < 1) throw new Error(`--backup-keep must be a positive integer.`);
+  const keepDaily = Number(opts["backup-keep-daily"]);
+  if (!Number.isInteger(keepDaily) || keepDaily < 0) throw new Error(`--backup-keep-daily must be 0 or a positive integer.`);
   return {
     db: opts.db,
     files: opts.files,
-    backup: opts.backup ? { url: opts.backup, everyMs: duration(opts["backup-every"]), keep } : undefined,
+    backup: opts.backup ? { url: opts.backup, everyMs: duration(opts["backup-every"]), keep, keepDaily } : undefined,
     cors: opts.cors ? opts.cors.split(",").map((o) => o.trim()).filter(Boolean) : undefined,
     rateLimit: opts["rate-limit"] ? parseRateLimit(opts["rate-limit"]) : null,
     trustProxy: proxyHops(opts["trust-proxy"], opts["proxy-hops"]),
@@ -287,7 +292,7 @@ async function backupCommand(opts: ReturnType<typeof options>) {
   const driver = new SqliteDriver(dbPath);
   try {
     const blobs = opts.files ? undefined : new LocalBlobs(join(opts.data, "files"));
-    const r = await backupNow(driver, url, Number(opts["backup-keep"]), blobs);
+    const r = await backupNow(driver, url, Number(opts["backup-keep"]), blobs, Number(opts["backup-keep-daily"]));
     console.log(`Uploaded ${r.key} (${(r.bytes / 1024).toFixed(1)} KB)${r.filesUploaded ? ` and ${r.filesUploaded} file(s)` : ""}.`);
   } finally {
     await driver.close();

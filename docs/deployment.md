@@ -134,6 +134,7 @@ Every flag also has an environment variable, and environment variables can come 
 | `--backup` | `ONEBASE_BACKUP` | none (see [Backups](./backups.md)) |
 | `--backup-every` | `ONEBASE_BACKUP_EVERY` | `1h` |
 | `--backup-keep` | `ONEBASE_BACKUP_KEEP` | `24` |
+| `--backup-keep-daily` | `ONEBASE_BACKUP_KEEP_DAILY` | `7` |
 | `--cors` | `ONEBASE_CORS` | any origin for function calls, and only your own site (`--url`) and `localhost` for sign-in; comma-separated list of allowed browser origins, or `*` for any origin everywhere |
 | `--rate-limit` | `ONEBASE_RATE_LIMIT` | off; per-IP limit on calls, e.g. `100/10s` or `600/m` |
 | `--max-upload` | `ONEBASE_MAX_UPLOAD` | 1gb; largest upload (and any request body), e.g. `512mb` or `2gb` |
@@ -141,6 +142,9 @@ Every flag also has an environment variable, and environment variables can come 
 | `--proxy-hops <n>` | `ONEBASE_TRUST_PROXY=<n>` | 1; how many proxies append to `X-Forwarded-For` |
 | `--no-dashboard` | `ONEBASE_DASHBOARD=off` | dashboard on at `/_admin` (see [Dashboard](./dashboard.md)) |
 | `--admin-host` | `ONEBASE_ADMIN_HOST` | any host; a host name such as `admin.example.com` to serve the dashboard and admin API only there |
+| | `ONEBASE_SECRET_KEY` | off; a secret of 32 or more characters that encrypts stored environment variables and backups |
+| | `ONEBASE_DB_POOL` | `10`; Postgres connections each instance may hold |
+| | `ONEBASE_WRITE_CONCURRENCY` | `1`; Postgres only: mutations one instance runs at once (see [Databases](./databases.md#several-instances)) |
 | | `ONEBASE_LOG_FORMAT=json` | coloured text; `json` writes one JSON object per line (`time`, `level`, `msg`) |
 | `--no-deploy` | `ONEBASE_DEPLOY=off` | deploys on (see [onebase deploy](#onebase-deploy)) |
 | | `ONEBASE_ADMIN_KEY` | generated into `<data>/admin.key`; your own needs at least 16 characters |
@@ -180,7 +184,7 @@ It talks to `ONEBASE_DEPLOY_URL` with `ONEBASE_DEPLOY_KEY`, like [`onebase deplo
 - **Local code:** a server running its own `onebase/` folder (or a binary's built-in code) can't load it again. Values read inside a function apply at once; values read when the code loads apply after a restart. At startup, stored values are set before the code loads.
 - **The server's own environment wins:** a variable set in the server's environment or `.env` files overrides a stored one with the same name. `onebase env list` and the dashboard mark those as overridden, so a change that can't take effect doesn't go unnoticed.
 - **Not for server settings:** `ONEBASE_*` names are refused, since the server reads them when it starts. Set those in its environment.
-- **Where they're kept:** in the database (the `_env` table), as plain text, so [backups](./backups.md) include them. Anyone with the admin key can read them. Names are letters, digits and `_`; values can be up to 64 KB.
+- **Where they're kept:** in the database (the `_env` table), so [backups](./backups.md) include them. They are plain text unless the server has `ONEBASE_SECRET_KEY` (at least 32 characters), which encrypts each value in the database; values saved earlier are encrypted the next time the server starts. Every instance needs the same key, and a server without it refuses to start on encrypted values instead of running half-configured. Anyone with the admin key can read them. Names are letters, digits and `_`; values can be up to 64 KB.
 
 ## Behind a reverse proxy
 

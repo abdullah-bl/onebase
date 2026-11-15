@@ -428,6 +428,8 @@ export function createAdmin(opts: { runtime: Runtime; key: string; assets: Dashb
     add("call_errors_total", "counter", "Function calls that failed.", runtime.calls.totals.errors);
     add("query_runs_total", "counter", "Runs of live and cached queries.", sync.runs);
     add("query_background_runs_total", "counter", "Live-query re-runs done after the write that caused them had returned.", sync.background);
+    add("query_worker_runs_total", "counter", "Live-query re-runs done on a query worker thread (ONEBASE_QUERY_WORKERS).", runtime.queryWorkerRuns);
+    add("query_workers", "gauge", "Query worker threads running now.", runtime.queryPool?.size ?? 0);
     add("queries_shared_total", "counter", "Per-user live queries merged into one shared between users.", sync.shared);
     add("queries_split_total", "counter", "Shared live queries split per user after reading the caller's identity.", sync.split);
     add("writes_total", "counter", "Write transactions started.", runtime.stats.writes);

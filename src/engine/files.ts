@@ -178,12 +178,8 @@ export class FileStore {
     ]);
   }
 
-  async metadata(tx: Exec, id: unknown): Promise<FileMetadata | null> {
-    if (typeof id !== "string") throw new OnebaseError(`Expected a storage id (string), got ${typeof id}.`);
-    const row = await tx.get("SELECT id, ct, sha256, size, content_type FROM _storage WHERE id = ?", [id]);
-    return row
-      ? { _id: row.id, _creationTime: Number(row.ct), sha256: row.sha256, size: Number(row.size), contentType: row.content_type }
-      : null;
+  metadata(tx: Exec, id: unknown): Promise<FileMetadata | null> {
+    return fileMetadata(tx, id);
   }
 
   /** Removes the metadata row; the caller deletes the bytes once the transaction commits. */
@@ -191,4 +187,11 @@ export class FileStore {
     if (!(await this.metadata(tx, id))) throw new OnebaseError(`storage.delete(): file "${String(id)}" doesn't exist.`);
     await tx.run("DELETE FROM _storage WHERE id = ?", [id as string]);
   }
+}
+
+/** A stored file's metadata, or null (query workers read it without a FileStore). */
+export async function fileMetadata(tx: Exec, id: unknown): Promise<FileMetadata | null> {
+  if (typeof id !== "string") throw new OnebaseError(`Expected a storage id (string), got ${typeof id}.`);
+  const row = await tx.get("SELECT id, ct, sha256, size, content_type FROM _storage WHERE id = ?", [id]);
+  return row ? { _id: row.id, _creationTime: Number(row.ct), sha256: row.sha256, size: Number(row.size), contentType: row.content_type } : null;
 }

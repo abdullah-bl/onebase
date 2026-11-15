@@ -7,18 +7,19 @@ import type { ComponentsDefinition } from "../components";
 import { parseCron } from "../cron";
 import type { SchemaDefinition } from "../schema";
 import { isRegisteredFunction, type CronJob, type HttpAction, type HttpRouter, type RegisteredFunction, type UserIdentity } from "../server";
-import { OneBaseError, describeValue, isPlainObject, validate, type AnyValidator } from "../values";
+import { OneBaseError, isPlainObject, validate, type AnyValidator } from "../values";
 import { ActionPool, defaultActionWorkers, defaultWorkerEntry } from "./action-pool";
+import { QueryPool } from "./query-pool";
 import type { CodeSource } from "./action-wire";
-import { indexCode, lookupRoute, type MountCode } from "./code";
-import { buildCatalog, storedTable, TableScope, tableMount, validatesTable, type Catalog } from "./catalog";
+import { checkArgs, checkReturn, indexCode, lookupFunction, lookupRoute, type MountCode } from "./code";
+import { buildCatalog, TableScope, tableMount, validatesTable, type Catalog } from "./catalog";
 import { CronRunner } from "./crons";
 import { BACKFILL_BATCH, backfilled, coalesce, hookState, readProgress, writeProgress, type HookProgress, type ResolvedHook } from "./hooks";
 import { applySchema, DatabaseImpl, OnebaseError, readerView, writerView, type ReadSet, type VectorSearchQuery, type Write } from "./database";
 import { isIdForTable, newId } from "./dialect";
-import { envNumber, savepoint, Semaphore, SerialQueue, type Driver, type Exec } from "./driver";
+import { envNumber, savepoint, Semaphore, SerialQueue, SqliteDriver, type Driver, type Exec } from "./driver";
 import { FileStore, LocalBlobs, type BlobBackend } from "./files";
-import { CallLog, type CallSource } from "./calllog";
+import { addLine, CallLog, callLines, type CallSource } from "./calllog";
 import { CallBudget, DEFAULT_CALL_LIMITS, type CallLimits } from "./limits";
 import { currentFunction, installGuards } from "./guard";
 import { AuthError, AuthService, SESSION_PREFIX } from "./auth";
@@ -147,6 +148,12 @@ export type RuntimeOptions = {
   actionWorkers?: number;
   /** The workers' program (default: onebase's own; a binary from `onebase build` has its own). */
   actionWorkerEntry?: string | URL;
+  /**
+   * Worker threads that re-run live queries in the background, each with its own read-only
+   * connection (default: $ONEBASE_QUERY_WORKERS, else 0: they re-run on the main thread). Only
+   * for SQLite on a file, outside dev mode, and code with a `source`. See query-pool.ts.
+   */
+  queryWorkers?: number;
   /** How much one query or mutation may read and write (default: DEFAULT_CALL_LIMITS). */
   callLimits?: Partial<CallLimits>;
   /** Applies stored environment variables to process.env (default: the process's one). */
@@ -327,6 +334,16 @@ export class Runtime {
   actionPool: ActionPool | null = null;
   private readonly actionWorkers: number;
   private readonly actionWorkerEntry: string | URL;
+  /** Re-runs the current code's live queries on worker threads; null: on the main thread. */
+  queryPool: QueryPool | null = null;
+  private readonly queryWorkers: number;
+  /** Live-query re-runs answered by a query worker, for /api/metrics. */
+  queryWorkerRuns = 0;
+  /**
+   * Goes up each time the code is replaced (deploy, rollback, environment variables). A query
+   * result from an older generation ran old code and must not be delivered.
+   */
+  codeGeneration = 0;
   private schedulerStarted = false;
   /** Mutations from this process run one at a time; other instances are handled by the driver. */
   private readonly mutations: { run<T>(fn: () => Promise<T>): Promise<T> };
@@ -371,6 +388,7 @@ export class Runtime {
     this.loadTimeoutMs = opts.loadTimeoutMs ?? 30_000;
     this.actionWorkers = opts.actionWorkers ?? envNumber("ONEBASE_ACTION_WORKERS") ?? defaultActionWorkers();
     this.actionWorkerEntry = opts.actionWorkerEntry ?? defaultWorkerEntry();
+    this.queryWorkers = Math.floor(opts.queryWorkers ?? envNumber("ONEBASE_QUERY_WORKERS") ?? 0);
     this.timeLimits = { ...DEFAULT_TIME_LIMITS };
     for (const [key, ms] of Object.entries(opts.timeLimits ?? {}) as [keyof TimeLimits, number | undefined][]) {
       if (ms === undefined) continue; // unset: keep the default
@@ -661,6 +679,23 @@ export class Runtime {
     this.actionPool =
       source && this.actionWorkers > 0 && !this.stopped
         ? new ActionPool({ size: this.actionWorkers, entry: this.actionWorkerEntry, source, log: this.log, functions: () => prepared.functions.keys() })
+        : null;
+    this.codeGeneration++;
+    // Queries running on the old code's workers are dropped: their results would be old-code results.
+    this.queryPool?.stop("the code was replaced");
+    const driver = this.driver;
+    this.queryPool =
+      source && this.queryWorkers > 0 && !this.stopped && !this.dev && driver instanceof SqliteDriver && driver.reader !== driver.writer
+        ? new QueryPool({
+            size: this.queryWorkers,
+            entry: this.actionWorkerEntry, // the same program serves both kinds of worker
+            source,
+            path: driver.path,
+            siteUrl: () => this.siteUrl,
+            callLimits: this.callLimits,
+            log: this.log,
+            functions: () => prepared.functions.keys(),
+          })
         : null;
   }
 
@@ -1081,33 +1116,7 @@ export class Runtime {
     // from server code (a client never calls through one).
     const viaHandle = isFunctionHandle(ref);
     if (viaHandle && !allowInternal) throw new OnebaseError("Function handles can only be called from other functions.");
-    const fn = this.functions.get(name);
-    if (!fn) {
-      const [mod] = name.split(":");
-      const sameModule = [...this.functions.keys()].filter((k) => k.startsWith(`${mod}:`));
-      const hint = sameModule.length
-        ? ` Functions in "${mod}": ${sameModule.join(", ")}.`
-        : ` Known functions: ${[...this.functions.keys()].join(", ") || "(none)"}.`;
-      throw new OnebaseError(`Function "${name}" not found.${hint}`);
-    }
-    if (expected && fn.type !== expected) {
-      throw new OnebaseError(`"${name}" is a ${fn.type}, not a ${expected}. Call it with use${cap(fn.type)} / run${cap(fn.type)}.`);
-    }
-    if (fn.visibility === "internal" && !allowInternal) {
-      throw new OnebaseError(`"${name}" is internal and can only be called from other functions (ctx.run*, scheduler).`);
-    }
-    const info = this.componentFunctions.get(name);
-    const target = info?.mount ?? null;
-    if (!viaHandle && caller !== "system" && caller !== target) {
-      if (caller) {
-        throw new OnebaseError(
-          target
-            ? `Component "${caller.name}" can't call component "${target.name}"'s "${name}"; only the app can.`
-            : `Component "${caller.name}" can't call the app's "${name}"; components only run their own functions.`,
-        );
-      }
-      if (info?.internal) throw new OnebaseError(`"${name}" is internal to component "${target!.name}"; call its public functions instead.`);
-    }
+    const { fn, mount: target } = lookupFunction(this.functions, this.componentFunctions, name, { expected, allowInternal, caller, viaHandle });
     return { name, fn, mount: target };
   }
 
@@ -1153,23 +1162,11 @@ export class Runtime {
   }
 
   private checkArgs(name: string, fn: RegisteredFunction, args: unknown): Record<string, unknown> {
-    const value = args ?? {};
-    if (!isPlainObject(value)) throw new OnebaseError(`Arguments to "${name}" must be an object, got ${describeValue(args)}.`);
-    if (fn.args) {
-      // A component's v.id("t") names its own table, stored as "<mount>.t".
-      const mount = this.componentFunctions.get(name)?.mount.name ?? null;
-      const errors = validate(fn.args, value, "args", { idTable: (table) => storedTable(mount, table) });
-      if (errors.length) throw new OnebaseError(`Invalid arguments for "${name}":\n  - ${errors.join("\n  - ")}`);
-    }
-    return value;
+    return checkArgs(name, fn, args, this.componentFunctions.get(name)?.mount.name ?? null);
   }
 
   private checkReturn(name: string, fn: RegisteredFunction, value: unknown): unknown {
-    if (fn.returns) {
-      const errors = validate(fn.returns, value === null ? null : value, "return value");
-      if (errors.length) throw new OnebaseError(`"${name}" returned an invalid value:\n  - ${errors.join("\n  - ")}`);
-    }
-    return value === undefined ? null : value;
+    return checkReturn(name, fn, value);
   }
 
   /** Converts any thrown error into what a client may see. */
@@ -1570,19 +1567,57 @@ export class Runtime {
   /** Runs a query against a committed snapshot and reports what it read. */
   async runQuery(ref: FunctionLike, args: unknown, opts: CallOptions & { /** Filled in as the query runs, so it's known even if the query throws. */ readSet?: ReadSet } = {}): Promise<{ value: unknown; readSet: ReadSet }> {
     const { name, fn, mount } = this.resolve(ref, "query", opts.allowInternal ?? false, this.callerOf(opts));
-    return this.calls.track(name, "query", opts.source ?? "function", () =>
-      // The limit starts once the query has a snapshot: time spent waiting for one isn't its fault.
-      this.driver.read((tx) =>
-        this.withinLimit("query", name, async (deadline) => {
-          const readSet: ReadSet = opts.readSet ?? { ids: new Set(), ranges: [] };
-          const budget = new CallBudget(name, "query", this.callLimits);
-          const db = this.newDb(deadline.exec(tx), { readSet, budget });
-          const value = await this.invoke(name, fn, this.queryCtx(db, opts.identity ?? null, mount), args, readSet);
-          budget.check(); // a limit error the function caught still fails the query
-          return { value, readSet };
-        }),
-      ),
+    return this.calls.track(name, "query", opts.source ?? "function", () => this.queryHere(name, fn, mount, args, opts));
+  }
+
+  /** runQuery() without the call record, on this thread's reader connection. */
+  private queryHere(name: string, fn: RegisteredFunction, mount: MountRuntime | null, args: unknown, opts: CallOptions & { readSet?: ReadSet }) {
+    // The limit starts once the query has a snapshot: time spent waiting for one isn't its fault.
+    return this.driver.read((tx) =>
+      this.withinLimit("query", name, async (deadline) => {
+        const readSet: ReadSet = opts.readSet ?? { ids: new Set(), ranges: [] };
+        const budget = new CallBudget(name, "query", this.callLimits);
+        const db = this.newDb(deadline.exec(tx), { readSet, budget });
+        const value = await this.invoke(name, fn, this.queryCtx(db, opts.identity ?? null, mount), args, readSet);
+        budget.check(); // a limit error the function caught still fails the query
+        return { value, readSet };
+      }),
     );
+  }
+
+  /**
+   * Runs a live query's background re-run on a query worker (see query-pool.ts), answering with its
+   * value as JSON. Null when it runs on the main thread instead: there are no query workers, or this
+   * query was seen needing the main thread. `opts.readSet` is filled in as by runQuery().
+   */
+  runQueryOnWorker(name: string, args: unknown, opts: CallOptions & { readSet: ReadSet }): Promise<{ json: string; readSet: ReadSet }> | null {
+    const pool = this.queryPool;
+    if (!pool || !pool.accepts(name)) return null;
+    const generation = this.codeGeneration;
+    const { fn, mount } = this.resolve(name, "query", opts.allowInternal ?? false, this.callerOf(opts));
+    return this.calls.track(name, "query", opts.source ?? "function", async () => {
+      const outcome = await pool.run({ name, args, identity: opts.identity ?? null }, this.timeLimits.queryMs);
+      const lines = callLines();
+      if (lines) for (const line of outcome.lines) addLine(lines, line.level, line.text);
+      if ("mainThread" in outcome) {
+        if (generation !== this.codeGeneration) throw new OnebaseError(`${name} was stopped: the code was replaced while it ran.`);
+        const { value, readSet } = await this.queryHere(name, fn, mount, args, opts);
+        return { json: JSON.stringify(value) ?? "null", readSet };
+      }
+      const into = opts.readSet;
+      for (const id of outcome.readSet.ids) into.ids.add(id);
+      into.ranges.push(...outcome.readSet.ranges);
+      if (outcome.readSet.impure) into.impure = true;
+      if (outcome.readSet.identity) into.identity = true;
+      if (!outcome.ok) throw outcome.error;
+      this.queryWorkerRuns++;
+      return { json: outcome.json, readSet: into };
+    });
+  }
+
+  /** Background re-runs to keep in flight at once on query workers (0: there are none). */
+  get queryWorkerSlots(): number {
+    return this.queryPool?.slots ?? 0;
   }
 
   async runMutation(
@@ -1935,6 +1970,7 @@ export class Runtime {
   stop() {
     this.stopped = true;
     this.actionPool?.stop();
+    this.queryPool?.stop();
     this.cronRunner?.stop();
     if (this.schedulerTimer) clearTimeout(this.schedulerTimer);
     if (this.heartbeat) clearInterval(this.heartbeat);

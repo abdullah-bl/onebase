@@ -166,6 +166,8 @@ An action's worker is stopped when its time is up, even in the middle of `while 
 
 Queries and mutations run on the main thread, and JavaScript can't stop a function in the middle of an `await`. So a query or mutation keeps running until it next yields. Anything it then tries fails with the same error, so it can't read or write any more, call other functions, or schedule them. Code that never yields, such as `while (true) {}`, can't be stopped this way and blocks the whole server. (A background re-run on a [query worker](#live-queries-on-worker-threads) is the exception: its worker is stopped.) The same goes for actions with `ONEBASE_ACTION_WORKERS=0`.
 
+**The watchdog.** For that last case, `onebase serve` runs a second thread that only watches whether the main one is still turning. When it has been stuck for 30 seconds, the process prints which function started last and stops itself, so whatever runs it (systemd, Docker, Fly) starts a fresh one: a server that would have hung until someone noticed is back in seconds. It stops with `SIGKILL`, since a stuck server can't shut down politely; nothing committed is lost. `ONEBASE_WATCHDOG` sets the wait (`2m`) or turns it off (`off`). Under `onebase dev` the server stops and comes back the next time you save a file.
+
 The limit counts from when the call gets its database snapshot (a query), the write lock (a mutation) or a worker (an action), not from when it was queued. A mutation called from a mutation shares its caller's limit; one called from an action gets its own.
 
 Change the limits with `ONEBASE_QUERY_TIMEOUT`, `ONEBASE_MUTATION_TIMEOUT` and `ONEBASE_ACTION_TIMEOUT`, e.g. `30s`, `2m`, or `off`. Keep mutations short: while one runs, every other write waits for it.

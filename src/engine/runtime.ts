@@ -15,10 +15,11 @@ import { checkArgs, checkReturn, indexCode, lookupFunction, lookupRoute, type Mo
 import { buildCatalog, TableScope, tableMount, validatesTable, type Catalog } from "./catalog";
 import { CronRunner } from "./crons";
 import { Scheduler } from "./scheduler";
+import type { Watchdog } from "./watchdog";
 import { BACKFILL_BATCH, backfilled, coalesce, hookState, readProgress, writeProgress, type HookProgress, type ResolvedHook } from "./hooks";
 import { applySchema, DatabaseImpl, OnebaseError, readerView, writerView, type ReadSet, type VectorSearchQuery, type Write } from "./database";
 import { isIdForTable, newId } from "./dialect";
-import { envNumber, savepoint, Semaphore, SerialQueue, SqliteDriver, type Driver, type Exec } from "./driver";
+import { envNumber, savepoint, Semaphore, SerialQueue, SqliteDriver, type Driver, type Exec, type Row } from "./driver";
 import {
   CONFIRMED,
   DIRECT_UPLOAD_DEFAULT_SECONDS,
@@ -270,6 +271,13 @@ export type CallOptions = {
   source?: CallSource;
 };
 
+/** Documents that don't match the schema: how many, and the first few. */
+type InvalidDocuments = { invalid: number; examples: string[] };
+/** A document check done ahead of a deploy's transaction: the schema it was for, and what was written during and after it. */
+type PrecheckedDocuments = { fingerprint: string; touched: Set<string>; overflowed: boolean };
+/** Past this many documents written during a precheck, the deploy checks everything again in its transaction. */
+const MAX_PRECHECK_WRITES = 100_000;
+
 /** What changed in a commit: exact writes, or (when too large to broadcast) just the tables. */
 export type CommitEvent = ({ writes: Write[]; tables?: undefined } | { tables: string[]; writes?: undefined }) & { settle?: Settle };
 
@@ -396,6 +404,10 @@ export class Runtime {
   /** Signs function handles; loaded from the database by init(). */
   private handleKey: Buffer | null = null;
   private stopped = false;
+  /** A deploy's document check in progress: every write adds the ids it touched (see precheckDocuments). */
+  private precheck: PrecheckedDocuments | null = null;
+  /** Set by the server: told which function starts, to name it if the thread gets stuck (watchdog.ts). */
+  watchdog: Watchdog | null = null;
   private draining = false;
   /** True once a shutdown has begun. */
   get shuttingDown() {
@@ -529,51 +541,123 @@ export class Runtime {
   }
 
   /**
+   * The tables whose documents are validated, and a fingerprint of their validators. With
+   * schemaValidation off only component tables are checked; turning it back on changes the
+   * fingerprint, so everything is checked again then.
+   */
+  private checkedTables(catalog: Catalog) {
+    const tables = Object.entries(catalog.tables).filter(([t]) => validatesTable(catalog, t)) as [string, { validator: AnyValidator }][];
+    const fingerprint = new Bun.CryptoHasher("sha256").update(JSON.stringify(tables.map(([t, d]) => [t, d.validator]))).digest("hex");
+    return { tables, fingerprint };
+  }
+
+  private checkRows(table: string, def: { validator: AnyValidator }, rows: Row[], found: InvalidDocuments) {
+    for (const row of rows) {
+      const errors = validate(def.validator, this.driver.dialect.parseDoc(row.doc), "document");
+      if (!errors.length) continue;
+      found.invalid++;
+      if (found.examples.length < 5) found.examples.push(`${table} ${row.id}: ${errors.slice(0, 3).join("; ")}`);
+    }
+  }
+
+  /** Checks a table 500 documents at a time, read with `all`; `between` runs after each batch. */
+  private async checkTable(
+    table: string,
+    def: { validator: AnyValidator },
+    found: InvalidDocuments,
+    all: (sql: string, params: unknown[]) => Promise<Row[]>,
+    between?: () => Promise<void>,
+  ) {
+    const d = this.driver.dialect;
+    let after: [number, string] = [-1, ""];
+    for (;;) {
+      const rows = await all(
+        `SELECT id, ct, doc FROM documents WHERE tbl = ? AND (ct, id) > (${d.placeholder("ct")}, ${d.placeholder("id")}) ORDER BY ct, id LIMIT 500`,
+        [table, ...after],
+      );
+      this.checkRows(table, def, rows, found);
+      if (rows.length < 500) break;
+      after = [Number(rows[rows.length - 1]!.ct), rows[rows.length - 1]!.id as string];
+      await between?.();
+    }
+  }
+
+  private schemaMismatch({ invalid, examples }: InvalidDocuments) {
+    return new OnebaseError(
+      `schema.ts doesn't match ${invalid} existing document${invalid === 1 ? "" : "s"}:\n  - ${examples.join("\n  - ")}` +
+        (invalid > examples.length ? `\n  - … and ${invalid - examples.length} more` : "") +
+        `\nMake the schema accept the data (v.optional(...), v.union(...)), or fix the data: start with ` +
+        `defineSchema({ ... }, { schemaValidation: false }), update the documents in a mutation (or the dashboard), then turn validation back on.`,
+    );
+  }
+
+  /**
+   * A deploy's document check, without the write lock. Checking every document inside the
+   * deploy's transaction would hold up every write (and, with one thread, every request) for as
+   * long as the scan takes. So the scan happens first, a batch at a time with requests served in
+   * between, while the ids of documents written meanwhile are collected; the transaction then
+   * only re-checks those (checkDocuments).
+   *
+   * Returns null when there is nothing to gain: no schema, an unchanged one, or a shared database,
+   * where other instances write too and their writes can't be collected in time. The caller must
+   * call endPrecheck() once its transaction is over.
+   */
+  private async precheckDocuments(catalog: Catalog | null): Promise<PrecheckedDocuments | null> {
+    if (!catalog || this.driver.shared) return null;
+    const { tables, fingerprint } = this.checkedTables(catalog);
+    const stored = await this.driver.read((tx) => tx.get("SELECT value FROM _meta WHERE \"key\" = 'schema'"));
+    if (stored?.value === fingerprint) return null;
+    const prechecked: PrecheckedDocuments = { fingerprint, touched: new Set(), overflowed: false };
+    this.precheck = prechecked;
+    const found: InvalidDocuments = { invalid: 0, examples: [] };
+    const read = (sql: string, params: unknown[]) => this.driver.read((tx) => tx.all(sql, params));
+    const breathe = () => new Promise<void>((resolve) => setImmediate(resolve));
+    try {
+      for (const [table, def] of tables) await this.checkTable(table, def, found, read, breathe);
+    } catch (err) {
+      this.endPrecheck();
+      throw err;
+    }
+    if (found.invalid) {
+      this.endPrecheck();
+      throw this.schemaMismatch(found);
+    }
+    return prechecked;
+  }
+
+  private endPrecheck() {
+    this.precheck = null;
+  }
+
+  /**
    * When schema.ts (or a component's schema) changes, every stored document is checked against
    * it, like a Convex deploy. The schema's fingerprint is saved once the data matches (unless
    * `record` is false, for a dry run), so unchanged schemas cost nothing. Returns warnings about
    * data the schema ignores.
    */
-  private async checkDocuments(tx: Exec, catalog: Catalog | null, record = true): Promise<string[]> {
+  private async checkDocuments(tx: Exec, catalog: Catalog | null, record = true, prechecked: PrecheckedDocuments | null = null): Promise<string[]> {
     if (!catalog) {
       if (record) await tx.run("DELETE FROM _meta WHERE \"key\" = 'schema'");
       return [];
     }
-    // With schemaValidation off only component tables are checked; turning it back on changes
-    // the fingerprint, so everything is checked again then.
-    const tables = Object.entries(catalog.tables).filter(([t]) => validatesTable(catalog, t)) as [string, { validator: AnyValidator }][];
-    const fingerprint = new Bun.CryptoHasher("sha256").update(JSON.stringify(tables.map(([t, d]) => [t, d.validator]))).digest("hex");
+    const { tables, fingerprint } = this.checkedTables(catalog);
     const stored = await tx.get("SELECT value FROM _meta WHERE \"key\" = 'schema'");
     if (stored?.value === fingerprint) return [];
 
-    const d = this.driver.dialect;
-    const examples: string[] = [];
-    let invalid = 0;
-    for (const [table, def] of tables) {
-      let after: [number, string] = [-1, ""];
-      for (;;) {
-        const rows = await tx.all(
-          `SELECT id, ct, doc FROM documents WHERE tbl = ? AND (ct, id) > (${d.placeholder("ct")}, ${d.placeholder("id")}) ORDER BY ct, id LIMIT 500`,
-          [table, ...after],
-        );
-        for (const row of rows) {
-          const errors = validate(def.validator, d.parseDoc(row.doc), "document");
-          if (!errors.length) continue;
-          invalid++;
-          if (examples.length < 5) examples.push(`${table} ${row.id}: ${errors.slice(0, 3).join("; ")}`);
-        }
-        if (rows.length < 500) break;
-        after = [Number(rows[rows.length - 1]!.ct), rows[rows.length - 1]!.id];
+    const found: InvalidDocuments = { invalid: 0, examples: [] };
+    if (prechecked?.fingerprint === fingerprint && !prechecked.overflowed) {
+      // Every document was checked a moment ago without the write lock (precheckDocuments). Only
+      // the ones written since then need another look, which is what keeps this transaction short.
+      const byTable = new Map(tables);
+      for (const id of prechecked.touched) {
+        const row = await tx.get("SELECT id, tbl, doc FROM documents WHERE id = ?", [id]);
+        const def = row ? byTable.get(row.tbl as string) : undefined;
+        if (def) this.checkRows(row!.tbl as string, def, [row!], found);
       }
+    } else {
+      for (const [table, def] of tables) await this.checkTable(table, def, found, (sql, params) => tx.all(sql, params));
     }
-    if (invalid) {
-      throw new OnebaseError(
-        `schema.ts doesn't match ${invalid} existing document${invalid === 1 ? "" : "s"}:\n  - ${examples.join("\n  - ")}` +
-          (invalid > examples.length ? `\n  - … and ${invalid - examples.length} more` : "") +
-          `\nMake the schema accept the data (v.optional(...), v.union(...)), or fix the data: start with ` +
-          `defineSchema({ ... }, { schemaValidation: false }), update the documents in a mutation (or the dashboard), then turn validation back on.`,
-      );
-    }
+    if (found.invalid) throw this.schemaMismatch(found);
     const known = new Set(Object.keys(catalog.tables));
     const orphans = (await tx.all("SELECT DISTINCT tbl FROM documents"))
       .map((r) => r.tbl as string)
@@ -895,8 +979,10 @@ export class Runtime {
         ? `The onebase CLI that pushed this didn't send its version, so it's older than this server (${VERSION}). Update it, so a version mismatch can be caught.`
         : versionWarning(builtWith);
     const schema = opts.dryRun ? this.dryRunSchema(opts.schema) : prepared!.catalog;
+    // The long part of a schema change, done before the transaction (and, for a dry run, instead of a long read).
+    const prechecked = await this.precheckDocuments(schema);
     const apply = async (tx: Exec) => {
-      const warnings = await this.checkDocuments(tx, schema, !opts.dryRun);
+      const warnings = await this.checkDocuments(tx, schema, !opts.dryRun, prechecked);
       if (opts.dryRun) return { indexes: { created: [], dropped: [] }, warnings };
       const indexes = await applySchema(tx, this.driver.dialect, schema);
       if (opts.save) await saveDeployment(tx, stored);
@@ -905,7 +991,7 @@ export class Runtime {
       return { indexes, warnings };
     };
     // Queued with this process's mutations, so none of them runs between the check and the swap.
-    const { indexes, warnings } = opts.dryRun ? await this.driver.read(apply) : await this.withWriter(apply);
+    const { indexes, warnings } = await (opts.dryRun ? this.driver.read(apply) : this.withWriter(apply)).finally(() => this.endPrecheck());
     const deployment = toDeployment(stored);
     if (!opts.dryRun) {
       await this.install(prepared!, deployment);
@@ -1705,6 +1791,7 @@ export class Runtime {
     const checked = this.checkArgs(name, fn, args);
     const caller = this.componentFunctions.get(name)?.mount ?? null;
     const handle = (ref: unknown) => this.createHandle(ref, caller);
+    this.watchdog?.enter(name);
     const result = await currentFunction.run({ type: fn.type, name, handle, reads }, () => fn.handler(ctx, checked));
     return this.checkReturn(name, fn, result);
   }
@@ -1867,6 +1954,12 @@ export class Runtime {
       // Nothing commits before every table hook has seen every write.
       await this.flushHooks(state);
       budget?.check(); // a limit error the function caught still rolls the mutation back
+      // Before the commit, in the writer: a deploy's transaction, queued behind this one, sees every id.
+      const precheck = this.precheck;
+      if (precheck && state.writes.length) {
+        if (precheck.touched.size + state.writes.length > MAX_PRECHECK_WRITES) precheck.overflowed = true;
+        else for (const w of state.writes) precheck.touched.add(w.id);
+      }
       if (this.driver.shared && this.driver.publish && (state.writes.length || state.scheduled || state.revoked.length)) {
         for (const message of this.broadcastMessages(state)) await this.driver.publish(tx, message);
       }

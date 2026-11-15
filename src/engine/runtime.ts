@@ -14,6 +14,7 @@ import type { CodeSource } from "./action-wire";
 import { checkArgs, checkReturn, indexCode, lookupFunction, lookupRoute, type MountCode } from "./code";
 import { buildCatalog, TableScope, tableMount, validatesTable, type Catalog } from "./catalog";
 import { CronRunner } from "./crons";
+import { Scheduler } from "./scheduler";
 import { BACKFILL_BATCH, backfilled, coalesce, hookState, readProgress, writeProgress, type HookProgress, type ResolvedHook } from "./hooks";
 import { applySchema, DatabaseImpl, OnebaseError, readerView, writerView, type ReadSet, type VectorSearchQuery, type Write } from "./database";
 import { isIdForTable, newId } from "./dialect";
@@ -316,10 +317,6 @@ type TxState = {
   hookCursors: Map<string, number>;
 };
 
-/** Scheduled jobs one instance runs at the same time. */
-const MAX_RUNNING_JOBS = 20;
-/** A running job's lease, as text that sorts by time (13 digits until the year 2286). */
-export const leaseMark = (at: number) => `lease:${String(Math.floor(at)).padStart(13, "0")}`;
 /** Commit broadcasts above this size only list the tables (Postgres NOTIFY caps payloads at 8000 bytes). */
 const MAX_BROADCAST = 7000;
 /** Ended sessions per broadcast message; more go in extra messages, so the cap above holds. */
@@ -390,13 +387,8 @@ export class Runtime {
   /** Deploys and rollbacks, one at a time, so the code running is always the one recorded. */
   private readonly deploys = new SerialQueue();
   private commitListeners: ((event: CommitEvent) => Promise<void>)[] = [];
-  private schedulerTimer: ReturnType<typeof setTimeout> | null = null;
-  private runningJobs = 0;
-  private readonly runningJobIds = new Set<string>();
-  /** How often a shared database is checked for missed work, and how long a job's claim lasts without being renewed. */
-  static heartbeatMs = 30_000;
-  static jobLeaseMs = 150_000;
-  private heartbeat: ReturnType<typeof setInterval> | null = null;
+  /** Scheduled jobs: the timer, claims, leases and recovery (scheduler.ts). */
+  private readonly scheduler = new Scheduler(this);
   private uploadSweeper: ReturnType<typeof setInterval> | null = null;
   readonly maxUploadBytes: number;
   private lastCreationTime = 0;
@@ -2025,20 +2017,8 @@ export class Runtime {
   // ---- Scheduler ----
 
   async startScheduler() {
-    await this.withWriter((tx) => tx.run("DELETE FROM _scheduled WHERE state <> 'pending' AND run_at < ?", [Date.now() - 7 * 86400_000]));
-    await this.recoverInterruptedJobs();
-    this.pokeScheduler();
-    // With a shared database, pick up jobs left by instances that went away.
-    // Also catch up on a deploy whose broadcast was missed (say, while reconnecting).
-    if (this.driver.shared) {
-      await this.keepJobs();
-      this.heartbeat = setInterval(() => {
-        void this.keepJobs()
-          .then(() => this.recoverInterruptedJobs())
-          .then(() => this.pokeScheduler());
-        void this.syncDeployment();
-      }, Runtime.heartbeatMs);
-    }
+    // On each heartbeat (shared databases), also catch up on a deploy whose broadcast was missed (say, while reconnecting).
+    await this.scheduler.start(() => void this.syncDeployment());
     this.schedulerStarted = true;
     // Unconfirmed direct uploads: at startup, then every 10 minutes. Never fails startup.
     const sweep = () =>
@@ -2058,151 +2038,29 @@ export class Runtime {
   }
 
   /**
-  /**
-   * On a shared database a job belongs to the instance that claimed it, and that instance may be
-   * gone. So a claim is a lease: the instance running a job renews it on every heartbeat, and a
-   * job whose lease ran out goes back in the queue for any instance to take.
-   *
-   * The lease is kept in the job's `error` column while it runs (nothing else uses it then), which
-   * needs no change to the table: instances of an older onebase leave it empty, and their jobs
-   * are never taken from them.
-   */
-  private async keepJobs() {
-    if (this.stopped) return;
-    const now = Date.now();
-    try {
-      const reclaimed = await this.withWriter(async (tx) => {
-        for (const id of this.runningJobIds) await tx.run("UPDATE _scheduled SET error = ? WHERE id = ? AND state = 'running'", [leaseMark(now), id]);
-        const { changes } = await tx.run(
-          "UPDATE _scheduled SET state = 'pending', error = NULL WHERE state = 'running' AND error LIKE 'lease:%' AND error < ?",
-          [leaseMark(now - Runtime.jobLeaseMs)],
-        );
-        return changes;
-      });
-      if (reclaimed) this.log.warn(`${reclaimed} scheduled job(s) were left running by an instance that went away. They will run again.`);
-    } catch (err) {
-      this.log.error(`Scheduler: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
-
-  /**
    * Before a shutdown: starts no more scheduled jobs or crons, then waits for the calls and jobs
    * already running, up to `ms`. Resolves to whether everything finished.
    */
   async drain(ms: number): Promise<boolean> {
     this.draining = true;
     this.cronRunner?.stop();
-    if (this.schedulerTimer) clearTimeout(this.schedulerTimer);
+    this.scheduler.drain();
     const until = Date.now() + ms;
-    while (this.calls.active > 0 || this.runningJobs > 0) {
+    while (this.calls.active > 0 || this.scheduler.running > 0) {
       if (Date.now() >= until) return false;
       await new Promise((r) => setTimeout(r, 20));
     }
     return true;
   }
 
+  /** Re-arms the scheduler's timer: call it after a job was added or made due. */
   pokeScheduler() {
-    if (this.stopped || this.draining) return;
-    void this.withReader((tx) => tx.get("SELECT MIN(run_at) AS at FROM _scheduled WHERE state = 'pending'"))
-      .then((next) => {
-        if (this.stopped) return;
-        if (this.schedulerTimer) clearTimeout(this.schedulerTimer);
-        this.schedulerTimer = null;
-        if (next?.at === null || next?.at === undefined) return;
-        const delay = Math.min(Math.max(0, Number(next.at) - Date.now()), 2 ** 31 - 1);
-        this.schedulerTimer = setTimeout(() => void this.runDueJobs(), delay);
-      })
-      .catch((err) => this.log.error(`Scheduler: ${err instanceof Error ? err.message : String(err)}`));
+    this.scheduler.poke();
   }
 
-  /**
-   * Jobs left `running` by a process that died mid-job (a crash, SIGKILL, a lost machine) go back
-   * to pending and run again (docs/scheduling.md): a migration's or workflow's next step continues
-   * on its own. A mutation job never committed (it's marked done in its own transaction), so it
-   * still runs exactly once; an action may run a second time, as documented.
-   *
-   * With a database only this process uses, every running job at startup is such a leftover. With
-   * a shared one, a job with a lease is left to keepJobs(). One without (claimed by an older
-   * onebase) counts as abandoned once it was claimed (run_at is set to the claim time) longer ago
-   * than its time limit allows, plus a minute.
-   */
-  async recoverInterruptedJobs(now = Date.now()) {
-    if (this.stopped) return;
-    const limitOf = (ms: number) => (ms > 0 ? ms : 60 * 60_000) + 60_000;
-    const cutoff = (type: string | undefined) =>
-      !this.driver.shared ? Infinity : now - limitOf(type === "mutation" ? this.timeLimits.mutationMs : this.timeLimits.actionMs);
-    try {
-      const recovered = await this.withWriter(async (tx) => {
-        const jobs = (await tx.all("SELECT id, fn, run_at, error FROM _scheduled WHERE state = 'running'")) as { id: string; fn: string; run_at: number; error: string | null }[];
-        let n = 0;
-        for (const job of jobs) {
-          // On a shared database a leased job is alive while its lease is renewed: keepJobs decides.
-          if (this.driver.shared && String(job.error ?? "").startsWith("lease:")) continue;
-          const type = this.functions.get(job.fn)?.type;
-          if (Number(job.run_at) >= cutoff(type)) continue;
-          n += (await tx.run("UPDATE _scheduled SET state = 'pending', run_at = ?, error = NULL WHERE id = ? AND state = 'running'", [now, job.id])).changes;
-        }
-        return n;
-      });
-      if (recovered) this.log.info(`Scheduler: recovered ${recovered} job(s) interrupted by a stopped server.`);
-    } catch (err) {
-      this.log.error(`Scheduler: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
-
-  private async runDueJobs() {
-    // Every slot is taken: a finishing job pokes the scheduler again.
-    const free = MAX_RUNNING_JOBS - this.runningJobs;
-    if (free <= 0 || this.draining) return;
-    // Claim each job with a conditional update so that no two runs (or instances) take the same one.
-    const due = await this.withWriter(async (tx) => {
-      const jobs = (await tx.all(
-        "SELECT id, fn, args FROM _scheduled WHERE state = 'pending' AND run_at <= ? ORDER BY run_at LIMIT ?",
-        [Date.now(), free],
-      )) as { id: string; fn: string; args: string }[];
-      const claimed = [];
-      for (const job of jobs) {
-        // run_at becomes the claim time (recoverInterruptedJobs); on a shared database the claim is also a lease (keepJobs).
-        const now = Date.now();
-        const { changes } = await tx.run("UPDATE _scheduled SET state = 'running', run_at = ?, error = ? WHERE id = ? AND state = 'pending'", [now, this.driver.shared ? leaseMark(now) : null, job.id]);
-        if (changes === 1) claimed.push(job);
-      }
-      return claimed;
-    }).catch((err) => {
-      this.log.error(`Scheduler: ${err instanceof Error ? err.message : String(err)}`);
-      return [];
-    });
-    // Jobs run on their own, so a slow or stuck one never holds up the jobs due after it.
-    for (const job of due) {
-      this.runningJobs++;
-      this.runningJobIds.add(job.id);
-      void this.runJob(job).finally(() => {
-        this.runningJobs--;
-        this.runningJobIds.delete(job.id);
-        this.pokeScheduler();
-      });
-    }
-    this.pokeScheduler();
-  }
-
-  private async runJob(job: { id: string; fn: string; args: string }) {
-    const setState = (tx: Exec, state: string, error: string | null = null) =>
-      tx.run("UPDATE _scheduled SET state = ?, error = ? WHERE id = ?", [state, error, job.id]);
-    try {
-      const args = JSON.parse(job.args);
-      const fn = this.functions.get(job.fn);
-      if (fn?.type === "mutation") {
-        // Exactly once: the job is marked done in the mutation's own transaction.
-        await this.runMutation(job.fn, args, { allowInternal: true, source: "scheduler", settle: "none", inTransaction: (tx) => setState(tx, "done") });
-      } else {
-        await this.call(job.fn, args, { allowInternal: true, source: "scheduler" });
-        await this.withWriter((tx) => setState(tx, "done"));
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      this.log.error(`Scheduled ${job.fn} failed: ${message}`);
-      await this.withWriter((tx) => setState(tx, "failed", message)).catch(() => {});
-    }
+  /** Puts jobs a stopped server left running back in the queue (see Scheduler.recoverInterrupted). */
+  recoverInterruptedJobs(now = Date.now()) {
+    return this.scheduler.recoverInterrupted(now);
   }
 
   stop() {
@@ -2210,8 +2068,7 @@ export class Runtime {
     this.actionPool?.stop();
     this.queryPool?.stop();
     this.cronRunner?.stop();
-    if (this.schedulerTimer) clearTimeout(this.schedulerTimer);
-    if (this.heartbeat) clearInterval(this.heartbeat);
+    this.scheduler.stop();
     if (this.uploadSweeper) clearInterval(this.uploadSweeper);
   }
 }

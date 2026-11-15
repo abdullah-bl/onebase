@@ -39,6 +39,37 @@ This applies on SQLite only. With Postgres, MySQL or Turso, other instances lear
 
 A query that reads the clock or a random source (`Date.now()`, `new Date()`, `Math.random()`, `performance.now()`, `crypto.randomUUID()` or `crypto.getRandomValues()`) runs for every read, so its one-off results stay as fresh as before. onebase can't see other things a query might depend on, such as a file, an environment variable or a module-level variable. A result based on those stays until a write or deploy drops it, which is also how a subscribed query behaves.
 
+### Live queries on worker threads
+
+After a write, every live query it affects runs again. The write only waits for its own client's queries. The rest re-run in the background, but on the main thread. With many per-user subscriptions to one query, say 2,000 users each watching their own feed, that can be tens of milliseconds of main-thread work per write.
+
+On SQLite, `ONEBASE_QUERY_WORKERS=2` moves those background re-runs to worker threads. Each worker loads its own copy of your code and opens its own read-only connection to the database file. A re-run is sent to a worker only after the write that caused it has committed, so it always sees that write. Everything else still runs on the main thread:
+
+- a subscription's first result
+- the queries a write waits for
+- one-off reads
+- re-runs after a deploy
+
+The default is `0`, which keeps every query on the main thread.
+
+A query on a worker can do everything a query can, with the same results and errors. Like action workers, each has its own copy of your modules, so a module-level variable a query reads isn't shared with the main thread. It also gets the same read limit and the same time limit. One that runs past its time limit is stopped with its worker, even in the middle of `while (true) {}`. A new worker takes its place.
+
+Two cases run on the main thread from then on: a query that uses a function handle, and every query if the workers can't load your code (with a warning). After a deploy, or a change to environment variables, no result from the old code is delivered: queries running on the old code's workers run again on the new code.
+
+Each worker costs about 15–30 MB of memory. Measured with `bun scripts/bench-query-workers.ts`: 2,000 per-user subscribers to one query, on a 20-core machine.
+
+| Query | Workers | Main thread busy per write | Longest stall | Until all are updated |
+| --- | --- | --- | --- | --- |
+| Reads ~50 documents, filters in JS | 0 | 102 ms | 8 ms | 88 ms |
+| | 2 | 21 ms | 1 ms | 50 ms |
+| | 4 | 23 ms | 2 ms | 36 ms |
+| Two indexed reads | 0 | 38 ms | 7 ms | 38 ms |
+| | 2 | 28 ms | 2 ms | 32 ms |
+
+The write itself returns in 1–3 ms either way. Finding the affected queries and sending each subscriber its result stay on the main thread, so the cheaper the query, the less workers save.
+
+Workers are off in dev mode, for in-memory databases, and for code passed to the runtime in memory. Postgres, MySQL and libSQL always run queries on the main thread.
+
 ## Mutations
 
 Mutations write data in a transaction: either all of their writes happen, or none do.
@@ -133,7 +164,7 @@ A query or mutation may run for 10 seconds, and an action (including an HTTP act
 
 An action's worker is stopped when its time is up, even in the middle of `while (true) {}`. Other actions running on the same worker finish first if the worker still responds. If it doesn't, they fail too, since they were stuck behind it.
 
-Queries and mutations run on the main thread, and JavaScript can't stop a function in the middle of an `await`. So a query or mutation keeps running until it next yields. Anything it then tries fails with the same error, so it can't read or write any more, call other functions, or schedule them. Code that never yields, such as `while (true) {}`, can't be stopped this way and blocks the whole server. The same goes for actions with `ONEBASE_ACTION_WORKERS=0`.
+Queries and mutations run on the main thread, and JavaScript can't stop a function in the middle of an `await`. So a query or mutation keeps running until it next yields. Anything it then tries fails with the same error, so it can't read or write any more, call other functions, or schedule them. Code that never yields, such as `while (true) {}`, can't be stopped this way and blocks the whole server. (A background re-run on a [query worker](#live-queries-on-worker-threads) is the exception: its worker is stopped.) The same goes for actions with `ONEBASE_ACTION_WORKERS=0`.
 
 The limit counts from when the call gets its database snapshot (a query), the write lock (a mutation) or a worker (an action), not from when it was queued. A mutation called from a mutation shares its caller's limit; one called from an action gets its own.
 

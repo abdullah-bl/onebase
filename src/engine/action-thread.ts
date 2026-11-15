@@ -13,6 +13,8 @@ import { indexCode, lookupRoute, type IndexedCode, type MountCode } from "./code
 import { OnebaseError } from "./database";
 import { currentFunction } from "./guard";
 import type { HttpRouter } from "../server";
+import { serveQueries } from "./query-thread";
+import type { ToQueryThread } from "./query-wire";
 import type { ProjectCode } from "./runtime";
 
 type Loaded = IndexedCode & { http: HttpRouter | null };
@@ -245,9 +247,12 @@ export function serveActions(embedded?: () => ProjectCode | Promise<ProjectCode>
     }
   };
 
-  self.onmessage = async (event: MessageEvent<ToThread>) => {
+  self.onmessage = async (event: MessageEvent<ToThread | Extract<ToQueryThread, { t: "init-query" }>>) => {
     const m = event.data;
     switch (m.t) {
+      // The same entry point serves query workers (see query-pool.ts), so a built binary has both.
+      case "init-query":
+        return serveQueries(m, load);
       case "init":
         try {
           const loaded = await load(m.source);

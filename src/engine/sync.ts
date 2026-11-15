@@ -11,7 +11,10 @@ type Listener = (update: QueryUpdate, json?: string) => void;
 /** One subscription: who asked, on whose behalf (a connection, say), and the entry serving it now. */
 type Sub = { identity: UserIdentity | null; owner: object | undefined; entry: Entry };
 
-/** Live queries re-run in the background this many at a time, giving way to other work every few milliseconds. */
+/**
+ * Live queries re-run in the background this many at a time (or, with query workers, as many as
+ * they take), giving way to other work every few milliseconds.
+ */
 const BACKGROUND_BATCH = 8;
 const BACKGROUND_SLICE_MS = 8;
 
@@ -20,8 +23,24 @@ const QUERY_CACHE_MB = 64;
 const ENTRY_OVERHEAD_BYTES = 4096;
 const READ_OVERHEAD_BYTES = 128;
 
-/** One execution of a query, with its value as JSON. */
-type Run = { value: unknown; readSet: ReadSet; json: string };
+/** One execution of a query, with its value as JSON, and the code generation it ran (see Runtime.codeGeneration). */
+type Run = { update: QueryUpdate; readSet: ReadSet; json: string; generation: number };
+
+/** A successful update from a query worker: its value is parsed from the JSON only if something asks for it. */
+function workerUpdate(json: string): QueryUpdate {
+  let parsed = false;
+  let value: unknown;
+  return {
+    ok: true,
+    get value() {
+      if (!parsed) {
+        value = JSON.parse(json);
+        parsed = true;
+      }
+      return value;
+    },
+  };
+}
 
 /** A value as it goes to a client. Queries return null for undefined; anything else JSON leaves out is sent the same way. */
 const valueJson = (value: unknown) => JSON.stringify(value) ?? "null";
@@ -49,6 +68,8 @@ type Entry = {
   ok: boolean;
   running: Promise<void> | null;
   dirty: boolean;
+  /** Someone waits for the run in progress (or the next): it runs on the main thread, not behind a query worker's queue. */
+  urgent: boolean;
   /** The execution in progress, and the commits made since it started. */
   execution: Promise<Run> | null;
   pending: CommitEvent[];
@@ -208,7 +229,7 @@ export class SubscriptionManager {
   private create(key: string, name: string, args: unknown, identity: UserIdentity | null, source: CallSource) {
     const entry: Entry = {
       key, name, args, identity, shared: this.anonymous.has(name), source, listeners: new Map(), owners: new Map(), stale: false,
-      readSet: null, last: null, lastJson: null, ok: false, running: null, dirty: false, execution: null, pending: [], keys: [], bytes: 0,
+      readSet: null, last: null, lastJson: null, ok: false, running: null, dirty: false, urgent: false, execution: null, pending: [], keys: [], bytes: 0,
     };
     this.entries.set(key, entry);
     this.index.add(entry);
@@ -279,11 +300,16 @@ export class SubscriptionManager {
     if (!this.cacheBytes || this.impure.has(name)) return run();
     const key = this.key(name, args, identity);
     const entry = this.entries.get(key);
-    if (!entry) return (await this.create(key, name, args, identity, source).execution!).json;
+    if (!entry) {
+      const first = await this.create(key, name, args, identity, source).execution!;
+      // The code was replaced while it ran.
+      return first.generation === this.runtime.codeGeneration ? first.json : run();
+    }
     if (entry.execution) {
       // Its snapshot may predate a commit this caller already knows about.
       if (entry.pending.length) return run();
       const shared = await entry.execution;
+      if (shared.generation !== this.runtime.codeGeneration) return run();
       // A run that read the identity answers only the one it ran as.
       if (shared.readSet.impure || (entry.shared && shared.readSet.identity)) return run();
       this.runtime.calls.record(name, "query", source);
@@ -323,7 +349,9 @@ export class SubscriptionManager {
     this.index.remove(entry);
   }
 
-  private refresh(entry: Entry): Promise<void> {
+  /** `background`: nobody waits for this run, so it may go to a query worker. */
+  private refresh(entry: Entry, background = false): Promise<void> {
+    if (!background) entry.urgent = true;
     if (entry.running) {
       entry.dirty = true;
       return entry.running;
@@ -331,33 +359,54 @@ export class SubscriptionManager {
     entry.running = (async () => {
       do {
         entry.dirty = false;
-        await this.execute(entry);
+        await this.execute(entry, !entry.urgent);
       } while (entry.dirty && entry.listeners.size > 0);
     })().finally(() => {
       entry.running = null;
+      entry.urgent = false;
       if (entry.listeners.size === 0 && this.entries.get(entry.key) === entry) this.park(entry);
     });
     return entry.running;
   }
 
-  /** `reads` is filled in as the query runs, so what it read is known even when it throws. */
-  private async run(entry: Entry, reads: ReadSet): Promise<Run> {
-    const { value, readSet } = await this.runtime.runQuery(entry.name, entry.args, { identity: entry.identity, source: entry.source, readSet: reads });
-    return { value, readSet, json: valueJson(value) };
+  /**
+   * `reads` is filled in as the query runs, so what it read is known even when it throws. A
+   * background run goes to a query worker when there is one.
+   */
+  private async run(entry: Entry, reads: ReadSet, background: boolean): Promise<Run> {
+    const generation = this.runtime.codeGeneration;
+    const opts = { identity: entry.identity, source: entry.source, readSet: reads };
+    const onWorker = background ? this.runtime.runQueryOnWorker(entry.name, entry.args, opts) : null;
+    if (onWorker) {
+      const { json, readSet } = await onWorker;
+      return { update: workerUpdate(json), readSet, json, generation };
+    }
+    const { value, readSet } = await this.runtime.runQuery(entry.name, entry.args, opts);
+    return { update: { ok: true, value }, readSet, json: valueJson(value), generation };
   }
 
-  private async execute(entry: Entry) {
+  private async execute(entry: Entry, background = false) {
     entry.pending = [];
     entry.stale = false;
     this.executing.add(entry);
     this.counts.runs++;
     const reads: ReadSet = { ids: new Set(), ranges: [] };
-    const execution = (entry.execution = this.run(entry, reads));
+    const generation = this.runtime.codeGeneration;
+    const execution = (entry.execution = this.run(entry, reads, background));
     let update: QueryUpdate;
     let json: string;
     try {
       await execution;
     } catch {}
+    if (this.runtime.codeGeneration !== generation) {
+      // The code was replaced while it ran, so its result (or error) is the old code's. Nobody gets
+      // it: the entry runs again, on the new code.
+      this.executing.delete(entry);
+      entry.execution = null;
+      entry.pending = [];
+      entry.dirty = true;
+      return;
+    }
     if (reads.identity) {
       this.personal.add(entry.name);
       this.anonymous.delete(entry.name);
@@ -386,7 +435,7 @@ export class SubscriptionManager {
       const run = await execution;
       entry.readSet = run.readSet;
       if (run.readSet.impure) this.impure.add(entry.name);
-      update = { ok: true, value: run.value };
+      update = run.update;
       json = run.json;
     } catch (err) {
       const e = this.runtime.toClientError(err, entry.name);
@@ -464,28 +513,33 @@ export class SubscriptionManager {
 
   /** Marks an entry out of date and queues its re-run. */
   private later(entry: Entry) {
-    if (entry.running) return void this.refresh(entry); // re-runs as soon as the run in progress ends
+    if (entry.running) return void this.refresh(entry, true); // re-runs as soon as the run in progress ends
     entry.stale = true;
     this.backlog.add(entry);
     if (!this.pumping) void this.pump();
   }
 
-  /** Works through the backlog a few entries at a time, letting requests and timers run in between. */
+  /**
+   * Works through the backlog a few entries at a time (as many as the query workers take, when
+   * there are some), letting requests and timers run in between.
+   */
   private async pump() {
     this.pumping = true;
     try {
       let since = performance.now();
-      while (this.backlog.size) {
-        const batch: Promise<void>[] = [];
+      const inFlight = new Set<Promise<void>>();
+      while (this.backlog.size || inFlight.size) {
+        const limit = this.runtime.queryWorkerSlots || BACKGROUND_BATCH;
         for (const e of this.backlog) {
+          if (inFlight.size >= limit) break;
           this.backlog.delete(e);
           // Unsubscribed or replaced meanwhile: there is nobody to tell.
           if (e.listeners.size === 0 || this.entries.get(e.key) !== e) continue;
           this.counts.background++;
-          batch.push(this.refresh(e));
-          if (batch.length >= BACKGROUND_BATCH) break;
+          const run: Promise<void> = this.refresh(e, true).finally(() => inFlight.delete(run));
+          inFlight.add(run);
         }
-        await Promise.all(batch);
+        if (inFlight.size) await Promise.race(inFlight);
         if (performance.now() - since >= BACKGROUND_SLICE_MS) {
           await new Promise((resolve) => setImmediate(resolve));
           since = performance.now();

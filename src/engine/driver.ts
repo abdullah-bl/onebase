@@ -138,6 +138,14 @@ function addVectorFunctions(db: Database) {
   db.function("vector_distance_cos", { deterministic: true }, vectorDistanceCos);
 }
 
+/** A read-only connection to a SQLite file the server has open in WAL mode (also used by query workers). */
+export function openSqliteReader(path: string): Database {
+  const reader = new Database(path, { readonly: true, strict: true });
+  reader.run("PRAGMA busy_timeout = 5000");
+  addVectorFunctions(reader);
+  return reader;
+}
+
 export type SqliteSpace = { pages: number; free: number; pageSize: number; autoVacuum: "none" | "full" | "incremental" };
 
 /** How big a SQLite file is, in pages, and how many of them are free. */
@@ -221,10 +229,7 @@ export class SqliteDriver implements Driver {
   }
 
   private openReader(): Database {
-    const reader = new Database(this.path, { readonly: true, strict: true });
-    reader.run("PRAGMA busy_timeout = 5000");
-    addVectorFunctions(reader);
-    return reader;
+    return openSqliteReader(this.path);
   }
 
   get description() {

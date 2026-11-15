@@ -60,7 +60,10 @@ export type AppOptions = {
   cors?: string[];
   /** Per-IP limit on function calls, subscriptions and uploads. */
   rateLimit?: RateLimit | null;
-  trustProxy?: boolean;
+  /** Read the client IP from X-Forwarded-For: true (one proxy) or how many proxies append to it. */
+  trustProxy?: boolean | number;
+  /** Largest request body (and so upload), in bytes (default 1 GB). */
+  maxBodyBytes?: number;
   /** How often open connections re-check their auth token, in ms (default 60s; 0 disables). */
   sessionRecheckMs?: number;
   /** Refuse a pushed bundle that takes longer than this to load (default 30s). */
@@ -130,6 +133,7 @@ export async function startApp(opts: AppOptions) {
     log: consoleLogger,
     loadCode: opts.deploys === false ? null : importBundle,
     loadTimeoutMs: opts.loadTimeoutMs,
+    maxUploadBytes: opts.maxBodyBytes,
     timeLimits: opts.timeLimits,
     source: opts.source,
     actionWorkers: opts.actionWorkers,
@@ -147,6 +151,7 @@ export async function startApp(opts: AppOptions) {
     cors: opts.cors,
     rateLimit: opts.rateLimit,
     trustProxy: opts.trustProxy,
+    maxBodyBytes: opts.maxBodyBytes,
     sessionRecheckMs: opts.sessionRecheckMs,
     admin: adminKey ? createAdmin({ runtime, key: adminKey.key, assets: dashboardAssets, version: VERSION }) : null,
   });
@@ -174,7 +179,8 @@ export async function startApp(opts: AppOptions) {
     if (runtime.actionPool) console.log(`  actions    on up to ${runtime.actionPool.maxThreads} worker thread${runtime.actionPool.maxThreads === 1 ? "" : "s"}`);
     console.log(`  database   ${driver.description}`);
     console.log(`  files      ${blobs.description}`);
-    if (opts.backup) console.log(`  backups    ${opts.backup.url} every ${Math.round(opts.backup.everyMs / 60_000)} min, keep ${opts.backup.keep}`);
+    // Not the query: it may carry accessKeyId/secretAccessKey.
+    if (opts.backup) console.log(`  backups    ${opts.backup.url.replace(/\?.*$/s, "")} every ${Math.round(opts.backup.everyMs / 60_000)} min, keep ${opts.backup.keep}`);
     if (opts.cors?.length && !opts.cors.includes("*")) console.log(`  cors       ${opts.cors.join(", ")}`);
     const limits = runtime.timeLimits;
     if ((Object.keys(limits) as (keyof TimeLimits)[]).some((k) => limits[k] !== DEFAULT_TIME_LIMITS[k])) {

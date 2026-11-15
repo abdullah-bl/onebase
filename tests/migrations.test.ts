@@ -6,7 +6,8 @@ import { defineComponents } from "../src/components";
 import { defineMigration, migrations, type MigrationStatus } from "../src/components/migrations";
 import type { Driver } from "../src/engine/driver";
 import type { Runtime } from "../src/engine/runtime";
-import { anyApi, defineSchema, defineTable, internalMutation, mutation, query } from "../src/server";
+import { Runtime as RuntimeClass } from "../src/engine/runtime";
+import { action, anyApi, defineSchema, defineTable, internalMutation, mutation, query } from "../src/server";
 import { v } from "../src/values";
 import { DRIVERS, openRuntime } from "./helpers";
 
@@ -65,6 +66,7 @@ const modules = {
     cancel: mutation({ args: { name: v.string() }, handler: (ctx: any, { name }) => ctx.components.migrations.cancel({ name }) }),
     bodies: query({ args: {}, handler: async (ctx) => (await ctx.db.query("messages").collect()).map((d: any) => d.body) }),
     logs: query({ args: {}, handler: async (ctx) => (await ctx.db.query("log").collect()).length }),
+    ping: action({ args: {}, handler: async () => "pong" }),
   },
 };
 
@@ -177,6 +179,33 @@ for (const D of DRIVERS) describe(`${D.name}: migrations`, () => {
     await expect(
       runtime.runMutation("components/migrations:migrate", { name: "x", runner: "backfill:upper" }, { allowInternal: true, source: "dashboard" }),
     ).rejects.toThrow("must be a function reference");
+  });
+
+  test("a hard crash mid-batch (SIGKILL) resumes on the next start without another migrate()", async () => {
+    await seed(25);
+    const st = await migrate("upper", { batchSize: 10, maxMs: 0 });
+    expect(st).toMatchObject({ state: "inProgress", processed: 10 });
+    // What a SIGKILL leaves behind: the continuation claimed ('running', claimed a while ago) but
+    // its transaction never committed. Plus an action job that was running at the time.
+    const claimedAt = Date.now() - 60 * 60_000;
+    await driver.write(async (tx) => {
+      const { changes } = await tx.run("UPDATE _scheduled SET state = 'running', run_at = ? WHERE state = 'pending'", [claimedAt]);
+      expect(changes).toBe(1);
+      await tx.run("INSERT INTO _scheduled (id, fn, args, run_at, state) VALUES (?, ?, ?, ?, 'running')", ["crashedaction", "admin:ping", "{}", claimedAt]);
+    });
+    runtime.stop();
+    await driver.close();
+
+    // The next process on the same database. Nobody calls migrate() again.
+    driver = D.make(dir);
+    runtime = new RuntimeClass({ driver, log: { info() {}, warn() {}, error() {} }, schema, modules, components: components as any });
+    await runtime.init();
+    await runtime.startScheduler();
+    await until(async () => (await status("upper"))?.state === "completed");
+    expect(await status("upper")).toMatchObject({ state: "completed", processed: 25 });
+    expect(await bodies()).toEqual(Array.from({ length: 25 }, (_, i) => `M${i}`));
+    // Other interrupted jobs run again too (docs/scheduling.md).
+    await until(async () => (await driver.read((tx) => tx.get("SELECT state FROM _scheduled WHERE id = ?", ["crashedaction"])))?.state === "done");
   });
 
   test("batchSize is checked", async () => {

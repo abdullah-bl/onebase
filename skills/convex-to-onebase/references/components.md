@@ -311,10 +311,12 @@ const room = await presence.listRoom(ctx, roomId);
 ```ts
 // onebase: components.ts
 import { presence } from "onebase/components/presence";
-here: presence({ heartbeatInterval: 10_000, expose: ["heartbeat", "list"] }),
+here: presence({ heartbeatInterval: 10_000, auth: true, expose: ["heartbeat", "list"] }),
 
-// client-side (exposed) or through your own functions
-api.components.here.heartbeat({ room: roomId, user: userId, sessionId });
+// client-side (exposed, with auth: true the user is the signed-in caller)
+api.components.here.heartbeat({ room: roomId, sessionId });
+// or through your own functions (mounted without expose), passing the user yourself
+await ctx.components.here.heartbeat({ room: roomId, user: userId, sessionId });
 useQuery(api.components.here.list, { room: roomId }); // was listRoom
 await ctx.components.here.disconnect({ sessionId }); // was disconnect
 ```

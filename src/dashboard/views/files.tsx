@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from "preact/hooks";
 import { call, on } from "../api";
 import { Empty, Icon, ago, bytes, errorText, fullTime, throttle, toast } from "../ui";
 
-type File = { id: string; createdAt: number; size: number; contentType: string | null; sha256: string };
+type File = { id: string; createdAt: number; size: number; contentType: string | null; sha256: string | null };
 
 export function FilesView() {
   const [files, setFiles] = useState<File[] | null>(null);

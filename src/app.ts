@@ -7,7 +7,7 @@ import { startBackups, type BackupOptions } from "./backup";
 import { createDriver } from "./engine/driver";
 import { LocalBlobs, parseS3Url, S3Blobs } from "./engine/files";
 import type { AuthConfig } from "./engine/jwt";
-import { consoleLogger, DEFAULT_TIME_LIMITS, formatMs, Runtime, type Authenticate, type Modules, type TimeLimits } from "./engine/runtime";
+import { consoleLogger, DEFAULT_TIME_LIMITS, formatMs, jsonLogger, Runtime, type Authenticate, type Modules, type TimeLimits } from "./engine/runtime";
 import { DEFAULT_CALL_LIMITS, formatBytes, type CallLimits } from "./engine/limits";
 import type { ComponentsDefinition } from "./components";
 import type { SchemaDefinition } from "./schema";
@@ -26,6 +26,8 @@ import { VERSION } from "./version";
 export type AppOptions = {
   /** Serve the dashboard at /_admin (default true). */
   dashboard?: boolean;
+  /** Serve the dashboard and admin API only when the request's Host is this (with or without a port). */
+  adminHost?: string;
   /** Accept `onebase deploy` and run what it pushed, instead of the code given here (default true; never in dev). */
   deploys?: boolean;
   schema: SchemaDefinition<any> | null;
@@ -115,6 +117,8 @@ export async function startApp(opts: AppOptions) {
     processEnvVars().apply(await driver.read(readEnvVars));
     code = await opts.load();
   }
+  // ONEBASE_LOG_FORMAT=json: one JSON object per line instead of coloured text.
+  const json = process.env.ONEBASE_LOG_FORMAT?.trim().toLowerCase() === "json";
   const runtime = new Runtime({
     driver,
     driverReady: Boolean(opts.load),
@@ -127,7 +131,7 @@ export async function startApp(opts: AppOptions) {
     crons: code.crons?.jobs ?? [],
     components: code.components ?? null,
     dev: opts.dev,
-    log: consoleLogger,
+    log: json ? jsonLogger : consoleLogger,
     loadCode: opts.deploys === false ? null : importBundle,
     loadTimeoutMs: opts.loadTimeoutMs,
     timeLimits: opts.timeLimits,
@@ -148,6 +152,7 @@ export async function startApp(opts: AppOptions) {
     rateLimit: opts.rateLimit,
     trustProxy: opts.trustProxy,
     sessionRecheckMs: opts.sessionRecheckMs,
+    adminHost: opts.adminHost,
     admin: adminKey ? createAdmin({ runtime, key: adminKey.key, assets: dashboardAssets, version: VERSION }) : null,
   });
   const host = opts.hostname === "0.0.0.0" ? "localhost" : opts.hostname;
@@ -155,7 +160,9 @@ export async function startApp(opts: AppOptions) {
   await runtime.startScheduler();
   const backups = opts.backup ? startBackups(driver, opts.backup, runtime.log, blobs) : null;
 
-  if (!opts.quiet) {
+  if (!opts.quiet && json) {
+    runtime.log.info(`onebase ${VERSION} is serving on http://${host}:${server.port} (${driver.description}, ${runtime.functions.size} functions)`);
+  } else if (!opts.quiet) {
     const names = [...runtime.functions.keys()].filter((n) => !n.startsWith("components/"));
     console.log(`\x1b[1monebase\x1b[0m v${VERSION}${opts.dev ? " (dev)" : ""}`);
     console.log(`  functions  ${names.length}${names.length ? ` (${names.slice(0, 6).join(", ")}${names.length > 6 ? ", …" : ""})` : ""}`);
@@ -195,7 +202,7 @@ export async function startApp(opts: AppOptions) {
     console.log(`  sync       ws://${host}:${server.port}/api/sync`);
     if (adminKey) {
       // In dev the key goes in the link (the #fragment never leaves the browser); otherwise say where it is.
-      const link = `http://${host}:${server.port}/_admin`;
+      const link = opts.adminHost ? `${/^https?:/.test(opts.adminHost) ? "" : "https://"}${opts.adminHost}/_admin` : `http://${host}:${server.port}/_admin`;
       console.log(`  dashboard  ${opts.dev ? `${link}#key=${adminKey.key}` : `${link} (admin key: ${adminKey.source})`}`);
     }
   }

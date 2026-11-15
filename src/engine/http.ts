@@ -23,6 +23,11 @@ export type ServeOptions = {
   trustProxy?: boolean;
   /** Handles /_admin requests (the dashboard). */
   admin?: ((req: Request, url: URL, client: string) => Promise<Response> | Response) | null;
+  /**
+   * Serve /_admin only for requests to this host name (with or without a port), so the dashboard,
+   * which holds the admin key, doesn't share an origin with the app's own pages.
+   */
+  adminHost?: string;
   /** How often open connections re-check their auth token, in ms (default 60s; 0 disables). */
   sessionRecheckMs?: number;
 };
@@ -119,6 +124,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
   const origins = opts.cors?.length && !opts.cors.includes("*") ? new Set(opts.cors.map((o) => o.replace(/\/$/, ""))) : null;
   const limiter = opts.rateLimit ? new RateLimiter(opts.rateLimit) : null;
   const signInLimiter = new RateLimiter(SIGN_IN_LIMIT);
+  const adminHost = opts.adminHost?.replace(/^https?:\/\//i, "").replace(/\/.*$/, "").toLowerCase() || null;
 
   const originAllowed = (req: Request) => {
     const origin = req.headers.get("Origin");
@@ -234,7 +240,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
     }
     try {
       const { name } = runtime.resolve(path, "query", false);
-      const unsubscribe = subscriptions.subscribe(name, args, ws.data.identity, (update, json) => pushQueryUpdate(ws, id, update, json));
+      const unsubscribe = subscriptions.subscribe(name, args, ws.data.identity, (update, json) => pushQueryUpdate(ws, id, update, json), ws);
       ws.data.subs.set(id, { path, args, unsubscribe });
     } catch (err) {
       const e = runtime.toClientError(err);
@@ -353,7 +359,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
         }
         const value =
           msg.kind === "mutation"
-            ? await runtime.runMutation(msg.path, msg.args, { ...opts, beforeCommit: () => ws.data.committed.add(msg.requestId) })
+            ? await runtime.runMutation(msg.path, msg.args, { ...opts, settle: ws, beforeCommit: () => ws.data.committed.add(msg.requestId) })
             : await runtime.runAction(msg.path, msg.args, opts);
         reply(ws, { type: "result", requestId: msg.requestId, ok: true, value } as any);
       } catch (err) {
@@ -377,10 +383,10 @@ export function serve(opts: ServeOptions): Server<SocketData> {
       if (kind === "query") return jsonText(req, `{"status":"success","value":${await subscriptions.query(body.path, body.args, identity, opts.source)}}`);
       const value =
         kind === "mutation"
-          ? await runtime.runMutation(body.path, body.args, opts)
+          ? await runtime.runMutation(body.path, body.args, { ...opts, settle: "none" })
           : kind === "action"
             ? await runtime.runAction(body.path, body.args, opts)
-            : await runtime.call(body.path, body.args, opts);
+            : await runtime.call(body.path, body.args, { ...opts, settle: "none" });
       return json(req, { status: "success", value });
     } catch (err) {
       runtime.log.error(`${body?.path}: ${err instanceof Error ? err.message : String(err)}`);
@@ -473,7 +479,10 @@ export function serve(opts: ServeOptions): Server<SocketData> {
       if (path === "/_onebase/client.js" && opts.clientBundle) {
         return new Response(opts.clientBundle, { headers: { "Content-Type": "text/javascript; charset=utf-8", ...cors(req) } });
       }
-      if (opts.admin && (path === "/_admin" || path.startsWith("/_admin/"))) return opts.admin(req, url, clientIp(req, server));
+      if (opts.admin && (path === "/_admin" || path.startsWith("/_admin/"))) {
+        // On any other host there is no dashboard at all: the path falls through to the app, like any unknown one.
+        if (!adminHost || url.host.toLowerCase() === adminHost || url.hostname.toLowerCase() === adminHost) return opts.admin(req, url, clientIp(req, server));
+      }
 
       const route = runtime.lookupHttp(req.method, path);
       if (route) {

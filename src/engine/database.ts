@@ -23,6 +23,8 @@ export type ReadSet = {
   ranges: ReadRange[];
   /** The query also read the clock or a random source, so its result can't be reused (see guard.ts). */
   impure?: boolean;
+  /** The query asked who is calling, so its result belongs to that identity alone. */
+  identity?: boolean;
 };
 export type Write = { table: string; id: string; before: Doc | null; after: Doc | null };
 

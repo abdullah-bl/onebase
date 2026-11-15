@@ -75,6 +75,8 @@ Options (each $NAME can also come from a .env file):
   --trust-proxy     Take the client IP from X-Forwarded-For (when behind a reverse proxy; $ONEBASE_TRUST_PROXY=1)
   --at <time>       restore: snapshot to use, e.g. 20261022T0300 (default: newest)
   --force           restore: overwrite an existing database
+  --admin-host <h>  Serve the dashboard and admin API only on this host name, e.g. admin.example.com, so they
+                    don't share an origin with your app ($ONEBASE_ADMIN_HOST)
   --no-dashboard    Don't serve the dashboard or admin API at /_admin, which also turns off deploys ($ONEBASE_DASHBOARD=off)
   --no-deploy       Refuse onebase deploy and run the local code, not what was pushed ($ONEBASE_DEPLOY=off)
   --from-file <f>   env set: set every variable in this .env file
@@ -133,6 +135,7 @@ function options(argv: string[]) {
       at: { type: "string" },
       force: { type: "boolean", default: false },
       "no-dashboard": { type: "boolean" },
+      "admin-host": { type: "string" },
       "no-deploy": { type: "boolean" },
       "dry-run": { type: "boolean", default: false },
       check: { type: "boolean", default: false },
@@ -176,6 +179,7 @@ function options(argv: string[]) {
     "rate-limit": values["rate-limit"] ?? env.ONEBASE_RATE_LIMIT,
     "trust-proxy": values["trust-proxy"] ?? enabled(env.ONEBASE_TRUST_PROXY),
     "no-dashboard": values["no-dashboard"] ?? off("ONEBASE_DASHBOARD", env.ONEBASE_DASHBOARD),
+    "admin-host": values["admin-host"] ?? env.ONEBASE_ADMIN_HOST,
     "no-deploy": values["no-deploy"] ?? off("ONEBASE_DEPLOY", env.ONEBASE_DEPLOY),
   };
 }
@@ -222,6 +226,7 @@ function serverOptions(opts: ReturnType<typeof options>) {
     rateLimit: opts["rate-limit"] ? parseRateLimit(opts["rate-limit"]) : null,
     trustProxy: opts["trust-proxy"],
     dashboard: !opts["no-dashboard"],
+    adminHost: opts["admin-host"]?.trim() || undefined,
     deploys: !opts["no-deploy"],
     timeLimits: {
       queryMs: timeLimit("ONEBASE_QUERY_TIMEOUT"),

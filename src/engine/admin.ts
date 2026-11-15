@@ -391,6 +391,55 @@ export function createAdmin(opts: { runtime: Runtime; key: string; assets: Dashb
 
   const wrongKeys = new RateLimiter(WRONG_KEYS);
 
+  // How late a timer fires says how long the one thread was busy with something else. Measured
+  // from the first scrape on, and the worst value since the scrape before is what gets reported.
+  let lagTimer: ReturnType<typeof setInterval> | null = null;
+  let lagMax = 0;
+  const watchLag = () => {
+    if (lagTimer) return;
+    let expected = performance.now() + 250;
+    lagTimer = setInterval(() => {
+      if (runtime.shuttingDown) return clearInterval(lagTimer!);
+      const now = performance.now();
+      lagMax = Math.max(lagMax, now - expected);
+      expected = now + 250;
+    }, 250);
+    lagTimer.unref?.();
+  };
+
+  /** GET /_admin/api/metrics: counters and gauges in the Prometheus text format. */
+  const metrics = async () => {
+    watchLag();
+    const jobs = await runtime.adminRead(async (_db, tx) => tx.all("SELECT state, COUNT(*) AS n FROM _scheduled GROUP BY state"));
+    const sync = runtime.stats.sync();
+    const lines: string[] = [];
+    const add = (name: string, type: "counter" | "gauge", help: string, value: number, labels = "") => {
+      if (!lines.some((l) => l.startsWith(`# TYPE onebase_${name} `))) lines.push(`# HELP onebase_${name} ${help}`, `# TYPE onebase_${name} ${type}`);
+      lines.push(`onebase_${name}${labels} ${Number.isFinite(value) ? value : 0}`);
+    };
+    add("uptime_seconds", "gauge", "Seconds since the server started.", (Date.now() - runtime.startedAt) / 1000);
+    add("memory_rss_bytes", "gauge", "Resident memory of the server process.", process.memoryUsage().rss);
+    add("connections", "gauge", "Open WebSocket connections.", runtime.stats.connections);
+    add("subscriptions", "gauge", "Distinct live queries being kept up to date.", runtime.stats.subscriptions());
+    add("subscriptions_waiting", "gauge", "Live queries out of date and waiting for a background re-run.", sync.waiting);
+    add("calls_active", "gauge", "Function calls running right now.", runtime.calls.active);
+    add("calls_total", "counter", "Function calls finished.", runtime.calls.totals.calls);
+    add("call_errors_total", "counter", "Function calls that failed.", runtime.calls.totals.errors);
+    add("query_runs_total", "counter", "Runs of live and cached queries.", sync.runs);
+    add("query_background_runs_total", "counter", "Live-query re-runs done after the write that caused them had returned.", sync.background);
+    add("queries_shared_total", "counter", "Per-user live queries merged into one shared between users.", sync.shared);
+    add("queries_split_total", "counter", "Shared live queries split per user after reading the caller's identity.", sync.split);
+    add("writes_total", "counter", "Write transactions started.", runtime.stats.writes);
+    add("write_wait_seconds_total", "counter", "Time write transactions spent waiting for the writer.", runtime.stats.writeWaitMs / 1000);
+    add("event_loop_lag_seconds", "gauge", "Longest the server's thread was held up since the last scrape.", lagMax / 1000);
+    lagMax = 0;
+    for (const state of ["pending", "running", "failed"]) {
+      const n = Number(jobs.find((j) => j.state === state)?.n ?? 0);
+      add("scheduled_jobs", "gauge", "Scheduled jobs by state.", n, `{state="${state}"}`);
+    }
+    return new Response(lines.join("\n") + "\n", { headers: { "Content-Type": "text/plain; version=0.0.4; charset=utf-8", "Cache-Control": "no-store" } });
+  };
+
   return async (req: Request, url: URL, client = "unknown"): Promise<Response> => {
     const path = url.pathname;
     if (path === "/_admin" || path === "/_admin/") return new Response(HTML(assetsVersion), { headers: PAGE_HEADERS });
@@ -406,6 +455,7 @@ export function createAdmin(opts: { runtime: Runtime; key: string; assets: Dashb
 
     const name = path.slice("/_admin/api/".length);
     if (name === "events" && req.method === "GET") return events(req);
+    if (name === "metrics" && req.method === "GET") return metrics();
     const handler = api[name];
     if (!handler || req.method !== "POST") return json({ error: `Unknown admin endpoint ${req.method} ${path}` }, 404);
     let body: unknown = {};

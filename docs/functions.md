@@ -29,7 +29,7 @@ export const byAuthor = query({
 });
 ```
 
-A subscribed query re-runs only when a write could change its result. Identical subscriptions (same function, arguments and user) share a single execution.
+A subscribed query re-runs only when a write could change its result. Identical subscriptions (same function, arguments and user) share a single execution. A query that never calls `ctx.auth.getUserIdentity()` is the same for everyone, so all its subscribers share one, whoever they are.
 
 ### Repeated reads
 

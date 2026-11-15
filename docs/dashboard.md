@@ -93,4 +93,5 @@ You can also set `ONEBASE_DASHBOARD=off`. `/_admin` then returns 404.
 
 - **Admin key:** treat it like a database password. Anyone with it can read and change all data and environment variables, and push code with [`onebase deploy`](./deployment.md#onebase-deploy).
 - **Exposure:** the dashboard is served on the same port as your API. If you don't want it reachable from the internet, block `/_admin` at your reverse proxy, or run with `--no-dashboard` and keep a separate internal instance with the dashboard on.
+- **Its own origin:** with `--admin-host admin.example.com` the dashboard and admin API answer only on that host name. Your app's pages are then a different origin, so a script injected into them can't read the key the dashboard holds. `onebase deploy` has to use that host too.
 - **Rotating the key:** delete `admin.key` and restart, or change `ONEBASE_ADMIN_KEY`.

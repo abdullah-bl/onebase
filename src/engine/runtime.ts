@@ -222,13 +222,25 @@ export type CallOptions = {
 };
 
 /** What changed in a commit: exact writes, or (when too large to broadcast) just the tables. */
-export type CommitEvent = { writes: Write[]; tables?: undefined } | { tables: string[]; writes?: undefined };
+export type CommitEvent = ({ writes: Write[]; tables?: undefined } | { tables: string[]; writes?: undefined }) & { settle?: Settle };
+
+/**
+ * Which live queries a write waits for before it returns: the ones subscribed by an owner (a
+ * connection, so its client gets the result and its updates together), "all", or none.
+ */
+export type Settle = object | "all" | undefined;
 
 export const consoleLogger: Logger = {
   info: (m) => console.log(m),
   warn: (m) => console.warn(`\x1b[33mwarn\x1b[0m ${m}`),
   error: (m) => console.error(`\x1b[31merror\x1b[0m ${m}`),
 };
+
+/** One JSON object per line, for log collectors: {"time","level","msg"}. */
+export const jsonLogger: Logger = (() => {
+  const line = (level: string) => (msg: string) => void process.stdout.write(`${JSON.stringify({ time: new Date().toISOString(), level, msg })}\n`);
+  return { info: line("info"), warn: line("warn"), error: line("error") };
+})();
 
 /** Errors whose message is safe and useful to show to callers. */
 function isUserFacing(err: unknown): boolean {
@@ -290,7 +302,15 @@ export class Runtime {
   readonly calls = new CallLog();
   readonly startedAt = Date.now();
   /** Live counts reported by the HTTP layer, for the dashboard. */
-  readonly stats = { connections: 0, subscriptions: () => 0 };
+  readonly stats = {
+    connections: 0,
+    subscriptions: () => 0,
+    /** Live-query work so far: runs, background re-runs, entries shared or split, and re-runs still waiting. */
+    sync: () => ({ runs: 0, background: 0, shared: 0, split: 0, waiting: 0 }),
+    /** Write transactions started, and the time they spent waiting for the writer before that. */
+    writes: 0,
+    writeWaitMs: 0,
+  };
   siteUrl: string;
   private readonly customAuthenticate: Authenticate | null;
   private readonly loadCode: RuntimeOptions["loadCode"];
@@ -916,8 +936,19 @@ export class Runtime {
   /** Runs `fn` in a write transaction, queued behind this process's mutations. */
   withWriter<T>(fn: (tx: Exec) => Promise<T>): Promise<T> {
     // A pipelined driver keeps the order itself, and lets queued writes share a commit.
-    if (this.driver.pipelined) return this.driver.write(fn);
-    return this.mutations.run(() => this.driver.write(fn));
+    const asked = performance.now();
+    let counted = false;
+    const timed = (tx: Exec) => {
+      // Once per write: a retry after a conflict isn't more time in the queue.
+      if (!counted) {
+        counted = true;
+        this.stats.writes++;
+        this.stats.writeWaitMs += performance.now() - asked;
+      }
+      return fn(tx);
+    };
+    if (this.driver.pipelined) return this.driver.write(timed);
+    return this.mutations.run(() => this.driver.write(timed));
   }
 
   withReader<T>(fn: (tx: Exec) => Promise<T>): Promise<T> {
@@ -1135,8 +1166,14 @@ export class Runtime {
 
   // ---- Contexts ----
 
-  private authFor(identity: UserIdentity | null) {
-    return { getUserIdentity: async () => identity };
+  /** `reads`: a query's read set, which records that the query asked who is calling. */
+  private authFor(identity: UserIdentity | null, reads?: ReadSet) {
+    return {
+      getUserIdentity: async () => {
+        if (reads) reads.identity = true;
+        return identity;
+      },
+    };
   }
 
   private warn = (message: string) => this.log.warn(message);
@@ -1263,7 +1300,7 @@ export class Runtime {
   }
 
   /** What a component's functions get besides their database. */
-  private componentBase(mount: MountRuntime, identity: UserIdentity | null, tx: Exec | null) {
+  private componentBase(mount: MountRuntime, identity: UserIdentity | null, tx: Exec | null, reads?: ReadSet) {
     const status = async (table?: string) => {
       const hook = table === undefined ? mount.hooks[0] : mount.hooks.find((h) => h.table === table);
       if (!hook) throw new OnebaseError(`Component "${mount.name}" has no table hook${table === undefined ? "" : ` on "${table}"`}.`);
@@ -1271,7 +1308,7 @@ export class Runtime {
       const state = hookState(progress, hook.fingerprint);
       return { table: hook.table, state, ready: state === "ready" };
     };
-    return { auth: this.authFor(identity), config: mount.config, component: { mount: mount.name }, hooks: { status } };
+    return { auth: this.authFor(identity, reads), config: mount.config, component: { mount: mount.name }, hooks: { status } };
   }
 
   /**
@@ -1287,8 +1324,8 @@ export class Runtime {
       return this.invoke(name, fn, this.queryCtx(db, id, target, state), args, db.readSet);
     };
     const scoped = readerView(db.withScope(mount?.scope ?? TableScope.app));
-    if (mount) return { db: scoped, ...this.componentBase(mount, id, db.tx), runQuery };
-    return { db: scoped, auth: this.authFor(id), storage: this.storageReader(db.tx, db.readSet), runQuery, components: this.componentsProxy("query", { runQuery }) };
+    if (mount) return { db: scoped, ...this.componentBase(mount, id, db.tx, db.readSet), runQuery };
+    return { db: scoped, auth: this.authFor(id, db.readSet), storage: this.storageReader(db.tx, db.readSet), runQuery, components: this.componentsProxy("query", { runQuery }) };
   }
 
   private mutationCtx(state: TxState, identity: UserIdentity | null, mount: MountRuntime | null = null): any {
@@ -1366,7 +1403,7 @@ export class Runtime {
     const guardAll = <T extends Record<string, any>>(obj: T): T =>
       Object.fromEntries(Object.entries(obj).map(([k, v]) => [k, typeof v === "function" ? deadline.guard(v) : v])) as T;
     const runQuery = deadline.guard((ref: FunctionLike, args?: unknown) => this.runQuery(ref, args, opts).then((r) => r.value));
-    const runMutation = deadline.guard((ref: FunctionLike, args?: unknown) => this.runMutation(ref, args, opts));
+    const runMutation = deadline.guard((ref: FunctionLike, args?: unknown) => this.runMutation(ref, args, { ...opts, settle: "none" }));
     const runAction = deadline.guard((ref: FunctionLike, args?: unknown) => this.runAction(ref, args, opts));
     const vectorSearch = deadline.guard(async (table: string, index: string, query: VectorSearchQuery) => {
       const { results } = await this.driver.read((tx) => this.newDb(tx, {}, mount?.scope).vectorSearch(table, index, query));
@@ -1515,13 +1552,13 @@ export class Runtime {
   // ---- Entry points ----
 
   /** Runs a query against a committed snapshot and reports what it read. */
-  async runQuery(ref: FunctionLike, args: unknown, opts: CallOptions = {}): Promise<{ value: unknown; readSet: ReadSet }> {
+  async runQuery(ref: FunctionLike, args: unknown, opts: CallOptions & { /** Filled in as the query runs, so it's known even if the query throws. */ readSet?: ReadSet } = {}): Promise<{ value: unknown; readSet: ReadSet }> {
     const { name, fn, mount } = this.resolve(ref, "query", opts.allowInternal ?? false, this.callerOf(opts));
     return this.calls.track(name, "query", opts.source ?? "function", () =>
       // The limit starts once the query has a snapshot: time spent waiting for one isn't its fault.
       this.driver.read((tx) =>
         this.withinLimit("query", name, async (deadline) => {
-          const readSet: ReadSet = { ids: new Set(), ranges: [] };
+          const readSet: ReadSet = opts.readSet ?? { ids: new Set(), ranges: [] };
           const budget = new CallBudget(name, "query", this.callLimits);
           const db = this.newDb(deadline.exec(tx), { readSet, budget });
           const value = await this.invoke(name, fn, this.queryCtx(db, opts.identity ?? null, mount), args, readSet);
@@ -1539,6 +1576,11 @@ export class Runtime {
       inTransaction?: (tx: Exec) => Promise<unknown>;
       /** Called just before the transaction commits (again if it's retried). */
       beforeCommit?: () => void;
+      /**
+       * The live queries to wait for before returning. Default "all": when this resolves, every
+       * subscriber has the new results. The server's own callers pass a connection or "none".
+       */
+      settle?: object | "all" | "none";
     } = {},
   ): Promise<unknown> {
     const { name, fn, mount } = this.resolve(ref, "mutation", opts.allowInternal ?? false, this.callerOf(opts));
@@ -1549,7 +1591,7 @@ export class Runtime {
           await opts.inTransaction?.(state.tx);
           return value;
         },
-        { beforeCommit: opts.beforeCommit, limit: name },
+        { beforeCommit: opts.beforeCommit, limit: name, settle: opts.settle === "none" ? undefined : (opts.settle ?? "all") },
       ),
     );
   }
@@ -1565,6 +1607,7 @@ export class Runtime {
       scope?: TableScope;
       /** The function this runs, under the mutation time limit; none for the system's own writes. */
       limit?: string;
+      settle?: Settle;
     } = {},
   ): Promise<T> {
     const { beforeCommit, scope = TableScope.app, limit } = opts;
@@ -1591,7 +1634,7 @@ export class Runtime {
     if (revoked.length) this.notifyRevoked(revoked);
     for (const fn of afterCommit) await fn();
     if (scheduled) this.pokeScheduler();
-    if (writes.length) await this.notifyCommit({ writes });
+    if (writes.length) await this.notifyCommit({ writes, settle: opts.settle });
     return value;
   }
 
@@ -1653,7 +1696,7 @@ export class Runtime {
   }
 
   /** Runs any function by name, whatever its type. */
-  async call(ref: FunctionLike, args: unknown, opts: CallOptions = {}): Promise<unknown> {
+  async call(ref: FunctionLike, args: unknown, opts: CallOptions & { settle?: object | "all" | "none" } = {}): Promise<unknown> {
     const { fn } = this.resolve(ref, null, opts.allowInternal ?? false, this.callerOf(opts));
     if (fn.type === "query") return (await this.runQuery(ref, args, opts)).value;
     if (fn.type === "mutation") return this.runMutation(ref, args, opts);
@@ -1831,7 +1874,7 @@ export class Runtime {
       const fn = this.functions.get(job.fn);
       if (fn?.type === "mutation") {
         // Exactly once: the job is marked done in the mutation's own transaction.
-        await this.runMutation(job.fn, args, { allowInternal: true, source: "scheduler", inTransaction: (tx) => setState(tx, "done") });
+        await this.runMutation(job.fn, args, { allowInternal: true, source: "scheduler", settle: "none", inTransaction: (tx) => setState(tx, "done") });
       } else {
         await this.call(job.fn, args, { allowInternal: true, source: "scheduler" });
         await this.withWriter((tx) => setState(tx, "done"));

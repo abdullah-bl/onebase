@@ -47,6 +47,7 @@ Each flag can also be set with an environment variable, which can come from a [.
 | `--cors <origins>` | any, but sign-in only from your site and `localhost` / `$ONEBASE_CORS` | Browser origins allowed to call the API, comma-separated; `*` allows any origin for sign-in too |
 | `--rate-limit <r>` | off / `$ONEBASE_RATE_LIMIT` | Per-IP limit on calls, subscriptions and uploads, e.g. `100/10s`, `600/m` |
 | `--trust-proxy` | off / `$ONEBASE_TRUST_PROXY=1` | Take the client IP from `X-Forwarded-For` |
+| `--admin-host <host>` | any host / `$ONEBASE_ADMIN_HOST` | Serve the dashboard and admin API only on this host name |
 | `--no-dashboard` | dashboard on / `$ONEBASE_DASHBOARD=off` | Don't serve the dashboard or admin API at `/_admin` (this also turns off deploys) |
 | `--no-deploy` | deploys on / `$ONEBASE_DEPLOY=off` | Refuse `onebase deploy` and run the local code instead of what was pushed |
 | `--check` | | `upgrade`: only say whether a newer release exists |

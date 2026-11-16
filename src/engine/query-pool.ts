@@ -4,7 +4,8 @@
 // the writer). Shared databases (Postgres, MySQL, libSQL) always run queries on the main thread.
 //
 // Which runs come here is sync.ts's choice: background re-runs only, the ones nobody is waiting
-// for. Everything else (a subscription's first run, the queries a write waits for, one-off reads)
+// for, and only once a round of them has kept the main thread busy for a few milliseconds, so a
+// small fan-out never pays for a thread. Everything else (a subscription's first run, the queries a write waits for, one-off reads)
 // stays on the main thread.
 //
 // Snapshots: a re-run is sent only after the commit that caused it has finished, and the worker
@@ -33,6 +34,16 @@ export const QUERIES_PER_WORKER = 4;
 
 /** At most this many query workers: one core stays for the main thread. */
 export const maxQueryWorkers = () => Math.max(1, availableParallelism() - 1);
+
+/**
+ * Query workers when nothing says how many: two, or fewer on a small machine, none on a single
+ * core. One worker already takes most of the work off the main thread; the second mostly gets a
+ * large fan-out to its subscribers sooner. They start only when a fan-out is large enough to need
+ * them (see SubscriptionManager.pump), so a small app never starts one.
+ */
+export const defaultQueryWorkers = () => Math.min(2, availableParallelism() - 1);
+/** A round of background re-runs works on the main thread this long before the rest goes to the workers. */
+export const QUERY_WORKERS_AFTER_MS = 4;
 
 export type QueryCall = { name: string; args: unknown; identity: UserIdentity | null };
 
@@ -65,6 +76,8 @@ class Thread {
   idleTimer: ReturnType<typeof setTimeout> | null = null;
   failure: string | null = null;
   functions: string[] = [];
+  /** It has loaded the code and takes queries. */
+  loaded = false;
 
   constructor(entry: string | URL, init: ToQueryThread, onMessage: (thread: Thread, m: FromQueryThread) => void, onExit: (thread: Thread, reason: string) => void) {
     // SHARE_ENV: the code sees the environment variables set from the dashboard, as on the main thread.
@@ -75,6 +88,7 @@ class Thread {
     this.worker.onmessage = ({ data }: MessageEvent<FromQueryThread>) => {
       if (data.t === "ready") {
         this.functions = data.functions;
+        this.loaded = true;
         return settle(true);
       }
       if (data.t === "failed") {
@@ -127,6 +141,16 @@ export class QueryPool {
   /** Whether `name` may run here. False sends it to the main thread, as without workers. */
   accepts(name: string): boolean {
     return !this.broken && !this.mainOnly.has(name);
+  }
+
+  /** Whether a worker has loaded the code, so a query sent now doesn't wait for that. */
+  get warm(): boolean {
+    return this.threads.some((t) => t.loaded && !t.dead);
+  }
+
+  /** Starts the first worker, if there is none, so it is ready by the time it is needed. */
+  warmUp() {
+    if (!this.broken && !this.threads.some((t) => !t.dead)) this.idle(this.spawn());
   }
 
   /** Runs a query on a worker. Never rejects: how it ended is in the outcome. */

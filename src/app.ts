@@ -84,7 +84,7 @@ export type AppOptions = {
   actionWorkers?: number;
   /** The action workers' program, for a binary from `onebase build`. */
   actionWorkerEntry?: string | URL;
-  /** Worker threads that re-run live queries on SQLite (default: $ONEBASE_QUERY_WORKERS, else 0: the main thread). */
+  /** Worker threads that re-run live queries on SQLite (default: $ONEBASE_QUERY_WORKERS, else up to 2; 0: the main thread). */
   queryWorkers?: number;
   /** How much one query or mutation may read and write (default: DEFAULT_CALL_LIMITS). */
   callLimits?: Partial<CallLimits>;

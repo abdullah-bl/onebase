@@ -3,6 +3,7 @@
  *
  *   bun scripts/bench-query-workers.ts            # every configuration, each in its own process
  *   bun scripts/bench-query-workers.ts 2 heavy    # one: 2 workers, the heavier query
+ *   SUBSCRIBERS=10 bun scripts/bench-query-workers.ts   # a small app, where workers have less to give
  *
  * 2,000 subscribers, one per user, to one query that reads the caller's identity, so nothing is
  * shared between them. Each write changes a document every one of them reads. Reported per write
@@ -47,7 +48,7 @@ function pieceMs(): number {
   return (performance.now() - t0) / 2000;
 }
 
-const SUBSCRIBERS = 2000;
+const SUBSCRIBERS = Number(process.env.SUBSCRIBERS ?? 2000);
 const WRITES = 12;
 const WARMUP = 2;
 
@@ -84,7 +85,7 @@ async function one(workers: number, kind: keyof typeof QUERIES) {
      export const feed = query({ args: {}, handler: ${QUERIES[kind]} });`,
   );
   const driver = new SqliteDriver(join(root, "db.sqlite"));
-  const runtime = new Runtime({ driver, ...(await loadProjectCode(dir)), queryWorkers: workers, log: { info() {}, warn() {}, error() {} } });
+  const runtime = new Runtime({ driver, ...(await loadProjectCode(dir)), queryWorkers: workers, queryWorkersAfterMs: process.env.AFTER_MS ? Number(process.env.AFTER_MS) : undefined, log: { info() {}, warn() {}, error() {} } });
   await runtime.init();
   for (let i = 0; i < 50; i++) await runtime.runMutation("notes:add", { text: `n${i}`, owner: `user${i}` }, { settle: "none" });
   const subs = new SubscriptionManager(runtime);
@@ -112,6 +113,8 @@ async function one(workers: number, kind: keyof typeof QUERIES) {
 
   const writer = {}; // a connection with no subscriptions of its own: its write waits for nothing
   const rows: { write: number; stall: number; all: number }[] = [];
+  /** The first write after start: with workers, it also waits for one to load the code. */
+  let first = 0;
   for (let k = 0; k < WARMUP + WRITES; k++) {
     marker = `w${k}-${Math.random().toString(36).slice(2, 8)}`;
     updated = 0;
@@ -124,6 +127,7 @@ async function one(workers: number, kind: keyof typeof QUERIES) {
     const write = performance.now() - t0;
     await done;
     const all = performance.now() - t0;
+    if (k === 0) first = all;
     if (k >= WARMUP) rows.push({ write, stall: lag, all });
   }
   clearInterval(ticker);
@@ -163,6 +167,7 @@ async function one(workers: number, kind: keyof typeof QUERIES) {
     stallMs: median(rows.map((r) => r.stall)),
     mainBusyMs: median(busy),
     allUpdatedMs: median(rows.map((r) => r.all)),
+    firstUpdatedMs: first,
     rssMb: rss,
     workerRuns: runtime.queryWorkerRuns,
   };

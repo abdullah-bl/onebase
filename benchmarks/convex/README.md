@@ -190,7 +190,7 @@ BUSY_ITERATIONS=1000000000 node bench/correctness/busy.mjs convex
 BUSY_ITERATIONS=1000000000 node bench/correctness/busy.mjs onebase
 ```
 
-This test replaced one that looped until `Date.now()` advanced, which can't work on Convex because its clock doesn't advance during a function. The published CPU results came from that older version.
+This test replaced one that looped until `Date.now()` advanced, which can't work on Convex because its clock doesn't advance during a function. The 3-second mutation in the published crash tests came from that older version; the CPU-bound comparison came from this one.
 
 ## Other limit tests
 

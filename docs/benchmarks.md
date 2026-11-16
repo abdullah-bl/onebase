@@ -7,7 +7,7 @@ description: How onebase compared with self-hosted Convex on one machine, how we
 
 In our tests on one machine, onebase used far less memory than self-hosted Convex and was faster at writes and vector search. It lost no acknowledged writes when the process was killed.
 
-Convex won one test: it served a repeated scan about 5× faster, most likely from its query cache. onebase has since added its own cache for repeated reads, [measured separately](#repeated-reads) and not yet compared with Convex. onebase also doesn't isolate long-running functions, hasn't been tested through a power cut, and hasn't been compared with a tuned Convex. Read these numbers as one machine's results, not as a general ranking.
+In the first runs Convex won one test: it served a repeated scan about 5× faster, most likely from its query cache. onebase has since added its own [cache for repeated reads](#repeated-reads), and in a [rerun](#rerun-with-the-cache) the two were level on that test. onebase also doesn't isolate long-running functions, hasn't been tested through a power cut, and hasn't been compared with a tuned Convex. Read these numbers as one machine's results, not as a general ranking.
 
 ## Test setup
 
@@ -20,7 +20,7 @@ Convex won one test: it served a repeated scan about 5× faster, most likely fro
 | onebase | Docker image built from `main` after [PR #22](https://github.com/abdullah-bl/onebase/pull/22), Bun 1.4.4, SQLite in WAL mode. `synchronous=NORMAL` (the default) unless a row says `FULL` |
 | Convex | `ghcr.io/convex/convex-backend:latest` (image `bb1c324d822c`) from the official self-hosted compose file, with default settings and its default SQLite storage |
 | Load | Node 22 on the same machine, sending HTTP requests over loopback. Each worker waits for a reply before sending its next request |
-| Dates | October 29–31, 2026 |
+| Dates | October 29–31, 2026. The [rerun](#rerun-with-the-cache) and the [CPU-bound comparison](#cpu-bound-functions) are from November 16, 2026 |
 
 Both backends ran the same functions, apart from the imports (`convex/*` or `onebase/*`) and the filter syntax in the scan test. The crash and correctness functions exist only on onebase.
 
@@ -50,6 +50,24 @@ Each sustained test ran for 60 seconds. CPU and memory come from `docker stats`,
 No request failed on either side.
 
 These results predate onebase's [cache for repeated reads](./functions.md#repeated-reads).
+
+### Rerun with the cache
+
+We ran the same five tests again on November 16, 2026, one 60-second round each, on the same machine and the same Convex image. onebase was built from commit `cc5035c`, after release 0.3.1, so it had the cache.
+
+| Test | Requests/s: Convex | onebase | CPU: Convex | onebase | Memory: Convex | onebase |
+|---|---|---|---|---|---|---|
+| ping | 10,509 | 10,891 | 179% | 64% | 549 MiB | 43 MiB |
+| scan | 12,337 | 12,578 | 217% | 65% | 553 MiB | 41 MiB |
+| write | 1,085 | **10,540** | 304% | 62% | 1,056 MiB | 53 MiB |
+| bigdoc | 856 | **1,156** | 404% | 108% | 1,215 MiB | 158 MiB |
+| mixed | 2,233 | **10,870** | 329% | 54% | 1,184 MiB | 56 MiB |
+
+No request failed on either side.
+
+The scan is the only result that changed: onebase went from 2,467 to 12,578 requests/s and now matches Convex. Every scan in this test is the same query, so this measures a repeated read, which both backends can serve without running it again. The other four are within the variation between rounds.
+
+Convex's memory is lower than in the first runs because its volume held less write history, not because anything was tuned. It wasn't a new volume either: Convex idled at 494 MiB before the first test.
 
 ### Writes and durability
 
@@ -94,6 +112,28 @@ The memory figures are process RSS at the end of the round. The limit (64 MB by 
 
 1 KB writes didn't measurably slow down, with the cache empty or holding thousands of results: 13,581–14,515/s against 13,734–14,376/s before when empty, and 13,840–14,522/s against 14,044–14,576/s when full (three rounds each).
 
+### CPU-bound functions
+
+A mutation runs a fixed number of iterations of a small integer loop and returns a checksum. The caller measures the time. This ran once on each backend, on November 16, 2026, with the same builds as the rerun above.
+
+| Iterations | Convex | onebase |
+|---|---|---|
+| 50 million | 44 ms | 43 ms |
+| 500 million | 392 ms | 389 ms |
+| 1 billion | 777 ms | 775 ms |
+| 4 billion | failed after 1,006 ms | 3,093 ms |
+
+The checksums matched wherever both finished, so both did the same work, at the same speed. Convex stopped the 4-billion run with a server error after about a second. We didn't look into why, but a limit of that size on a mutation is a protection onebase doesn't have.
+
+We also sent pings while the 1-billion run was going, which took 794 ms on both:
+
+| | Convex | onebase |
+|---|---|---|
+| Pings answered | 56 | 22 |
+| Longest wait | 8 ms | **780 ms** |
+
+Convex kept answering. On onebase one ping waited for the whole mutation, as in the [crash tests](#crash-and-correctness-tests) below.
+
 ### Default limits
 
 | | Convex | onebase |
@@ -134,12 +174,12 @@ These ran on onebase only, once each, with default settings.
 - **Tuned Convex.** Convex ran with its defaults, including at most 16 queries and 16 mutations at once (64 actions, 8 scheduled jobs) and a 4 MiB/s write limit, and these may cap its write numbers. We didn't try raising them, or running on Postgres.
 - **Convex Cloud.** Only the self-hosted backend was tested.
 - **Fair memory numbers for Convex.** Its memory grows with stored write history. The volume had been through several rounds: idle memory was 2.4 GiB here, against 177 MiB on a younger volume.
-- **The cache against Convex.** The Convex comparison above was run before the cache existed, and we didn't confirm that Convex's scan result came from its own cache.
-- **Repeatability.** Each sustained result is mostly a single run. Convex's write results varied by about 25% between rounds, so ignore smaller differences.
+- **Where the scan results come from.** The scan test repeats one query, so it measures each backend's cache, not how fast it scans. We didn't confirm that Convex's result came from its cache. Only the [rerun](#rerun-with-the-cache) had onebase's cache: the write, vector and limit numbers are from before it.
+- **Repeatability.** Each sustained result is mostly a single run, and so is the rerun. Convex's write results varied by about 25% between rounds, so ignore smaller differences.
 - **Other hardware.** Nothing was measured on x86-64. With 121 GiB of RAM, reads came from the page cache and never touched the disk. A smaller machine will behave differently.
 - **A real network.** The load generator ran on the same machine and shared its CPU.
 - **Live queries at scale.** We counted open WebSockets, but didn't measure delivering updates to many subscribers on either side.
 - **Consistency.** We didn't compare the guarantees of Convex's optimistic concurrency with onebase's serial writes.
-- **Long-running functions on Convex.** Our CPU test looped until `Date.now()` advanced. It failed on Convex at 500 ms, but Convex documents a clock that doesn't advance during a function, so the test itself is the likely cause. We have no valid comparison of how each backend handles this.
+- **Long-running actions on Convex.** The [CPU-bound comparison](#cpu-bound-functions) covers a mutation, run once. We didn't compare actions, where onebase uses worker threads, or find out which Convex limit stopped the 4-billion run.
 
-The scripts are in [`benchmarks/convex`](https://github.com/abdullah-bl/onebase/tree/main/benchmarks/convex), with the commands to rerun these tests. A few numbers have no script: disk writes per request, and the vector search runs outside Docker. The CPU test has changed since these runs: it now does a fixed amount of computation instead of watching the clock, so it can run on Convex. Nobody has rerun it yet, so the comparison of long-running functions on Convex is still missing. `bun run bench` in this repository is a different benchmark: it measures onebase's engine in-process, with no HTTP and no Convex.
+The scripts are in [`benchmarks/convex`](https://github.com/abdullah-bl/onebase/tree/main/benchmarks/convex), with the commands to rerun these tests. A few numbers have no script: disk writes per request, and the vector search runs outside Docker. The CPU test in the crash tests looped until `Date.now()` advanced, which can't work on Convex because its clock doesn't advance during a function. The [CPU-bound comparison](#cpu-bound-functions) uses the version that replaced it, with a fixed amount of computation. `bun run bench` in this repository is a different benchmark: it measures onebase's engine in-process, with no HTTP and no Convex.

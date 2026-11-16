@@ -1,6 +1,6 @@
 // onebase's own version, and how versions compare.
 
-export const VERSION = "0.3.0";
+export const VERSION = "0.3.1";
 
 /** [major, minor, patch] of "v1.2.3" or "1.2.3-beta"; null when it isn't a version. */
 export function parseVersion(text: string): [number, number, number] | null {

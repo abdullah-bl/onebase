@@ -16,6 +16,8 @@ export const DEFAULT_KEEP_DAILY = 7;
 export type BackupResult = { key: string; bytes: number; filesUploaded: number };
 
 const SNAPSHOT_PREFIX = "db/onebase-";
+/** Storage ids are lowercase letters and digits. */
+const STORAGE_ID = /^[0-9a-z]+$/;
 
 function stamp(date = new Date()): string {
   return date.toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
@@ -87,15 +89,21 @@ export async function backupNow(driver: Driver, url: string, keep: number, blobs
     const snapshots = (await listKeys(loc, SNAPSHOT_PREFIX)).map((o) => o.key);
     for (const old of snapshotsToDelete(snapshots, keep, keepDaily)) await loc.client.delete(old);
 
-    // Files never change once written, so only new ones are uploaded.
+    // Files never change once written, so only new ones are uploaded. With a secret key they are
+    // encrypted like the snapshot (as <id>.enc), and a copy uploaded in the clear before the key was
+    // set is replaced: otherwise "my backups are encrypted" would be true of new files only.
     let filesUploaded = 0;
     if (blobs instanceof LocalBlobs && existsSync(blobs.dir)) {
       const remote = new Set((await listKeys(loc, "files/")).map((o) => o.key));
       for (const name of readdirSync(blobs.dir)) {
-        const key = `${loc.prefix}files/${name}`;
-        if (remote.has(key)) continue;
-        await loc.client.write(key, Bun.file(join(blobs.dir, name)));
-        filesUploaded++;
+        const plain = `${loc.prefix}files/${name}`;
+        const key = secret ? `${plain}.enc` : plain;
+        if (!remote.has(key)) {
+          const file = Bun.file(join(blobs.dir, name));
+          await loc.client.write(key, secret ? new Response(file.stream().pipeThrough(encryptStream(secret))) : file);
+          filesUploaded++;
+        }
+        if (secret && remote.has(plain)) await loc.client.delete(plain);
       }
     }
     return { key, bytes, filesUploaded };
@@ -173,11 +181,26 @@ export async function restore(url: string, dbPath: string, filesDir: string, opt
   let files = 0;
   mkdirSync(filesDir, { recursive: true });
   for (const { key } of await listKeys(loc, "files/")) {
-    const name = key.slice(`${loc.prefix}files/`.length);
-    // Storage ids are lowercase letters and digits. Any other key isn't one of ours, and a name
-    // like "../../x" would be written outside the files folder.
-    if (!/^[0-9a-z]+$/.test(name) || existsSync(join(filesDir, name))) continue;
-    await Bun.write(join(filesDir, name), loc.client.file(key));
+    const stored = key.slice(`${loc.prefix}files/`.length);
+    const sealed = stored.endsWith(".enc");
+    const name = sealed ? stored.slice(0, -".enc".length) : stored;
+    // Any key that isn't a storage id isn't one of ours, and a name like "../../x" would be
+    // written outside the files folder.
+    if (!STORAGE_ID.test(name) || existsSync(join(filesDir, name))) continue;
+    if (!sealed) {
+      await Bun.write(join(filesDir, name), loc.client.file(key));
+    } else {
+      const secret = secretKey();
+      if (!secret) throw new Error(`The file ${key} is encrypted. Set $${SECRET_KEY_ENV} to the key the server had when it was backed up.`);
+      // Under another name until it's whole: a file that fails to decrypt half way isn't left looking restored.
+      const tmp = join(filesDir, `.restore-${newId()}`);
+      try {
+        await Bun.write(tmp, new Response(loc.client.file(key).stream().pipeThrough(decryptStream(secret))));
+        renameSync(tmp, join(filesDir, name));
+      } finally {
+        rmSync(tmp, { force: true });
+      }
+    }
     files++;
   }
   return { key: chosen.key, files };

@@ -54,6 +54,7 @@ Each flag can also be set with an environment variable, which can come from a [.
 | `--no-dashboard` | dashboard on / `$ONEBASE_DASHBOARD=off` | Don't serve the dashboard or admin API at `/_admin` (this also turns off deploys) |
 | `--no-deploy` | deploys on / `$ONEBASE_DEPLOY=off` | Refuse `onebase deploy` and run the local code instead of what was pushed |
 | `--check` | | `upgrade`: only say whether a newer release exists |
+| `--no-verify` | | `upgrade`: don't check the release's signed build attestation |
 | `--dry-run` | | `deploy`: check the code against the server's data without changing anything |
 | `--rollback` | | `deploy`: go back to the previous deployment |
 | `--env-file <path>` | `.env` files for the command | Read only this file; repeat for several |

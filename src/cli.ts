@@ -85,6 +85,7 @@ Options (each $NAME can also come from a .env file):
   --no-deploy       Refuse onebase deploy and run the local code, not what was pushed ($ONEBASE_DEPLOY=off)
   --from-file <f>   env set: set every variable in this .env file
   --check           upgrade: only say whether a newer release exists
+  --no-verify       upgrade: don't check the release's signed build attestation
   --dry-run         deploy: check the code against the server's data without changing anything
   --rollback        deploy: go back to the previous deployment
   --env-file <path> Read this .env file instead of the defaults (repeatable)
@@ -146,6 +147,7 @@ function options(argv: string[]) {
       "no-deploy": { type: "boolean" },
       "dry-run": { type: "boolean", default: false },
       check: { type: "boolean", default: false },
+      "no-verify": { type: "boolean", default: false },
       rollback: { type: "boolean", default: false },
       "env-file": { type: "string", multiple: true },
       "from-file": { type: "string" },
@@ -534,7 +536,7 @@ export async function main(argv = process.argv.slice(2)) {
     case "env":
       return envCommand({ args: opts.args, url: opts.url, key: process.env.ONEBASE_DEPLOY_KEY?.trim(), fromFile: opts["from-file"] });
     case "upgrade":
-      await upgrade({ version: opts.args[0], check: opts.check, compiled: COMPILED });
+      await upgrade({ version: opts.args[0], check: opts.check, compiled: COMPILED, verify: !opts["no-verify"] });
       return;
     case "build":
       return buildCommand(opts);

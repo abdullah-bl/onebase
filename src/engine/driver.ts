@@ -673,6 +673,14 @@ export class LibsqlDriver implements Driver {
       return result;
     } catch (err) {
       await tx.rollback().catch(() => {});
+      if ((err as any)?.code === "TRANSACTION_TIMEOUT") {
+        // Not a LibsqlError, so it isn't retried: the same work would run out of time again.
+        throw new Error(
+          "The libSQL server ended this transaction because it stayed open too long (sqld and Turso allow about 5 seconds). " +
+            "Every read and write in a function is a round trip to the server, so do less in one mutation: write in several smaller ones, or schedule the rest.",
+          { cause: err },
+        );
+      }
       throw err;
     } finally {
       tx.close();

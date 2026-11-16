@@ -23,7 +23,53 @@ export type UpgradeOptions = {
   current?: string;
   fetch?: (url: string, init?: RequestInit) => Promise<Response>;
   log?: (line: string) => void;
+  /** Set to false to skip checking who built the binary (--no-verify). */
+  verify?: boolean;
+  /** Checks who built the binary; throws if it can't tell (default: verifyProvenance). */
+  provenance?: (binary: Provenance) => Promise<void>;
 };
+
+/** A downloaded release binary: its file name, SHA-256 (hex) and the release's tag. */
+export type Provenance = { name: string; digest: string; tag: string; fetch: NonNullable<UpgradeOptions["fetch"]> };
+
+/** The first release whose binaries were signed. Older ones can only be checked against SHA256SUMS. */
+const FIRST_ATTESTED = "0.3.0";
+
+/**
+ * Checks that GitHub Actions built this exact binary from this repository's release workflow, at
+ * the release's tag. SHA256SUMS can't say that: it sits in the same release, so whoever could
+ * replace the binary could replace it too. The attestation is signed with a short-lived
+ * certificate that Sigstore issued to that workflow run and recorded in a public log; the
+ * signature, the certificate's chain, the log entry and the workflow it names are all checked.
+ */
+export async function verifyProvenance({ name, digest, tag, fetch: get }: Provenance): Promise<void> {
+  const api = `https://api.github.com/repos/${REPO}/attestations/sha256:${digest}`;
+  const res = await get(api, { headers: { Accept: "application/vnd.github+json", "User-Agent": "onebase-cli" } });
+  if (!res.ok && res.status !== 404) throw new Error(`GitHub answered ${res.status} for ${api}${res.status === 403 ? " (rate limited? try again in a while)" : ""}.`);
+  const attestations = res.ok ? (((await res.json()) as { attestations?: { bundle: any }[] }).attestations ?? []) : [];
+  if (!attestations.length) throw new Error(`GitHub has no build attestation for ${name} (sha256 ${digest}), so there's no telling who built it.`);
+
+  const { verify } = await import("sigstore");
+  let reason: unknown;
+  for (const { bundle } of attestations) {
+    try {
+      await verify(bundle, {
+        certificateIssuer: "https://token.actions.githubusercontent.com",
+        certificateIdentityURI: `https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/${tag}`,
+      });
+      // The signature covers this statement, and the statement names the files it is about.
+      const statement = JSON.parse(Buffer.from(bundle.dsseEnvelope.payload, "base64").toString());
+      if (bundle.dsseEnvelope.payloadType !== "application/vnd.in-toto+json" || statement.predicateType !== "https://slsa.dev/provenance/v1") {
+        throw new Error("it isn't a build provenance statement");
+      }
+      if (!statement.subject?.some((s: any) => s?.name === name && s?.digest?.sha256 === digest)) throw new Error("it is about a different file");
+      return;
+    } catch (err) {
+      reason = err;
+    }
+  }
+  throw new Error(`The build attestation for ${name} doesn't hold: ${reason instanceof Error ? reason.message : String(reason)}.`);
+}
 
 export type UpgradeResult = { status: "up-to-date" | "available" | "upgraded" | "not-a-binary"; current: string; release?: string };
 
@@ -90,6 +136,22 @@ export async function upgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
   if (!expected) throw new Error(`SHA256SUMS in ${release.tag_name} doesn't list ${name}.`);
   const actual = new Bun.CryptoHasher("sha256").update(binary).digest("hex");
   if (actual !== expected.toLowerCase()) throw new Error(`${name} doesn't match its SHA-256 in SHA256SUMS (got ${actual}). Nothing was changed.`);
+
+  if (opts.verify === false) {
+    log(`  Not checking who built it (--no-verify).`);
+  } else if (compareVersions(target, FIRST_ATTESTED) < 0) {
+    log(`  onebase ${target} is from before releases were signed, so only its checksum was checked.`);
+  } else {
+    try {
+      await (opts.provenance ?? verifyProvenance)({ name, digest: actual, tag: release.tag_name, fetch: get });
+    } catch (err) {
+      throw new Error(
+        `${err instanceof Error ? err.message : String(err)}\nNothing was changed. If this machine can't reach Sigstore or GitHub's API, ` +
+          `check the binary elsewhere with gh attestation verify ${name} --repo ${REPO}, then pass --no-verify.`,
+      );
+    }
+    log(`  Built by this repository's release workflow at ${release.tag_name} (signed attestation checked).`);
+  }
 
   const exec = opts.execPath ?? process.execPath;
   const fresh = `${exec}.new`;

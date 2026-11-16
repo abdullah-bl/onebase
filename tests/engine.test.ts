@@ -51,9 +51,9 @@ const modules = {
       handler: async (ctx, args) => ctx.db.insert("messages", args as any),
     }),
     sendMany: mutation({
-      args: { count: v.number() },
-      handler: async (ctx, { count }) => {
-        for (let i = 0; i < count; i++) await ctx.db.insert("messages", { channel: "c", author: "a", body: String(i) } as any);
+      args: { count: v.number(), from: v.optional(v.number()) },
+      handler: async (ctx, { count, from = 0 }) => {
+        for (let i = from; i < from + count; i++) await ctx.db.insert("messages", { channel: "c", author: "a", body: String(i) } as any);
       },
     }),
     sendTwiceThenFail: mutation({
@@ -225,7 +225,8 @@ for (const D of DRIVERS) describe(D.name, () => {
           "numItems to be a non-negative integer",
         );
       }
-      await m("messages:sendMany", { count: MAX_PAGE_SIZE + 2 });
+      // In several mutations: over the network every insert is a round trip, and libSQL ends a transaction after 5 seconds.
+      for (let from = 0; from < MAX_PAGE_SIZE + 2; from += 1024) await m("messages:sendMany", { from, count: Math.min(1024, MAX_PAGE_SIZE + 2 - from) });
       const big = await q("messages:page", { paginationOpts: { numItems: 1e9, cursor: null } });
       expect(big.page.length).toBe(MAX_PAGE_SIZE);
       expect(big.isDone).toBe(false);

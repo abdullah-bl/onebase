@@ -235,10 +235,14 @@ describe("Sign in with Apple and email codes", () => {
       expect((await appleSignIn({ idToken: bare.idToken, nonce: bare.nonce })).status).toBe(401);
     });
 
-    test("accepts the raw nonce echoed back, as web sign-in does", async () => {
+    test("refuses the token's own nonce claim sent back as the nonce", async () => {
+      // What someone holding only the token can do: read the claim out of it. Hashed or not, it isn't the raw nonce.
+      const hashed = await fake.identity({ sub: "apple-claim" });
+      const claim = JSON.parse(Buffer.from(hashed.idToken.split(".")[1]!, "base64url").toString()).nonce;
+      expect((await appleSignIn({ idToken: hashed.idToken, nonce: claim })).status).toBe(401);
       const nonce = b64(crypto.getRandomValues(new Uint8Array(16)));
       const { idToken } = await fake.identity({ sub: "apple-raw", nonce });
-      expect((await appleSignIn({ idToken, nonce })).status).toBe(200);
+      expect((await appleSignIn({ idToken, nonce })).status).toBe(401);
     });
 
     test("refuses tokens for another app, another issuer, an expired token and a forged signature", async () => {

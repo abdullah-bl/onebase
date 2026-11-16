@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { SqliteDriver } from "../src/engine/driver";
 import { versionWarning } from "../src/engine/runtime";
 import { checkStorage, STORAGE_VERSION, type Migration } from "../src/engine/storage";
-import { assetName, upgrade } from "../src/upgrade";
+import { assetName, upgrade, verifyProvenance, type Provenance } from "../src/upgrade";
 import { compareVersions, compatibleVersions } from "../src/version";
 import { openRuntime, quiet } from "./helpers";
 
@@ -123,7 +123,7 @@ describe("onebase upgrade", () => {
     chmodSync(path, 0o755);
     return path;
   };
-  const base = { compiled: true, current: "0.2.0", platform: "linux", arch: "x64", log: () => {} };
+  const base = { compiled: true, current: "0.2.0", platform: "linux", arch: "x64", log: () => {}, provenance: async () => {} };
 
   test("names assets as the release workflow does", () => {
     expect(assetName("darwin", "arm64")).toBe("onebase-darwin-arm64");
@@ -152,6 +152,51 @@ describe("onebase upgrade", () => {
     await expect(upgrade({ ...base, execPath: exec, fetch: release("0.3.0", { prints: "garbage" }) })).rejects.toThrow("didn't run");
     expect(readFileSync(exec, "utf8")).toContain("0.2.0");
     expect(existsSync(`${exec}.old`) || existsSync(`${exec}.new`)).toBe(false);
+  });
+
+  test("refuses a binary whose build attestation doesn't hold, unless told not to check", async () => {
+    const exec = installed("unsigned");
+    const seen: Provenance[] = [];
+    const provenance = async (binary: Provenance) => {
+      seen.push(binary);
+      throw new Error("The build attestation for it doesn't hold: certificate identity error.");
+    };
+    await expect(upgrade({ ...base, execPath: exec, fetch: release("0.3.0"), provenance })).rejects.toThrow(/certificate identity error[^]*Nothing was changed[^]*--no-verify/);
+    expect(seen[0]).toMatchObject({ name: ASSET, tag: "v0.3.0", digest: expect.stringMatching(/^[0-9a-f]{64}$/) });
+    expect(readFileSync(exec, "utf8")).toContain("0.2.0");
+    expect(existsSync(`${exec}.old`) || existsSync(`${exec}.new`)).toBe(false);
+
+    const lines: string[] = [];
+    expect(await upgrade({ ...base, execPath: exec, fetch: release("0.3.0"), provenance, verify: false, log: (l) => lines.push(l) })).toMatchObject({ status: "upgraded" });
+    expect(lines.join("\n")).toContain("Not checking who built it");
+    expect(seen.length).toBe(1);
+  });
+
+  test("a release from before signing is installed on its checksum alone, and says so", async () => {
+    const lines: string[] = [];
+    const never = async () => {
+      throw new Error("not asked");
+    };
+    const opts = { ...base, current: "0.1.0", execPath: installed("old-release"), version: "0.2.0", fetch: release("0.2.0"), provenance: never, log: (l: string) => lines.push(l) };
+    expect(await upgrade(opts)).toMatchObject({ status: "upgraded" });
+    expect(lines.join("\n")).toContain("before releases were signed");
+  });
+
+  test("without an attestation on GitHub, or with one that isn't signed, the check fails", async () => {
+    const binary = { name: ASSET, digest: "a".repeat(64), tag: "v0.3.0" };
+    const asked: string[] = [];
+    const none = async (url: string) => (asked.push(url), new Response("{}", { status: 404 }));
+    await expect(verifyProvenance({ ...binary, fetch: none })).rejects.toThrow("no build attestation");
+    expect(asked).toEqual([`https://api.github.com/repos/abdullah-bl/onebase/attestations/sha256:${"a".repeat(64)}`]);
+    // A statement that says the right things but carries no valid signature.
+    const statement = { predicateType: "https://slsa.dev/provenance/v1", subject: [{ name: ASSET, digest: { sha256: binary.digest } }] };
+    const bundle = {
+      mediaType: "application/vnd.dev.sigstore.bundle.v0.3+json",
+      verificationMaterial: { certificate: { rawBytes: Buffer.from("not a certificate").toString("base64") }, tlogEntries: [] },
+      dsseEnvelope: { payload: Buffer.from(JSON.stringify(statement)).toString("base64"), payloadType: "application/vnd.in-toto+json", signatures: [{ sig: Buffer.from("forged").toString("base64") }] },
+    };
+    const forged = async () => Response.json({ attestations: [{ bundle }] });
+    await expect(verifyProvenance({ ...binary, fetch: forged })).rejects.toThrow("doesn't hold");
   });
 
   test("a named version that doesn't exist, and running from source", async () => {

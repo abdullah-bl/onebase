@@ -102,6 +102,7 @@ async function start(name: string, files: Record<string, string>, opts: Partial<
   const started = (await openRuntime(() => new SqliteDriver(join(root, name, "db.sqlite")), {
     ...code,
     queryWorkers: 2,
+    queryWorkersAfterMs: 0, // every background re-run goes to a worker, however small the fan-out
     timeLimits: { queryMs: LIMIT },
     ...opts,
   })) as { runtime: Runtime; driver: SqliteDriver };
@@ -299,6 +300,44 @@ test("a deploy while a worker runs the query: the old code's result is never del
   await until(() => got.at(-1).texts?.includes("y"), "the next write", 8000);
   expect(got.at(-1)).toMatchObject({ v: "v2", where: "worker" });
 });
+
+test("by default a small fan-out stays on the main thread and starts no worker; a large one moves to the workers", async () => {
+  // As `onebase serve` runs it: workers allowed, but only used once a round of re-runs has gone on for a few milliseconds.
+  const app = await start("adaptive", FILES, { queryWorkersAfterMs: undefined });
+  const pool = app.runtime.queryPool!;
+  expect(pool).not.toBeNull();
+  const watchAs = (name: string, args: Record<string, unknown>, who: string) => {
+    const got: any[] = [];
+    app.subs.subscribe(name, args, user(who), (u) => got.push(u.ok ? u.value : u));
+    return got;
+  };
+  const idle = () => until(() => app.subs.waiting === 0, "the background re-runs");
+
+  const few = Array.from({ length: 5 }, (_, i) => watchAs("notes:mine", {}, `u${i}`));
+  await until(() => few.every((w) => w.length > 0), "the first results");
+  for (let i = 0; i < 5; i++) {
+    await app.runtime.runMutation("notes:add", { text: `small${i}`, owner: "u1" }, { settle: "none" });
+    await until(() => few[1]!.at(-1).texts.includes(`small${i}`), `small${i}`);
+    await idle();
+  }
+  expect(few.every((w) => w.at(-1).where === "main")).toBe(true);
+  expect(app.runtime.queryWorkerRuns).toBe(0);
+  expect(pool.size).toBe(0);
+
+  // 80 queries of a few milliseconds each: far more than the main thread does before handing over.
+  const many = Array.from({ length: 80 }, (_, i) => watchAs("notes:slow", { n: 2_000_000 + i }, "u0"));
+  await until(() => many.every((w) => w.length > 0), "the first results", 20_000);
+  for (const text of ["large1", "large2"]) {
+    await app.runtime.runMutation("notes:add", { text }, { settle: "none" });
+    await until(() => many.every((w) => w.at(-1).texts.includes(text)), text, 20_000);
+    await idle();
+  }
+  // The first write's round starts a worker and carries on meanwhile; by the second, it is ready.
+  expect(app.runtime.queryWorkerRuns).toBeGreaterThan(0);
+  expect(many.some((w) => w.at(-1).where === "worker")).toBe(true);
+  // The start of every round still runs on the main thread.
+  expect(many.some((w) => w.at(-1).where === "main")).toBe(true);
+}, 60_000);
 
 test("queryWorkers: 0, dev mode and in-memory code keep every query on the main thread", async () => {
   const off = await start("off", FILES, { queryWorkers: 0 });

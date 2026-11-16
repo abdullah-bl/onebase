@@ -195,6 +195,8 @@ export class SubscriptionManager {
   /** Entries waiting for a background re-run. */
   private backlog = new Set<Entry>();
   private pumping = false;
+  /** The round of background re-runs in progress has run long enough to use the query workers. */
+  private offloadingRound = false;
   /** Counters for /api/metrics. */
   readonly counts = { runs: 0, background: 0, shared: 0, split: 0 };
 
@@ -376,7 +378,7 @@ export class SubscriptionManager {
   private async run(entry: Entry, reads: ReadSet, background: boolean): Promise<Run> {
     const generation = this.runtime.codeGeneration;
     const opts = { identity: entry.identity, source: entry.source, readSet: reads };
-    const onWorker = background ? this.runtime.runQueryOnWorker(entry.name, entry.args, opts) : null;
+    const onWorker = background && this.offloading ? this.runtime.runQueryOnWorker(entry.name, entry.args, opts) : null;
     if (onWorker) {
       const { json, readSet } = await onWorker;
       return { update: workerUpdate(json), readSet, json, generation };
@@ -526,10 +528,14 @@ export class SubscriptionManager {
   private async pump() {
     this.pumping = true;
     try {
-      let since = performance.now();
+      const started = performance.now();
+      let since = started;
       const inFlight = new Set<Promise<void>>();
       while (this.backlog.size || inFlight.size) {
-        const limit = this.runtime.queryWorkerSlots || BACKGROUND_BATCH;
+        // A round that is still going after a few milliseconds is a large fan-out: the rest of it
+        // goes to the query workers. A small one is done before that, with no thread in between.
+        if (!this.offloadingRound && this.backlog.size && performance.now() - started >= this.runtime.queryWorkersAfterMs) this.offloadingRound = true;
+        const limit = (this.offloading && this.runtime.queryWorkerSlots) || BACKGROUND_BATCH;
         for (const e of this.backlog) {
           if (inFlight.size >= limit) break;
           this.backlog.delete(e);
@@ -547,7 +553,13 @@ export class SubscriptionManager {
       }
     } finally {
       this.pumping = false;
+      this.offloadingRound = false;
     }
+  }
+
+  /** Whether background re-runs go to the query workers now (when there are some). */
+  private get offloading(): boolean {
+    return this.offloadingRound || this.runtime.queryWorkersAfterMs === 0;
   }
 
   /** Subscriptions waiting for a background re-run. */

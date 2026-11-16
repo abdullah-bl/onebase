@@ -43,28 +43,33 @@ A query that reads the clock or a random source (`Date.now()`, `new Date()`, `Ma
 
 After a write, every live query it affects runs again. The write only waits for its own client's queries. The rest re-run in the background, but on the main thread. With many per-user subscriptions to one query, say 2,000 users each watching their own feed, that can be tens of milliseconds of main-thread work per write.
 
-On SQLite, `ONEBASE_QUERY_WORKERS=2` moves those background re-runs to worker threads. Each worker loads its own copy of your code and opens its own read-only connection to the database file. A re-run is sent to a worker only after the write that caused it has committed, so it always sees that write. Everything else still runs on the main thread:
+On SQLite, a large fan-out moves to worker threads. A round of background re-runs starts on the main thread; if it is still going after 4 milliseconds, the rest of it is sent to query workers. So a write that a handful of queries depend on is handled exactly as before, with no thread in between and no worker started, while one that thousands depend on stops taking the main thread's time. The first worker starts the first time a round runs that long, and the main thread carries on until it has loaded your code.
+
+Each worker loads its own copy of your code and opens its own read-only connection to the database file. A re-run is sent to a worker only after the write that caused it has committed, so it always sees that write. Everything else still runs on the main thread:
 
 - a subscription's first result
 - the queries a write waits for
 - one-off reads
 - re-runs after a deploy
 
-The default is `0`, which keeps every query on the main thread.
+`ONEBASE_QUERY_WORKERS` sets how many workers there may be. The default is 2, or 1 on a machine with two cores and none with one. `0` keeps every query on the main thread. More than 2 gets a very large fan-out to its subscribers sooner, but takes little more off the main thread.
 
 A query on a worker can do everything a query can, with the same results and errors. Like action workers, each has its own copy of your modules, so a module-level variable a query reads isn't shared with the main thread. It also gets the same read limit and the same time limit. One that runs past its time limit is stopped with its worker, even in the middle of `while (true) {}`. A new worker takes its place.
 
 Two cases run on the main thread from then on: a query that uses a function handle, and every query if the workers can't load your code (with a warning). After a deploy, or a change to environment variables, no result from the old code is delivered: queries running on the old code's workers run again on the new code.
 
-Each worker costs about 15–30 MB of memory. Measured with `bun scripts/bench-query-workers.ts`: 2,000 per-user subscribers to one query, on a 20-core machine.
+Each worker costs about 15–30 MB of memory once it has started; workers beyond the first stop again after 30 idle seconds. Measured with `bun scripts/bench-query-workers.ts`: 2,000 per-user subscribers to one query, on a 20-core machine.
 
 | Query | Workers | Main thread busy per write | Longest stall | Until all are updated |
 | --- | --- | --- | --- | --- |
-| Reads ~50 documents, filters in JS | 0 | 102 ms | 8 ms | 88 ms |
-| | 2 | 21 ms | 1 ms | 50 ms |
-| | 4 | 23 ms | 2 ms | 36 ms |
-| Two indexed reads | 0 | 38 ms | 7 ms | 38 ms |
-| | 2 | 28 ms | 2 ms | 32 ms |
+| Reads ~50 documents, filters in JS | 0 | 100 ms | 8 ms | 86 ms |
+| | 1 | 20 ms | 4 ms | 84 ms |
+| | 2 (default) | 26 ms | 4 ms | 48 ms |
+| | 4 | 25 ms | 4 ms | 36 ms |
+| Two indexed reads | 0 | 36 ms | 7 ms | 37 ms |
+| | 2 (default) | 27 ms | 4 ms | 33 ms |
+
+With 10 subscribers (`SUBSCRIBERS=10`) the numbers are the same with and without workers, because none is started: every subscriber is updated in under a millisecond.
 
 The write itself returns in 1–3 ms either way. Finding the affected queries and sending each subscriber its result stay on the main thread, so the cheaper the query, the less workers save.
 

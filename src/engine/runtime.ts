@@ -9,7 +9,7 @@ import type { SchemaDefinition } from "../schema";
 import { isRegisteredFunction, type CronJob, type HttpAction, type HttpRouter, type RegisteredFunction, type UserIdentity } from "../server";
 import { OneBaseError, describeValue, isPlainObject, validate, type AnyValidator } from "../values";
 import { ActionPool, defaultActionWorkers, defaultWorkerEntry } from "./action-pool";
-import { QueryPool } from "./query-pool";
+import { defaultQueryWorkers, QUERY_WORKERS_AFTER_MS, QueryPool } from "./query-pool";
 import type { CodeSource } from "./action-wire";
 import { checkArgs, checkReturn, indexCode, lookupFunction, lookupRoute, type MountCode } from "./code";
 import { buildCatalog, TableScope, tableMount, validatesTable, type Catalog } from "./catalog";
@@ -164,10 +164,17 @@ export type RuntimeOptions = {
   actionWorkerEntry?: string | URL;
   /**
    * Worker threads that re-run live queries in the background, each with its own read-only
-   * connection (default: $ONEBASE_QUERY_WORKERS, else 0: they re-run on the main thread). Only
-   * for SQLite on a file, outside dev mode, and code with a `source`. See query-pool.ts.
+   * connection (default: $ONEBASE_QUERY_WORKERS, else up to 2, by the machine's cores). 0 keeps
+   * every query on the main thread. Only for SQLite on a file, outside dev mode, and code with a
+   * `source`. See query-pool.ts.
    */
   queryWorkers?: number;
+  /**
+   * How long a round of background re-runs works on the main thread before the rest of it goes to
+   * the query workers (default: QUERY_WORKERS_AFTER_MS). 0 sends every background re-run to a
+   * worker, even while the first one is still loading the code.
+   */
+  queryWorkersAfterMs?: number;
   /** How much one query or mutation may read and write (default: DEFAULT_CALL_LIMITS). */
   callLimits?: Partial<CallLimits>;
   /** Applies stored environment variables to process.env (default: the process's one). */
@@ -382,6 +389,8 @@ export class Runtime {
   /** Re-runs the current code's live queries on worker threads; null: on the main thread. */
   queryPool: QueryPool | null = null;
   private readonly queryWorkers: number;
+  /** See RuntimeOptions.queryWorkersAfterMs. */
+  readonly queryWorkersAfterMs: number;
   /** Live-query re-runs answered by a query worker, for /api/metrics. */
   queryWorkerRuns = 0;
   /**
@@ -434,7 +443,8 @@ export class Runtime {
     this.loadTimeoutMs = opts.loadTimeoutMs ?? 30_000;
     this.actionWorkers = opts.actionWorkers ?? envNumber("ONEBASE_ACTION_WORKERS") ?? defaultActionWorkers();
     this.actionWorkerEntry = opts.actionWorkerEntry ?? defaultWorkerEntry();
-    this.queryWorkers = Math.floor(opts.queryWorkers ?? envNumber("ONEBASE_QUERY_WORKERS") ?? 0);
+    this.queryWorkers = Math.floor(opts.queryWorkers ?? envNumber("ONEBASE_QUERY_WORKERS") ?? defaultQueryWorkers());
+    this.queryWorkersAfterMs = opts.queryWorkersAfterMs ?? QUERY_WORKERS_AFTER_MS;
     this.timeLimits = { ...DEFAULT_TIME_LIMITS };
     for (const [key, ms] of Object.entries(opts.timeLimits ?? {}) as [keyof TimeLimits, number | undefined][]) {
       if (ms === undefined) continue; // unset: keep the default
@@ -1875,6 +1885,12 @@ export class Runtime {
   runQueryOnWorker(name: string, args: unknown, opts: CallOptions & { readSet: ReadSet }): Promise<{ json: string; readSet: ReadSet }> | null {
     const pool = this.queryPool;
     if (!pool || !pool.accepts(name)) return null;
+    // Loading the code takes a worker tens of milliseconds. Unless told to always use workers,
+    // the main thread carries on meanwhile instead of making subscribers wait for that.
+    if (this.queryWorkersAfterMs > 0 && !pool.warm) {
+      pool.warmUp();
+      return null;
+    }
     const generation = this.codeGeneration;
     const { fn, mount } = this.resolve(name, "query", opts.allowInternal ?? false, this.callerOf(opts));
     return this.calls.track(name, "query", opts.source ?? "function", async () => {

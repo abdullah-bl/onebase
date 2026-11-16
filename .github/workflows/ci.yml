@@ -22,6 +22,13 @@ jobs:
       libsql:
         image: ghcr.io/tursodatabase/libsql-server:latest
         ports: ["8080:8080"]
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: onebase
+          MYSQL_DATABASE: onebase
+        ports: ["3306:3306"]
+        options: --health-cmd "mysqladmin ping -h 127.0.0.1 -ponebase" --health-interval 2s --health-timeout 5s --health-retries 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -33,6 +40,8 @@ jobs:
         env:
           TEST_POSTGRES_URL: postgres://postgres:onebase@127.0.0.1:5432/onebase
           TEST_LIBSQL_URL: http://127.0.0.1:8080
+          # Without TLS, MySQL's default sign-in needs the server's public key.
+          TEST_MYSQL_URL: mysql://root:onebase@127.0.0.1:3306/onebase?allowPublicKeyRetrieval=true
       - name: Doctor on every example
         run: for d in examples/*/; do echo "== $d"; (cd "$d" && bun ../../src/cli.ts doctor) || exit 1; done
       - name: Site builds

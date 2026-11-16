@@ -49,7 +49,8 @@
     "@types/react": "19",
     "preact": "10",
     "react": "19",
-    "shiki": "^4.5.0"
+    "shiki": "^4.5.0",
+    "sigstore": "^5.0.1"
   },
   "peerDependencies": {
     "typescript": "^7",

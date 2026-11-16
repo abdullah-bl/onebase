@@ -126,4 +126,37 @@ describe("backup and restore", () => {
     expect((await listBackups(url)).map((b) => b.key)).toEqual([made.key]);
     delete process.env.ONEBASE_SECRET_KEY;
   });
+
+  test("with a secret key, uploaded files are encrypted too, and ones backed up before the key are replaced", async () => {
+    const url = s3.url("sealed-files");
+    const fileKey = `sealed-files/files/${fileId}`;
+    await backupNow(app.driver, url, 2, app.runtime.files.backend);
+    expect(Buffer.from(s3.objects.get(fileKey)!).toString()).toBe("file body");
+
+    process.env.ONEBASE_SECRET_KEY = "k".repeat(40);
+    expect((await backupNow(app.driver, url, 2, app.runtime.files.backend)).filesUploaded).toBe(1);
+    expect(s3.objects.has(fileKey)).toBe(false);
+    const stored = s3.objects.get(`${fileKey}.enc`)!;
+    expect(new TextDecoder().decode(stored.subarray(0, 7))).toBe("OBENC1\n");
+    expect(Buffer.from(stored).includes("file body")).toBe(false);
+    // Already there: nothing to upload the next time.
+    expect((await backupNow(app.driver, url, 2, app.runtime.files.backend)).filesUploaded).toBe(0);
+
+    const to = dir("restore");
+    expect((await restore(url, join(to, "db.sqlite"), join(to, "files"))).files).toBe(1);
+    expect(readFileSync(join(to, "files", fileId), "utf8")).toBe("file body");
+
+    // Leave only a snapshot made without a key, so that what fails below is the file.
+    for (const key of [...s3.objects.keys()]) if (key.startsWith("sealed-files/db/")) s3.objects.delete(key);
+    delete process.env.ONEBASE_SECRET_KEY;
+    await backupNow(app.driver, url, 2);
+    const without = dir("restore");
+    await expect(restore(url, join(without, "db.sqlite"), join(without, "files"))).rejects.toThrow("is encrypted. Set $ONEBASE_SECRET_KEY");
+    process.env.ONEBASE_SECRET_KEY = "another-key-".repeat(4);
+    const wrong = dir("restore");
+    await expect(restore(url, join(wrong, "db.sqlite"), join(wrong, "files"))).rejects.toThrow("can't be decrypted");
+    // Nothing half-written is left looking like a restored file.
+    expect(readdirSync(join(wrong, "files"))).toEqual([]);
+    delete process.env.ONEBASE_SECRET_KEY;
+  });
 });

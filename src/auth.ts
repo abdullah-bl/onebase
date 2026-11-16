@@ -497,9 +497,11 @@ export function apple(
         throw new Error("Apple sign-in needs the random nonce it started with (at least 16 characters).");
       }
       const { claims, profile } = await readToken(idToken, audiences);
-      // Apple echoes the nonce the app gave it: normally sha256(rawNonce) in hex, or the raw nonce itself.
+      // The app gives Apple sha256(rawNonce) in hex, Apple puts that in the token, and the app sends
+      // the raw nonce here. Only the hash is accepted: if the token's own nonce claim were too, anyone
+      // holding a token could read the claim out of it and send that, and the check would prove nothing.
       const echoed = typeof claims.nonce === "string" ? claims.nonce : "";
-      if (!echoed || (echoed !== (await sha256Hex(nonce)) && echoed !== nonce)) throw new Error("This Apple sign-in doesn't match the one that was started.");
+      if (!echoed || echoed !== (await sha256Hex(nonce))) throw new Error("This Apple sign-in doesn't match the one that was started.");
       const exp = typeof claims.exp === "number" ? claims.exp * 1000 : Date.now() + 10 * 60_000;
       return { ...profile, name: cleanName(params.name), once: { key: `apple|${claims.sub}|${echoed}|${exp}`, until: exp + 5 * 60_000 } };
     },

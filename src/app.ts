@@ -5,6 +5,7 @@ import { extname, join, resolve, sep } from "node:path";
 import { RateLimiter, serve, type AssetResolver, type RateLimit } from "./engine/http";
 import { startBackups, type BackupOptions } from "./backup";
 import { createDriver } from "./engine/driver";
+import { startWatchdog } from "./engine/watchdog";
 import { LocalBlobs, parseS3Url, S3Blobs } from "./engine/files";
 import type { AuthConfig } from "./engine/jwt";
 import { consoleLogger, DEFAULT_TIME_LIMITS, formatMs, jsonLogger, Runtime, type Authenticate, type Modules, type TimeLimits } from "./engine/runtime";
@@ -28,6 +29,11 @@ export type AppOptions = {
   dashboard?: boolean;
   /** Serve the dashboard and admin API only when the request's Host is this (with or without a port). */
   adminHost?: string;
+  /**
+   * Stop the process when its main thread has been stuck this long (a function looping without
+   * awaiting), for a supervisor to restart it. Default 0: off. `onebase serve` turns it on at 30s.
+   */
+  watchdogMs?: number;
   /** Accept `onebase deploy` and run what it pushed, instead of the code given here (default true; never in dev). */
   deploys?: boolean;
   schema: SchemaDefinition<any> | null;
@@ -148,6 +154,8 @@ export async function startApp(opts: AppOptions) {
     callLimits: opts.callLimits,
   });
   const { created, dropped } = await runtime.init();
+  const watchdog = opts.watchdogMs ? startWatchdog(opts.watchdogMs) : null;
+  runtime.watchdog = watchdog;
   const server = serve({
     runtime,
     port: opts.port,
@@ -227,6 +235,7 @@ export async function startApp(opts: AppOptions) {
       runtime.log.warn(`Shutting down with ${runtime.calls.active} call(s) still running after ${formatMs(graceMs)}.`);
     }
     runtime.stop();
+    watchdog?.stop();
     await server.stop(true);
     await driver.close();
   };

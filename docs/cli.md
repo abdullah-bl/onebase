@@ -70,6 +70,7 @@ Each flag can also be set with an environment variable, which can come from a [.
 | `ONEBASE_ADMIN_KEY` | Dashboard and deploy key (default: generated into `<data>/admin.key`) |
 | `ONEBASE_DEPLOY_URL`, `ONEBASE_DEPLOY_KEY` | `deploy` and `env`: the server, and its admin key. Keep them in `.env.local`. |
 | `ONEBASE_QUERY_TIMEOUT`, `ONEBASE_MUTATION_TIMEOUT`, `ONEBASE_ACTION_TIMEOUT` | How long a call may run (default `10s`, `10s`, `10m`; `off` for no limit). See [Time limits](./functions.md#time-limits). |
+| `ONEBASE_WATCHDOG` | How long the server's main thread may be stuck before the process stops itself for its supervisor to restart (default `30s`; `off` to disable). See [Time limits](./functions.md#time-limits) |
 | `ONEBASE_MAX_READS`, `ONEBASE_MAX_WRITES`, `ONEBASE_MAX_WRITE_MB`, `ONEBASE_MAX_DOCUMENT_MB` | How much one query or mutation may read and write (default `256000`, `128000`, `128`, `16`; `off` for no limit). See [Read and write limits](./functions.md#read-and-write-limits). |
 | `ONEBASE_QUERY_CACHE_MB` | Memory for repeated query results on SQLite (default `64`; `0` to run every read). See [Repeated reads](./functions.md#repeated-reads). |
 | `ONEBASE_VECTOR_MEMORY_MB` | Memory for SQLite's vector indexes (default `2048`; `0` to search them in SQL). See [Vector search](./vector-search.md#memory-and-threads-on-sqlite). |

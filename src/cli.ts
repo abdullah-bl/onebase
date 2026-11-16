@@ -258,6 +258,8 @@ function serverOptions(opts: ReturnType<typeof options>) {
       mutationMs: timeLimit("ONEBASE_MUTATION_TIMEOUT"),
       actionMs: timeLimit("ONEBASE_ACTION_TIMEOUT"),
     },
+    // Stops a server whose one thread is stuck, so its supervisor restarts it.
+    watchdogMs: timeLimit("ONEBASE_WATCHDOG") ?? 30_000,
     callLimits: {
       documentsRead: callLimit(CALL_LIMIT_ENV.documentsRead),
       documentsWritten: callLimit(CALL_LIMIT_ENV.documentsWritten),

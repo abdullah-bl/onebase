@@ -52,7 +52,7 @@ Deploying 5 source file(s) (6.0 KB) and 1 static file(s) from public/ (7.7 KB) t
 What happens:
 
 1. **On your machine:** `codegen` and `doctor` run, and doctor errors stop the deploy. Your functions and the npm packages they import are bundled into one module. The `public/` folder is included (pick another folder with `--public ./dist`).
-2. **On the server:** the new code is loaded, and auth config and crons are checked. When `schema.ts` changed, every document is checked against the new schema, in the same transaction that updates the indexes, like a Convex push. If any check fails, nothing changes and the old code keeps running.
+2. **On the server:** the new code is loaded, and auth config and crons are checked. When `schema.ts` changed, every document is checked against the new schema, in the same transaction that updates the indexes, like a Convex push. If any check fails, nothing changes and the old code keeps running. On SQLite that check doesn't hold up the server: documents are read 500 at a time before the transaction, with requests served in between, and the transaction only looks again at documents written meanwhile.
 3. **The swap:** new calls use the new code, and calls already running finish with the old code. The replaced deployment's module is dropped from the module cache, so its memory is freed once those calls finish. Connected clients stay connected, and their live queries re-run on the new code.
 
 Two more forms:

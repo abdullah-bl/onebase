@@ -177,6 +177,20 @@ The limit counts from when the call gets its database snapshot (a query), the wr
 
 Change the limits with `ONEBASE_QUERY_TIMEOUT`, `ONEBASE_MUTATION_TIMEOUT` and `ONEBASE_ACTION_TIMEOUT`, e.g. `30s`, `2m`, or `off`. Keep mutations short: while one runs, every other write waits for it.
 
+**Expected duration.** The [dashboard](./dashboard.md) lists a function as slow when its p95 passes 1 second for a query or mutation, or 10 seconds for an action. Some work is long by nature, such as an action that streams a language model's answer. For that work, say how long a call normally takes, in milliseconds. The dashboard then flags the function only when it is slower than that:
+
+```ts
+export const answer = internalAction({
+  args: { turnId: v.id("turns") },
+  expectedMs: 3 * 60_000, // a full answer from the local model
+  handler: async (ctx, { turnId }) => { /* ... */ },
+});
+```
+
+`expectedMs` changes only the dashboard's warning, not the time limit. Keep it below the limit: a call that reaches the limit is stopped, so a larger value could never be passed, and the server warns about it at startup. An [HTTP action](./http-actions.md) takes it as a second argument, `httpAction(handler, { expectedMs })`, and an [MCP tool](./mcp.md) takes it next to `args`.
+
+`expectedMs: Infinity` turns the warning off. It is for a wrapper that lasts as long as the function it runs. The work queue's and workflows' runners set it; the function they run has its own metrics, which show whether it is slow.
+
 ## Read and write limits
 
 One query or mutation may read and write only so much. The defaults are far above Convex's, and are there to stop a runaway call from filling memory or holding the write lock, not to shape normal code.

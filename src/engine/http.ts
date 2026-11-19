@@ -612,7 +612,7 @@ export function serve(opts: ServeOptions): Server<SocketData> {
       if (route) {
         try {
           const identity = await identityFromRequest(req);
-          return await runtime.runHttpAction(route.handler.handler, req, identity, route.mount);
+          return await runtime.runHttpAction(route.handler.handler, req, identity, route.mount, route.handler.expectedMs);
         } catch (err) {
           // A bad or expired session token is the caller's problem, not a server error.
           if (err instanceof AuthError) return new Response(err.message, { status: err.status });

@@ -229,6 +229,8 @@ async function applyOutcome(ctx: Ctx, wf: any, step: any, outcome: Outcome) {
 /** Runs an action step out of band, then records its outcome in a mutation. */
 const runActionStep = internalAction({
   args: { workflowId: v.string(), number: v.number() },
+  // It lasts as long as the step's action, which has its own metrics: never flag this wrapper as slow.
+  expectedMs: Infinity,
   handler: async (ctx, { workflowId, number }) => {
     const step = await ctx.runQuery(stepRow, { workflowId, number });
     if (!step || step.state !== "inProgress") return null;

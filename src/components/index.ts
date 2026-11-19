@@ -8,11 +8,13 @@ import type { GenericDataModel, SchemaDefinition } from "../schema";
 import { v } from "../values";
 import {
   functionBuilder,
+  httpAction,
   isRegisteredFunction,
   type ActionCtx,
   type Auth,
   type FunctionBuilder,
   type HttpAction,
+  type HttpActionOptions,
   type HttpMethod,
   type MutationCtx,
   type QueryCtx,
@@ -191,10 +193,8 @@ export function componentServer<DM extends GenericDataModel, Config = {}>() {
     internalMutation: functionBuilder("mutation", "internal") as FunctionBuilder<"mutation", "internal", ComponentMutationCtx<DM, Config>>,
     internalAction: functionBuilder("action", "internal") as FunctionBuilder<"action", "internal", ComponentActionCtx<DM, Config>>,
     /** A handler for the component's HTTP routes; ctx is the component's action ctx. */
-    httpAction: (handler: (ctx: ComponentActionCtx<DM, Config>, request: Request) => Promise<Response> | Response): HttpAction => ({
-      __onebase: "httpAction",
-      handler: handler as unknown as HttpAction["handler"],
-    }),
+    httpAction: (handler: (ctx: ComponentActionCtx<DM, Config>, request: Request) => Promise<Response> | Response, options?: HttpActionOptions): HttpAction =>
+      httpAction(handler as unknown as HttpAction["handler"], options),
   };
 }
 

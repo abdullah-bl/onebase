@@ -9,7 +9,7 @@ Every onebase server includes a dashboard at **`/_admin`**. It's built into the 
 
 | Page | What you can do |
 |---|---|
-| **Overview** | What needs attention (failed jobs and crons, failing or slow functions, overdue jobs, tables outside the schema), calls and p95 latency over the last minute, 15 minutes or hour, per-function health, what runs next, table sizes, and the setup, with a rollback button when a deployment is live |
+| **Overview** | What needs attention (failed jobs and crons, failing or slow functions (slow means above the function's [`expectedMs`](./functions.md#time-limits) if it declares one), overdue jobs, tables outside the schema), calls and p95 latency over the last minute, 15 minutes or hour, per-function health, what runs next, table sizes, and the setup, with a rollback button when a deployment is live |
 | **Data** | Browse any table, filter (`{"author": "ali"}`) or look up an id, add and edit documents (or double-click a value to change just that field), delete or export a selection |
 | **Schema** | Every table as a card with its fields, types and indexes, and a line from each `v.id()` field to the table it points to. Hover a table to follow its links |
 | **Functions** | Run any function, internal ones included, with JSON arguments (prefilled from its validator), optionally as a signed-in user. Also shows its numbers for the last hour and its latest calls |

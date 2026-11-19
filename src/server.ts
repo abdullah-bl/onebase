@@ -358,6 +358,13 @@ export type RegisteredFunction<
   readonly args?: AnyValidator;
   readonly returns?: AnyValidator;
   readonly handler: (ctx: any, args: any) => any;
+  /**
+   * How long a call normally takes, in ms. The dashboard flags a function as slow only when its p95
+   * is above this (default: 1s for queries and mutations, 10s for actions). Set it on work that is
+   * long by nature, such as an action that streams a model's answer, so real slowness stays visible.
+   * `Infinity` turns the warning off, for a wrapper that lasts as long as the function it runs.
+   */
+  readonly expectedMs?: number;
   /** Type-only markers. */
   readonly __args?: Args;
   readonly __returns?: Returns;
@@ -369,11 +376,20 @@ export interface FunctionBuilder<Type extends FunctionType, Visibility extends F
   <A extends PropertyValidators | AnyValidator, R>(def: {
     args: A;
     returns?: AnyValidator;
+    /** How long a call normally takes, in ms (the dashboard's "slow" threshold for this function). */
+    expectedMs?: number;
     handler: (ctx: Ctx, args: InferArgs<A>) => R;
   }): RegisteredFunction<Type, Visibility, InferArgs<A>, Awaited<R>>;
   <R>(
-    def: { args?: undefined; returns?: AnyValidator; handler: (ctx: Ctx, args: {}) => R } | ((ctx: Ctx, args: {}) => R),
+    def: { args?: undefined; returns?: AnyValidator; expectedMs?: number; handler: (ctx: Ctx, args: {}) => R } | ((ctx: Ctx, args: {}) => R),
   ): RegisteredFunction<Type, Visibility, {}, Awaited<R>>;
+}
+
+/** `expectedMs` is a positive number of ms. Infinity is allowed: it turns the slow warning off. */
+function checkExpectedMs(ms: unknown) {
+  if (ms !== undefined && !(typeof ms === "number" && ms > 0)) {
+    throw new Error(`expectedMs must be a positive number of milliseconds (got ${String(ms)})`);
+  }
 }
 
 export function functionBuilder(type: FunctionType, visibility: FunctionVisibility): any {
@@ -385,6 +401,7 @@ export function functionBuilder(type: FunctionType, visibility: FunctionVisibili
           `${type}({ args: { ... }, handler: async (ctx, args) => { ... } })`,
       );
     }
+    checkExpectedMs(d.expectedMs);
     return {
       __onebase: "function",
       type,
@@ -392,6 +409,7 @@ export function functionBuilder(type: FunctionType, visibility: FunctionVisibili
       args: d.args === undefined ? undefined : asObjectValidator(d.args),
       returns: d.returns,
       handler: d.handler,
+      ...(d.expectedMs !== undefined ? { expectedMs: d.expectedMs } : {}),
     } satisfies RegisteredFunction;
   };
 }
@@ -410,6 +428,7 @@ export function makeServer<DM extends GenericDataModel | AnyDataModel = AnyDataM
     internalAction: functionBuilder("action", "internal") as FunctionBuilder<"action", "internal", ActionCtx<DM, C>>,
     httpAction: httpAction as (
       handler: (ctx: ActionCtx<DM, C>, request: Request) => Promise<Response> | Response,
+      options?: HttpActionOptions,
     ) => HttpAction,
   };
 }
@@ -437,10 +456,16 @@ export type ApiFromModule<M, V extends FunctionVisibility> = {
 export type HttpAction = {
   readonly __onebase: "httpAction";
   readonly handler: (ctx: ActionCtx<any>, request: Request) => Promise<Response> | Response;
+  readonly expectedMs?: number;
+};
+export type HttpActionOptions = {
+  /** How long a request normally takes, in ms. The dashboard flags the route as slow only above this (default: 5s). */
+  expectedMs?: number;
 };
 
-export function httpAction(handler: HttpAction["handler"]): HttpAction {
-  return { __onebase: "httpAction", handler };
+export function httpAction(handler: HttpAction["handler"], options: HttpActionOptions = {}): HttpAction {
+  checkExpectedMs(options.expectedMs);
+  return { __onebase: "httpAction", handler, ...(options.expectedMs !== undefined ? { expectedMs: options.expectedMs } : {}) };
 }
 
 export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS";

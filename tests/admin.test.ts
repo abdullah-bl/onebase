@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { startApp } from "../src/app";
 import { CallLog } from "../src/engine/calllog";
 import { SubscriptionManager } from "../src/engine/sync";
-import { cronJobs, defineSchema, defineTable, internalMutation, mutation, query } from "../src/server";
+import { tool } from "../src/mcp";
+import { cronJobs, defineSchema, defineTable, httpAction, internalMutation, mutation, query } from "../src/server";
 import { v } from "../src/values";
 
 const schema = defineSchema({
@@ -17,6 +18,8 @@ let flakyWorks = false;
 const modules = {
   notes: {
     list: query({ args: {}, handler: (ctx) => ctx.db.query("notes").collect() }),
+    // Long by nature (say, a model streaming an answer): the dashboard judges it against this.
+    summarize: query({ args: {}, expectedMs: 5_000, handler: () => "ok" }),
     add: mutation({
       args: { text: v.string() },
       handler: async (ctx, { text }) => {
@@ -236,6 +239,30 @@ describe("dashboard admin API", () => {
     expect(add.errors).toBeGreaterThanOrEqual(1);
     expect(add.lastError).toContain("args.text must be v.string()");
     expect(add.p95).toBeGreaterThan(0);
+    expect(add.expectedMs).toBeNull();
+  });
+
+  test("a function's expectedMs reaches the metrics, so the dashboard judges it against that", async () => {
+    await app.runtime.runQuery("notes:summarize", {}, { source: "client" });
+    const metrics = await ok("metrics");
+    expect(metrics.functions.find((f: any) => f.name === "notes:summarize")).toMatchObject({ type: "query", expectedMs: 5_000 });
+  });
+
+  test("expectedMs must be a positive number of milliseconds", () => {
+    for (const bad of [0, -5, Number.NaN, "60s"]) {
+      expect(() => query({ args: {}, expectedMs: bad as any, handler: () => null })).toThrow("expectedMs must be a positive number");
+      expect(() => httpAction(() => new Response(), { expectedMs: bad as any })).toThrow("expectedMs must be a positive number");
+    }
+    // Infinity turns the warning off.
+    expect(query({ args: {}, expectedMs: Infinity, handler: () => null }).expectedMs).toBe(Infinity);
+    expect(query({ args: {}, expectedMs: 1500, handler: () => null }).expectedMs).toBe(1500);
+    expect("expectedMs" in query({ args: {}, handler: () => null })).toBe(false);
+  });
+
+  test("HTTP actions and MCP tools carry expectedMs too", () => {
+    expect(httpAction(() => new Response(), { expectedMs: 60_000 }).expectedMs).toBe(60_000);
+    expect("expectedMs" in httpAction(() => new Response())).toBe(false);
+    expect(tool({ description: "d", expectedMs: 60_000, handler: async () => 1 }).expectedMs).toBe(60_000);
   });
 
   test("uploads a file with a token from the dashboard", async () => {
@@ -277,6 +304,48 @@ describe("call metrics", () => {
         if (fail) throw new Error("no");
       })
       .catch(() => {});
+
+  describe("slow functions", () => {
+    const SLOW = 25;
+    const timed = (log: CallLog, name: string, ms: number, expectedMs?: number) =>
+      log.track(name, "query", "client", async () => (ms ? Bun.sleep(ms) : undefined), expectedMs);
+    const stat = (log: CallLog, name: string) => log.metrics().functions.find((f) => f.name === name)!;
+
+    test("a function is slow when its p95 is above its expectedMs", async () => {
+      const log = new CallLog();
+      await Promise.all([timed(log, "a:over", SLOW, 5), timed(log, "a:under", SLOW, 60_000), timed(log, "a:default", SLOW)]);
+      expect(stat(log, "a:over")).toMatchObject({ slow: true, expectedMs: 5 });
+      expect(stat(log, "a:under")).toMatchObject({ slow: false, expectedMs: 60_000 });
+      // No expectedMs: the type's default (1s for a query).
+      expect(stat(log, "a:default")).toMatchObject({ slow: false, expectedMs: null });
+    });
+
+    test("an expectedMs longer than the histogram's old 74s top can still be passed", () => {
+      const log = new CallLog();
+      const at = Date.now();
+      const add = (name: string, ms: number, expectedMs: number) =>
+        (log as any).add({ id: 0, at: at - ms, name, type: "action", source: "client", ms, ok: true, lines: [] }, false, expectedMs);
+      add("a:stream", 10 * 60_000, 3 * 60_000);
+      add("a:fine", 2 * 60_000, 3 * 60_000);
+      expect(stat(log, "a:stream").slow).toBe(true);
+      expect(stat(log, "a:stream").p95).toBe(10 * 60_000);
+      expect(stat(log, "a:fine").slow).toBe(false);
+    });
+
+    test("one slow call in twenty is not a slow p95, two are", async () => {
+      const log = new CallLog();
+      for (const name of ["a:one", "a:two"]) await Promise.all(Array.from({ length: 18 }, () => timed(log, name, 0, 15)));
+      await Promise.all([timed(log, "a:one", 0, 15), timed(log, "a:one", SLOW, 15), timed(log, "a:two", SLOW, 15), timed(log, "a:two", SLOW, 15)]);
+      expect(stat(log, "a:one").slow).toBe(false);
+      expect(stat(log, "a:two").slow).toBe(true);
+    });
+
+    test("expectedMs: Infinity never flags, and shows no expected duration", async () => {
+      const log = new CallLog();
+      await timed(log, "a:runner", SLOW, Infinity);
+      expect(stat(log, "a:runner")).toMatchObject({ slow: false, expectedMs: null });
+    });
+  });
 
   test("adds up calls and errors per function", async () => {
     const log = new CallLog();

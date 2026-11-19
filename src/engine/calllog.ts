@@ -21,8 +21,9 @@ export type CallRecord = {
 const MAX_LINES = 50;
 const MAX_LINE_CHARS = 2000;
 
-// Latency histograms: half-octave buckets from 0.1 ms to about 74 s, so a percentile is within ~20%.
-const HIST_BUCKETS = 40;
+// Latency histograms: half-octave buckets from 0.1 ms to about 3.5 days. A percentile is its bucket's
+// top edge, so it can read up to 41% high. Whether a function is slow is counted exactly instead.
+const HIST_BUCKETS = 64;
 const bucketOf = (ms: number) => (ms <= 0.1 ? 0 : Math.min(HIST_BUCKETS - 1, Math.ceil(2 * Math.log2(ms / 0.1))));
 const bucketTop = (i: number) => 0.1 * 2 ** (i / 2);
 
@@ -33,6 +34,11 @@ const FN_SLOTS = 6;
 const MAX_FN_NAMES = 500;
 const OTHER = "(other)";
 const MAX_ERROR_CHARS = 500;
+
+/** A call is slow above this, unless its function declares its own `expectedMs`. */
+export const SLOW_MS: Record<CallRecord["type"], number> = { query: 1000, mutation: 1000, action: 10_000, http: 5000 };
+/** A function is slow when its p95 is: more than this share of its runs were slow calls. */
+const SLOW_SHARE = 0.05;
 
 function percentile(hist: Uint32Array, count: number, p: number): number | null {
   if (count === 0) return null;
@@ -111,6 +117,10 @@ export type FunctionMetrics = CallSummary & {
   lastAt: number;
   lastError: string | null;
   lastErrorAt: number | null;
+  /** The function's declared normal duration (`expectedMs`); null if it has none or turned the warning off. */
+  expectedMs: number | null;
+  /** Its p95 is above `expectedMs`, or above its type's default. Counted from each run, not read off the histogram. */
+  slow: boolean;
 };
 export type CallMetrics = {
   seconds: CallPoint[];
@@ -125,6 +135,9 @@ type FnSlot = {
   errors: number;
   cached: number;
   runs: number;
+  /** Runs that took longer than the function's slow threshold. */
+  over: number;
+  expectedMs: number | undefined;
   maxMs: number;
   lastAt: number;
   lastError: string | null;
@@ -176,18 +189,19 @@ export class CallLog {
     patchConsole();
   }
 
-  async track<T>(name: string, type: CallRecord["type"], source: CallSource, fn: () => Promise<T>): Promise<T> {
+  /** `expectedMs` is the function's declared normal duration, which replaces its type's slow threshold. */
+  async track<T>(name: string, type: CallRecord["type"], source: CallSource, fn: () => Promise<T>, expectedMs?: number): Promise<T> {
     const lines: LogLine[] = [];
     const at = Date.now();
     const start = performance.now();
     this.active++;
     try {
       const value = await capture.run(lines, fn);
-      this.add({ id: this.nextId++, at, name, type, source, ms: performance.now() - start, ok: true, lines });
+      this.add({ id: this.nextId++, at, name, type, source, ms: performance.now() - start, ok: true, lines }, false, expectedMs);
       return value;
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err);
-      this.add({ id: this.nextId++, at, name, type, source, ms: performance.now() - start, ok: false, error, lines });
+      this.add({ id: this.nextId++, at, name, type, source, ms: performance.now() - start, ok: false, error, lines }, false, expectedMs);
       throw err;
     } finally {
       this.active--;
@@ -199,10 +213,10 @@ export class CallLog {
     this.add({ id: this.nextId++, at: Date.now(), name, type, source, ms: 0, ok: true, lines: [] }, true);
   }
 
-  private add(record: CallRecord, cached = false) {
+  private add(record: CallRecord, cached = false, expectedMs?: number) {
     this.totals.calls++;
     if (!record.ok) this.totals.errors++;
-    this.measure(record, cached);
+    this.measure(record, cached, expectedMs);
     if (this.max > 0) {
       this.records[this.head] = record;
       this.head = (this.head + 1) % this.max;
@@ -212,7 +226,7 @@ export class CallLog {
   }
 
   /** Counts a finished call. Cached answers count as calls, but say nothing about how long functions take. */
-  private measure(record: CallRecord, cached: boolean) {
+  private measure(record: CallRecord, cached: boolean, expectedMs?: number) {
     const now = record.at + record.ms;
     const ms = cached ? null : record.ms;
     this.seconds.add(now, record.ok, ms);
@@ -228,7 +242,7 @@ export class CallLog {
     const name = current.fns.has(record.name) || current.fns.size < MAX_FN_NAMES ? record.name : OTHER;
     let stat = current.fns.get(name);
     if (!stat) {
-      stat = { type: record.type, calls: 0, errors: 0, cached: 0, runs: 0, maxMs: 0, lastAt: 0, lastError: null, lastErrorAt: null, hist: new Uint32Array(HIST_BUCKETS) };
+      stat = { type: record.type, calls: 0, errors: 0, cached: 0, runs: 0, over: 0, expectedMs: undefined, maxMs: 0, lastAt: 0, lastError: null, lastErrorAt: null, hist: new Uint32Array(HIST_BUCKETS) };
       current.fns.set(name, stat);
     }
     stat.calls++;
@@ -236,6 +250,8 @@ export class CallLog {
     if (cached) stat.cached++;
     else {
       stat.runs++;
+      stat.expectedMs = expectedMs;
+      if (record.ms > (expectedMs ?? SLOW_MS[record.type])) stat.over++;
       stat.hist[bucketOf(record.ms)]!++;
       if (record.ms > stat.maxMs) stat.maxMs = record.ms;
     }
@@ -278,6 +294,9 @@ export class CallLog {
         m.errors += s.errors;
         m.cached += s.cached;
         m.runs += s.runs;
+        m.over += s.over;
+        // Slots come oldest first, so this ends as the latest declaration.
+        if (s.runs) m.expectedMs = s.expectedMs;
         m.maxMs = Math.max(m.maxMs, s.maxMs);
         m.lastAt = Math.max(m.lastAt, s.lastAt);
         if (s.lastErrorAt !== null && s.lastErrorAt >= (m.lastErrorAt ?? 0)) {
@@ -301,6 +320,10 @@ export class CallLog {
       lastAt: m.lastAt,
       lastError: m.lastError,
       lastErrorAt: m.lastErrorAt,
+      // Infinity means "never flag this function", which is not a duration to show.
+      expectedMs: m.expectedMs !== undefined && Number.isFinite(m.expectedMs) ? m.expectedMs : null,
+      // The nearest-rank p95 is above the threshold exactly when more than 5% of the runs are.
+      slow: m.over > Math.floor(m.runs * SLOW_SHARE),
     }));
   }
 

@@ -28,9 +28,6 @@ const RANGE_LABEL: Record<Range, string> = { "1m": "minute", "15m": "15 minutes"
 
 // What counts as worth interrupting someone: a real share of calls failing, or calls slow enough to feel.
 const MIN_ERROR_SHARE = 0.01;
-const SLOW_MS = { query: 1000, mutation: 1000, action: 10_000, http: 5000 };
-/** Slow for this function: above its declared `expectedMs`, else above its type's default. */
-const slowAt = (f: { type: keyof typeof SLOW_MS; expectedMs?: number | null }) => f.expectedMs ?? SLOW_MS[f.type];
 const MIN_SLOW_CALLS = 5;
 const MAX_ATTENTION = 5;
 const TOP_FUNCTIONS = 8;
@@ -118,7 +115,7 @@ function attention(overview: Overview | null, metrics: Metrics | null, scheduler
         detail: `${f.errors.toLocaleString()} of ${f.calls.toLocaleString()} in the last hour. ${f.lastError ?? ""}`,
         actions: [{ label: "See errors", primary: true, run: () => go(logsFor(f.name, true)) }],
       });
-    } else if (f.p95 !== null && f.p95 > slowAt(f) && f.calls - f.cached >= MIN_SLOW_CALLS) {
+    } else if (f.p95 !== null && f.slow && f.calls - f.cached >= MIN_SLOW_CALLS) {
       items.push({
         key: `slow-${f.name}`,
         level: "warning",
@@ -329,7 +326,7 @@ function FunctionHealth({ metrics, go }: { metrics: Metrics | null; go: Go }) {
                     </td>
                     <td class="num muted">{f.cached ? percent(f.cached, f.calls) : "–"}</td>
                     <td class="num">{f.p50 === null ? "–" : duration(f.p50)}</td>
-                    <td class={`num ${f.p95 !== null && f.p95 > slowAt(f) ? "slow" : ""}`} title={f.expectedMs ? `Expected up to ${duration(f.expectedMs)}` : undefined}>{f.p95 === null ? "–" : duration(f.p95)}</td>
+                    <td class={`num ${f.slow ? "slow" : ""}`} title={f.expectedMs ? `Expected up to ${duration(f.expectedMs)}` : undefined}>{f.p95 === null ? "–" : duration(f.p95)}</td>
                   </tr>
                 ))}
               </tbody>

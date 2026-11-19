@@ -187,7 +187,9 @@ export const answer = internalAction({
 });
 ```
 
-`expectedMs` changes only the dashboard's warning, not the time limit. The work queue's and workflows' runners already set it, since they last as long as the function they run. That function's own metrics show whether it is slow.
+`expectedMs` changes only the dashboard's warning, not the time limit. Keep it below the limit: a call that reaches the limit is stopped, so a larger value could never be passed, and the server warns about it at startup. An [HTTP action](./http-actions.md) takes it as a second argument, `httpAction(handler, { expectedMs })`, and an [MCP tool](./mcp.md) takes it next to `args`.
+
+`expectedMs: Infinity` turns the warning off. It is for a wrapper that lasts as long as the function it runs. The work queue's and workflows' runners set it; the function they run has its own metrics, which show whether it is slow.
 
 ## Read and write limits
 

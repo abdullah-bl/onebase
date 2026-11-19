@@ -246,11 +246,7 @@ export function createAdmin(opts: { runtime: Runtime; key: string; assets: Dashb
 
     calls: ({ limit = 500 }) => runtime.calls.recent(Math.min(Number(limit) || 500, 1000)),
 
-    metrics: () => {
-      const m = runtime.calls.metrics();
-      // Each function's own "normal" duration, so the dashboard judges slowness against it.
-      return { ...m, functions: m.functions.map((f) => ({ ...f, expectedMs: runtime.functions.get(f.name)?.expectedMs ?? null })) };
-    },
+    metrics: () => runtime.calls.metrics(),
 
     jobs: ({ state }) =>
       runtime.adminRead(async (_db, tx) => {

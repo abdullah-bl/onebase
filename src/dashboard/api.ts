@@ -78,6 +78,8 @@ export type FunctionMetrics = CallSummary & {
   lastErrorAt: number | null;
   /** The function's declared normal duration (`expectedMs`), if any. */
   expectedMs: number | null;
+  /** Its p95 is above `expectedMs`, or above its type's default. */
+  slow: boolean;
 };
 export type Metrics = {
   seconds: CallPoint[];

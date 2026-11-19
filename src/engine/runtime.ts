@@ -800,7 +800,14 @@ export class Runtime {
     this.mcp = prepared.mcp;
     this.crons = prepared.crons;
     this.functions.clear();
-    for (const [name, fn] of prepared.functions) this.functions.set(name, fn);
+    for (const [name, fn] of prepared.functions) {
+      this.functions.set(name, fn);
+      // A call that long is stopped first, so the slow warning could never show.
+      const limit = this.timeLimits[`${fn.type}Ms`];
+      if (limit && fn.expectedMs !== undefined && Number.isFinite(fn.expectedMs) && fn.expectedMs > limit) {
+        this.log.warn(`${name} expects calls to take ${formatMs(fn.expectedMs)}, more than the ${fn.type} time limit (${formatMs(limit)}). The dashboard can never flag it as slow.`);
+      }
+    }
     this.deployment = deployment;
     // Actions already running on the old code's workers finish there.
     this.actionPool?.retire();
@@ -1835,6 +1842,8 @@ export class Runtime {
     request: Request,
     identity: UserIdentity | null,
     mount: MountRuntime | null = null,
+    /** The route's declared normal duration, if any. */
+    expectedMs?: number,
   ) {
     const name = `${request.method} ${new URL(request.url).pathname}`;
     const handle = (ref: unknown) => this.createHandle(ref, mount);
@@ -1851,7 +1860,7 @@ export class Runtime {
       return this.withinLimit("action", name, (deadline) =>
         currentFunction.run({ type: "action", name, handle }, async () => handler(this.actionCtx(identity, mount, deadline), request)),
       );
-    });
+    }, expectedMs);
   }
 
   // ---- Entry points ----
@@ -1859,7 +1868,7 @@ export class Runtime {
   /** Runs a query against a committed snapshot and reports what it read. */
   async runQuery(ref: FunctionLike, args: unknown, opts: CallOptions & { /** Filled in as the query runs, so it's known even if the query throws. */ readSet?: ReadSet } = {}): Promise<{ value: unknown; readSet: ReadSet }> {
     const { name, fn, mount } = this.resolve(ref, "query", opts.allowInternal ?? false, this.callerOf(opts));
-    return this.calls.track(name, "query", opts.source ?? "function", () => this.queryHere(name, fn, mount, args, opts));
+    return this.calls.track(name, "query", opts.source ?? "function", () => this.queryHere(name, fn, mount, args, opts), fn.expectedMs);
   }
 
   /** runQuery() without the call record, on this thread's reader connection. */
@@ -1910,7 +1919,7 @@ export class Runtime {
       if (!outcome.ok) throw outcome.error;
       this.queryWorkerRuns++;
       return { json: outcome.json, readSet: into };
-    });
+    }, fn.expectedMs);
   }
 
   /** Background re-runs to keep in flight at once on query workers (0: there are none). */
@@ -1942,6 +1951,7 @@ export class Runtime {
         },
         { beforeCommit: opts.beforeCommit, limit: name, settle: opts.settle === "none" ? undefined : (opts.settle ?? "all") },
       ),
+      fn.expectedMs,
     );
   }
 
@@ -2047,7 +2057,7 @@ export class Runtime {
         pool.runAction(thread, call, { ctx: this.actionCtx(identity, mount, deadline), handle }, deadline),
       );
       return this.checkReturn(name, fn, value);
-    });
+    }, fn.expectedMs);
   }
 
   /** Runs any function by name, whatever its type. */

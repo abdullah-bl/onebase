@@ -50,9 +50,9 @@ type InferArgs<A> = A extends AnyValidator ? Infer<A> : A extends PropertyValida
  * tools that return objects: it's checked, so it also limits what reaches the agent.
  */
 export function tool<A extends PropertyValidators | AnyValidator, R>(
-  def: McpToolInfo & { args: A; returns?: AnyValidator; handler: (ctx: ActionCtx<any, any>, args: InferArgs<A>) => R },
+  def: McpToolInfo & { args: A; returns?: AnyValidator; expectedMs?: number; handler: (ctx: ActionCtx<any, any>, args: InferArgs<A>) => R },
 ): McpTool<InferArgs<A>, Awaited<R>>;
-export function tool<R>(def: McpToolInfo & { args?: undefined; returns?: AnyValidator; handler: (ctx: ActionCtx<any, any>, args: {}) => R }): McpTool<{}, Awaited<R>>;
+export function tool<R>(def: McpToolInfo & { args?: undefined; returns?: AnyValidator; expectedMs?: number; handler: (ctx: ActionCtx<any, any>, args: {}) => R }): McpTool<{}, Awaited<R>>;
 export function tool(def: any): McpTool {
   if (typeof def?.description !== "string" || !def.description.trim()) {
     throw new Error("tool({ description }) needs a description: agents read it to decide when to use the tool.");
@@ -63,7 +63,7 @@ export function tool(def: any): McpTool {
   if (def.args !== undefined && !isValidator(def.args) && (typeof def.args !== "object" || def.args === null)) {
     throw new Error("tool({ args }) must be validators, e.g. args: { text: v.string() }.");
   }
-  const fn = functionBuilder("action", "internal")({ args: def.args, returns: def.returns, handler: def.handler });
+  const fn = functionBuilder("action", "internal")({ args: def.args, returns: def.returns, expectedMs: def.expectedMs, handler: def.handler });
   const info: McpToolInfo = { description: def.description.trim() };
   if (def.name !== undefined) info.name = def.name;
   if (def.title !== undefined) info.title = String(def.title);

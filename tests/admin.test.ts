@@ -17,6 +17,8 @@ let flakyWorks = false;
 const modules = {
   notes: {
     list: query({ args: {}, handler: (ctx) => ctx.db.query("notes").collect() }),
+    // Long by nature (say, a model streaming an answer): the dashboard judges it against this.
+    summarize: query({ args: {}, expectedMs: 90_000, handler: () => "ok" }),
     add: mutation({
       args: { text: v.string() },
       handler: async (ctx, { text }) => {
@@ -236,6 +238,21 @@ describe("dashboard admin API", () => {
     expect(add.errors).toBeGreaterThanOrEqual(1);
     expect(add.lastError).toContain("args.text must be v.string()");
     expect(add.p95).toBeGreaterThan(0);
+    expect(add.expectedMs).toBeNull();
+  });
+
+  test("a function's expectedMs reaches the metrics, so the dashboard judges it against that", async () => {
+    await app.runtime.runQuery("notes:summarize", {}, { source: "client" });
+    const metrics = await ok("metrics");
+    expect(metrics.functions.find((f: any) => f.name === "notes:summarize")).toMatchObject({ type: "query", expectedMs: 90_000 });
+  });
+
+  test("expectedMs must be a positive number of milliseconds", () => {
+    for (const bad of [0, -5, Number.NaN, Number.POSITIVE_INFINITY, "60s"]) {
+      expect(() => query({ args: {}, expectedMs: bad as any, handler: () => null })).toThrow("expectedMs must be a positive number");
+    }
+    expect(query({ args: {}, expectedMs: 1500, handler: () => null }).expectedMs).toBe(1500);
+    expect("expectedMs" in query({ args: {}, handler: () => null })).toBe(false);
   });
 
   test("uploads a file with a token from the dashboard", async () => {

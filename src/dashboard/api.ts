@@ -76,6 +76,8 @@ export type FunctionMetrics = CallSummary & {
   lastAt: number;
   lastError: string | null;
   lastErrorAt: number | null;
+  /** The function's declared normal duration (`expectedMs`), if any. */
+  expectedMs: number | null;
 };
 export type Metrics = {
   seconds: CallPoint[];

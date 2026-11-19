@@ -108,6 +108,8 @@ export const summarize = action({
 });
 ```
 
+An action that is long by nature (e.g. streaming a model's answer) can declare `expectedMs: 180_000` next to `args`. The dashboard then flags it as slow only above that; the time limit doesn't change.
+
 Actions have no `ctx.db`: read through `ctx.runQuery` and write through `ctx.runMutation`. Any npm package or `node:*` module works in every kind of function, so no `"use node"` is needed. Only actions may call `fetch()`; in a query or mutation it throws.
 
 ## Internal functions, scheduling, pagination, HTTP

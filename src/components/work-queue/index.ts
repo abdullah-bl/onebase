@@ -203,6 +203,8 @@ const complete = internalMutation({
 /** Runs an action item, then records the outcome in a mutation. */
 const runAction = internalAction({
   args: { id: v.string(), attempt: v.number() },
+  // It lasts as long as the queued action, which has its own metrics (and its own expectedMs).
+  expectedMs: 60 * 60_000,
   handler: async (ctx, { id, attempt }) => {
     const item = await ctx.runQuery(runningItem, { id, attempt });
     if (!item) return null;

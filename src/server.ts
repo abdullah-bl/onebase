@@ -358,6 +358,12 @@ export type RegisteredFunction<
   readonly args?: AnyValidator;
   readonly returns?: AnyValidator;
   readonly handler: (ctx: any, args: any) => any;
+  /**
+   * How long a call normally takes, in ms. The dashboard flags a function as slow only when its p95
+   * is above this (default: 1s for queries and mutations, 10s for actions). Set it on work that is
+   * long by nature, such as an action that streams a model's answer, so real slowness stays visible.
+   */
+  readonly expectedMs?: number;
   /** Type-only markers. */
   readonly __args?: Args;
   readonly __returns?: Returns;
@@ -369,10 +375,12 @@ export interface FunctionBuilder<Type extends FunctionType, Visibility extends F
   <A extends PropertyValidators | AnyValidator, R>(def: {
     args: A;
     returns?: AnyValidator;
+    /** How long a call normally takes, in ms (the dashboard's "slow" threshold for this function). */
+    expectedMs?: number;
     handler: (ctx: Ctx, args: InferArgs<A>) => R;
   }): RegisteredFunction<Type, Visibility, InferArgs<A>, Awaited<R>>;
   <R>(
-    def: { args?: undefined; returns?: AnyValidator; handler: (ctx: Ctx, args: {}) => R } | ((ctx: Ctx, args: {}) => R),
+    def: { args?: undefined; returns?: AnyValidator; expectedMs?: number; handler: (ctx: Ctx, args: {}) => R } | ((ctx: Ctx, args: {}) => R),
   ): RegisteredFunction<Type, Visibility, {}, Awaited<R>>;
 }
 
@@ -385,6 +393,9 @@ export function functionBuilder(type: FunctionType, visibility: FunctionVisibili
           `${type}({ args: { ... }, handler: async (ctx, args) => { ... } })`,
       );
     }
+    if (d.expectedMs !== undefined && !(typeof d.expectedMs === "number" && Number.isFinite(d.expectedMs) && d.expectedMs > 0)) {
+      throw new Error(`expectedMs must be a positive number of milliseconds (got ${String(d.expectedMs)})`);
+    }
     return {
       __onebase: "function",
       type,
@@ -392,6 +403,7 @@ export function functionBuilder(type: FunctionType, visibility: FunctionVisibili
       args: d.args === undefined ? undefined : asObjectValidator(d.args),
       returns: d.returns,
       handler: d.handler,
+      ...(d.expectedMs !== undefined ? { expectedMs: d.expectedMs } : {}),
     } satisfies RegisteredFunction;
   };
 }

@@ -251,15 +251,22 @@ export class AuthService {
     await tx.run("DELETE FROM _mcp_connections WHERE user_id = ?", [userId]);
   }
 
+  /** Ends every session of a user (but `except`), and their MCP connections and API keys. */
+  private async endAll(tx: Exec, revoke: (sessionIds: string[]) => void, userId: string, except?: string) {
+    const ended = (await tx.all("SELECT id FROM _auth_sessions WHERE user_id = ?", [userId])).map((r) => r.id as string).filter((id) => id !== except);
+    revoke(ended);
+    if (except) await tx.run("DELETE FROM _auth_sessions WHERE user_id = ? AND id <> ?", [userId, except]);
+    else await tx.run("DELETE FROM _auth_sessions WHERE user_id = ?", [userId]);
+    await this.endMcpConnections(tx, userId);
+  }
+
   private async signOut(token: string | null, everywhere: boolean) {
     if (!token?.startsWith(SESSION_PREFIX)) throw new AuthError("Signing out needs the session token: Authorization: Bearer <token>.", 401);
     await this.runtime.authWrite(async ({ tx, revoke }) => {
       const row = await tx.get("SELECT id, user_id FROM _auth_sessions WHERE token_hash = ?", [sha256(token)]);
       if (!row) return; // already signed out
       if (everywhere) {
-        revoke((await tx.all("SELECT id FROM _auth_sessions WHERE user_id = ?", [row.user_id])).map((r) => r.id as string));
-        await tx.run("DELETE FROM _auth_sessions WHERE user_id = ?", [row.user_id]);
-        await this.endMcpConnections(tx, row.user_id as string);
+        await this.endAll(tx, revoke, row.user_id as string);
       } else {
         revoke([row.id]);
         await tx.run("DELETE FROM _auth_sessions WHERE id = ?", [row.id]);
@@ -295,7 +302,7 @@ export class AuthService {
     try {
       if (path === "methods" && req.method === "GET") {
         const label = (m: AuthMethod) => (m.kind === "oauth" || m.kind === "idToken" ? m.name : m.kind === "emailCode" ? "Email code" : "Password");
-        return json({ methods: this.methods.map((m) => ({ id: m.id, kind: m.kind, name: label(m) })) });
+        return json({ methods: this.methods.map((m) => ({ id: m.id, kind: m.kind, name: label(m), ...(m.kind === "password" && m.signUp === false ? { signUp: false } : {}) })) });
       }
       if (path === "signin" && req.method === "POST") return json(await this.signIn(await this.body(req), origins, client));
       if (path === "signout" && req.method === "POST") {
@@ -360,6 +367,8 @@ export class AuthService {
       case "signIn":
         return this.passwordSignIn(method, email, this.checkPassword(params.password, 1), client);
       case "signUp":
+        // Refused before anything is hashed or counted: with sign-up closed, accounts come from your own code.
+        if (method.signUp === false) throw new AuthError("Sign-up is closed. Ask an administrator for an account.", 403);
         return this.signUp(method, email, this.checkPassword(params.password, method.minLength), params, client);
       case "reset":
         return this.requestReset(method, email, client);
@@ -628,11 +637,9 @@ export class AuthService {
       const user = account ? await db.get(account.user_id) : null;
       if (!user) throw new AuthError("This account no longer exists.", 401);
       await tx.run("UPDATE _auth_accounts SET secret = ? WHERE provider = 'password' AND account_id = ?", [secret, email]);
-      revoke((await tx.all("SELECT id FROM _auth_sessions WHERE user_id = ?", [user._id])).map((r) => r.id as string));
-      await tx.run("DELETE FROM _auth_sessions WHERE user_id = ?", [user._id]);
-      await this.endMcpConnections(tx, user._id);
+      await this.endAll(tx, revoke, user._id);
       // The owner has proven the inbox: their failed-password count ends, on every network.
-      await tx.run("DELETE FROM _auth_attempts WHERE \"key\" = ? OR \"key\" LIKE ?", [`password:${email}`, `password:${email}|%`]);
+      await this.clearFailures(tx, email, user._id);
       // The code proves they read this inbox.
       // (Unless another user already holds the address verified: that one stays the only verified user for it.)
       if (
@@ -673,12 +680,97 @@ export class AuthService {
         // just chose (takeEmailCode checked they know it), and nothing from before confirmation (an
         // earlier password, a session) survives.
         if (secret) await tx.run("UPDATE _auth_accounts SET secret = ? WHERE provider = 'password' AND account_id = ?", [secret, email]);
-        revoke((await tx.all("SELECT id FROM _auth_sessions WHERE user_id = ?", [user._id])).map((r) => r.id as string));
-        await tx.run("DELETE FROM _auth_sessions WHERE user_id = ?", [user._id]);
-        await this.endMcpConnections(tx, user._id);
+        await this.endAll(tx, revoke, user._id);
       }
       return { userId: user._id, token: await this.createSession(tx, user._id) };
     });
+  }
+
+  // ---- From your functions: ctx.auth.setPassword, verifyPassword, endSessions ----
+
+  private passwordMethod(call: string): PasswordMethod {
+    if (!this.password) throw new AuthError(`ctx.auth.${call} needs password sign-in: add password() to methods in auth.config.ts.`);
+    return this.password;
+  }
+
+  private userId(call: string, userId: unknown): string {
+    if (typeof userId !== "string" || !userId || userId.length > 64) throw new AuthError(`ctx.auth.${call}: the first argument is the user's id in the users table.`);
+    return userId;
+  }
+
+  /** Forgets wrong passwords counted against an email (on every network) and a user. */
+  private async clearFailures(tx: Exec, email: string, userId: string) {
+    await tx.run("DELETE FROM _auth_attempts WHERE \"key\" = ? OR \"key\" = ? OR \"key\" LIKE ? ESCAPE '!'", [
+      `password:${email}`,
+      `verify:${userId}`,
+      `password:${email.replace(/[!%_]/g, "!$&")}|%`,
+    ]);
+  }
+
+  /**
+   * ctx.auth.setPassword: gives a user a new password, whoever is asking (the app decides who may).
+   * A user who had no password gets one for their email. Every session of theirs ends except
+   * `keepSession` (the caller's own, when they change their own password), and so do their MCP
+   * connections and API keys: whoever knew the old password is out.
+   */
+  async setPassword(userId: unknown, newPassword: unknown, keepSession?: string): Promise<void> {
+    const method = this.passwordMethod("setPassword");
+    const id = this.userId("setPassword", userId);
+    const password = this.checkPassword(newPassword, method.minLength);
+    const secret = await hashing.run(() => Bun.password.hash(password));
+    await this.runtime.authWrite(async ({ db, tx, revoke }) => {
+      const user = db.normalizeId("users", id) ? await db.get(id) : null;
+      if (!user) throw new AuthError("ctx.auth.setPassword: there is no user with that id.");
+      const accounts = await tx.all("SELECT account_id FROM _auth_accounts WHERE provider = 'password' AND user_id = ?", [id]);
+      let emails = accounts.map((a) => a.account_id as string);
+      if (emails.length) {
+        await tx.run("UPDATE _auth_accounts SET secret = ? WHERE provider = 'password' AND user_id = ?", [secret, id]);
+      } else {
+        // No password yet (created by your own code, or signs in another way): they sign in with their email.
+        const email = normalizeEmail(user.email);
+        if (email.length > MAX_EMAIL || !EMAIL.test(email)) throw new AuthError("ctx.auth.setPassword: this user has no email address to sign in with. Set users.email first.");
+        const taken = await tx.get("SELECT user_id FROM _auth_accounts WHERE provider = 'password' AND account_id = ?", [email]);
+        if (taken && (await db.get(taken.user_id))) throw new AuthError(`ctx.auth.setPassword: another user already signs in with ${email}.`);
+        if (taken) await tx.run("DELETE FROM _auth_accounts WHERE provider = 'password' AND account_id = ?", [email]); // its user was deleted
+        await tx.run("INSERT INTO _auth_accounts (provider, account_id, user_id, secret, created) VALUES ('password', ?, ?, ?, ?)", [email, id, secret, Date.now()]);
+        emails = [email];
+      }
+      await this.endAll(tx, revoke, id, keepSession);
+      // A fresh start: someone locked out by wrong guesses can sign in with the new password.
+      for (const email of emails) await this.clearFailures(tx, email, id);
+    });
+  }
+
+  /**
+   * ctx.auth.verifyPassword: whether this is the user's password. Wrong answers are counted per
+   * user, and after MAX_FAILURES in an hour it throws instead of answering, so a stolen session
+   * can't be used to guess the password behind it.
+   */
+  async verifyPassword(userId: unknown, password: unknown): Promise<boolean> {
+    this.passwordMethod("verifyPassword");
+    const id = this.userId("verifyPassword", userId);
+    if (typeof password !== "string") throw new AuthError("ctx.auth.verifyPassword: the second argument is the password to check.");
+    const key = `verify:${id}`;
+    await this.countAttempt(key, MAX_FAILURES, "wrong passwords");
+    if (password.length === 0 || password.length > MAX_PASSWORD) return false;
+    const accounts = await this.runtime.withReader((tx) => tx.all("SELECT secret FROM _auth_accounts WHERE provider = 'password' AND user_id = ?", [id]));
+    let valid = false;
+    // A user without a password takes as long to answer as one with.
+    if (!accounts.length) await hashing.run(async () => Bun.password.verify(password, await this.dummy()));
+    for (const account of accounts) valid ||= await hashing.run(() => Bun.password.verify(password, account.secret as string));
+    if (valid) await this.runtime.withWriter((tx) => tx.run("DELETE FROM _auth_attempts WHERE \"key\" = ?", [key]));
+    return valid;
+  }
+
+  /**
+   * ctx.auth.endSessions: signs a user out everywhere, at once (open connections too), and ends
+   * their MCP connections and API keys. `within`: a mutation's transaction, so it commits with
+   * whatever else the mutation did, like marking the account disabled.
+   */
+  async endSessions(userId: unknown, within?: { tx: Exec; revoke(sessionIds: string[]): void }): Promise<void> {
+    const id = this.userId("endSessions", userId);
+    if (within) await this.endAll(within.tx, within.revoke, id);
+    else await this.runtime.authWrite(({ tx, revoke }) => this.endAll(tx, revoke, id));
   }
 
   private dummy(): Promise<string> {

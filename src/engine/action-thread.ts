@@ -118,7 +118,8 @@ export function serveActions(embedded?: () => ProjectCode | Promise<ProjectCode>
           vectorSearch,
         }
       : {
-          auth: { getUserIdentity: async () => identity },
+          // Passwords and sessions live with the database, on the main thread.
+          auth: { getUserIdentity: async () => identity, ...Object.fromEntries(["setPassword", "verifyPassword", "endSessions"].map((k) => [k, call("auth", k)])) },
           storage: Object.fromEntries(["getUrl", "getMetadata", "generateUploadUrl", "confirmUpload", "delete", "store", "get"].map((k) => [k, call("storage", k)])),
           scheduler,
           runQuery,

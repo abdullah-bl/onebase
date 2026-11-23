@@ -206,6 +206,45 @@ test("actions run on workers, and ctx works there as on the main thread", async 
   expect(record?.lines).toContainEqual({ level: "log", text: "from the worker hi" });
 });
 
+test("ctx.auth sets and checks passwords and ends sessions from a worker", async () => {
+  const rt = await start(
+    "auth",
+    {
+      "schema.ts": `import { authTables, defineSchema } from "onebase/server"; export default defineSchema({ ...authTables });`,
+      "auth.config.ts": `import { password } from "onebase/auth"; export default { methods: [password()] };`,
+      "users.ts": `
+        import { action, mutation } from "onebase/server";
+        import { v } from "onebase/values";
+        export const add = mutation({ args: { email: v.string() }, handler: (ctx, args) => ctx.db.insert("users", args) });
+        export const reset = action({
+          args: { id: v.id("users"), password: v.string() },
+          handler: async (ctx, { id, password }) => {
+            await ctx.auth.setPassword(id, password);
+            const checks = [await ctx.auth.verifyPassword(id, password), await ctx.auth.verifyPassword(id, "something else")];
+            let short = null;
+            try { await ctx.auth.setPassword(id, "short"); } catch (err) { short = err.message; }
+            return { thread: Bun.isMainThread ? "main" : "worker", checks, short };
+          },
+        });
+        export const kick = action({ args: { id: v.id("users") }, handler: (ctx, { id }) => ctx.auth.endSessions(id) });
+      `,
+    },
+    { actionWorkers: 1 },
+  );
+  const id = (await rt.runMutation("users:add", { email: "worker@example.com" })) as string;
+  const token = await rt.auth!.sessionFor(id);
+  // Called as the user: the session they changed their password from is the one that stays.
+  const identity = await rt.auth!.identifySession(token);
+  expect(await rt.runAction("users:reset", { id, password: "from a worker" }, { identity })).toEqual({
+    thread: "worker",
+    checks: [true, false],
+    short: "Use a password with at least 8 characters.",
+  });
+  expect((await rt.auth!.identifySession(token)).subject).toBe(id);
+  await rt.runAction("users:kick", { id });
+  expect((await failure(rt.auth!.identifySession(token))).message).toContain("signed out");
+});
+
 test("an action's OneBaseError reaches the caller with its data", async () => {
   const err = (await failure(runtime.runAction("notes:throws", {}))) as any;
   expect(err.data).toEqual({ code: 42 });

@@ -182,6 +182,8 @@ export default {
 - Client: `signIn("password", { flow: "signUp" | "signIn", email, password })`, `signIn("github")`, `signOut()`. React: `useAuthActions()`, `useOnebaseAuth()` (`{ isLoading, isAuthenticated }`), `<Authenticated>`, `<Unauthenticated>`, `<AuthLoading>`.
 - Functions: `const userId = await getAuthUserId(ctx)` (from `onebase/server`) returns `Id<"users"> | null`. Users are normal documents in `users`.
 - Password reset and email verification: `password({ sendCode: async ({ email, code, purpose }) => { /* email it */ }, verifyEmail: true })`. Flows: `"reset"` (email) → `"reset-verification"` (email, code, newPassword); with verifyEmail, `signUp` resolves `{ signingIn: false }` and `"email-verification"` (email, code, password: the one signed up with) signs in.
+- Passwords and sessions from functions (no role checks built in: check the caller yourself). Actions only: `await ctx.auth.setPassword(userId, newPassword)` (hashes and saves, creates the password for a user without one from `users.email`, ends the user's other sessions) and `await ctx.auth.verifyPassword(userId, password)` (`true`/`false`; throws after 10 wrong answers an hour). Mutations and actions: `await ctx.auth.endSessions(userId)` signs the user out everywhere at once, e.g. in the mutation that disables an account.
+- Closed sign-up: `password({ signUp: false })` makes the server refuse `flow: "signUp"` (403). Create accounts yourself: insert the user with `email` in a mutation, then `ctx.auth.setPassword(userId, temporaryPassword)` in an action.
 
 External providers use the Convex format, and `authenticate` checks any other token with read access to the database:
 

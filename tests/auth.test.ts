@@ -11,8 +11,8 @@ import { OnebaseClient, type AuthStorage } from "../src/client/index";
 import { AuthService, sha256 } from "../src/engine/auth";
 import { createDriver } from "../src/engine/driver";
 import { Runtime } from "../src/engine/runtime";
-import { authTables, defineSchema, defineTable, getAuthUserId, mutation, query } from "../src/server";
-import { v } from "../src/values";
+import { action, authTables, defineSchema, defineTable, getAuthUserId, mutation, query } from "../src/server";
+import { OneBaseError, v } from "../src/values";
 import { quiet } from "./helpers";
 
 const schema = defineSchema({
@@ -33,6 +33,37 @@ const modules = {
     whoami: query({ args: {}, handler: async (ctx) => (await ctx.auth.getUserIdentity())?.subject ?? null }),
     addKey: mutation({ args: { key: v.string(), owner: v.string() }, handler: (ctx, args) => ctx.db.insert("apiKeys", args) }),
     deleteUser: mutation({ args: { id: v.id("users") }, handler: (ctx, { id }) => ctx.db.delete(id) }),
+    // What an app builds on ctx.auth: changing your own password, an admin's reset, disabling an account.
+    createUser: mutation({ args: { email: v.optional(v.string()), name: v.optional(v.string()) }, handler: (ctx, args) => ctx.db.insert("users", args) }),
+    changePassword: action({
+      args: { current: v.string(), next: v.string() },
+      handler: async (ctx, { current, next }) => {
+        const userId = await getAuthUserId(ctx);
+        if (!userId) throw new OneBaseError("Sign in first.");
+        if (!(await ctx.auth.verifyPassword(userId, current))) throw new OneBaseError("That isn't your current password.");
+        await ctx.auth.setPassword(userId, next);
+        return "changed";
+      },
+    }),
+    adminSetPassword: action({ args: { id: v.string(), password: v.string() }, handler: (ctx, { id, password }) => ctx.auth.setPassword(id as any, password) }),
+    checkPassword: action({ args: { id: v.id("users"), password: v.string() }, handler: (ctx, { id, password }) => ctx.auth.verifyPassword(id, password) }),
+    signOutEverywhere: action({ args: { id: v.id("users") }, handler: (ctx, { id }) => ctx.auth.endSessions(id) }),
+    disable: mutation({
+      args: { id: v.id("users"), fail: v.optional(v.boolean()) },
+      handler: async (ctx, { id, fail }) => {
+        await ctx.db.patch(id, { name: "disabled" });
+        await ctx.auth.endSessions(id);
+        if (fail) throw new OneBaseError("changed my mind");
+      },
+    }),
+    disableNested: mutation({
+      args: { id: v.id("users") },
+      handler: async (ctx, { id }) => {
+        await ctx.runMutation("auth:disable" as any, { id, fail: true }).catch(() => {});
+        return "kept";
+      },
+    }),
+    hashInMutation: mutation({ args: { id: v.id("users") }, handler: (ctx, { id }) => (ctx.auth as any).setPassword(id, "whatever else") }),
   },
 };
 
@@ -179,6 +210,16 @@ for (const DB of DATABASES) describe(`${DB.name}: built-in auth`, () => {
     const body = (await res.json()) as any;
     return body.status === "success" ? body.value : { error: body.errorMessage as string };
   };
+  /** Calls a mutation or action over HTTP as the holder of `token`. */
+  const run = async (kind: "mutation" | "action", fn: string, args: Record<string, unknown>, token?: string) => {
+    const res = await fetch(`${base}/api/${kind}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify({ path: fn, args }),
+    });
+    const body = (await res.json()) as any;
+    return body.status === "success" ? body.value : { error: body.errorMessage as string };
+  };
   const verifierPair = () => {
     const verifier = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
     return { verifier, challenge: sha256(verifier) };
@@ -266,6 +307,90 @@ for (const DB of DATABASES) describe(`${DB.name}: built-in auth`, () => {
     expect((await post("signout", { everywhere: true }, t2)).status).toBe(200);
     expect((await ask("auth:whoami", t3)).error).toContain("signed out");
     expect((await post("signout", {})).status).toBe(401); // needs the token
+  });
+
+  test("ctx.auth: changing your own password checks the current one, keeps this session and ends the others", async () => {
+    const { userId, token: here } = (await signUp("changer@example.com")).body;
+    const elsewhere = (await signIn("changer@example.com", "correct horse")).body.token;
+    expect(await run("action", "auth:changePassword", { current: "not this one", next: "battery staple" }, here)).toEqual({ error: "That isn't your current password." });
+    expect(await run("action", "auth:changePassword", { current: "correct horse", next: "short" }, here)).toEqual({ error: "Use a password with at least 8 characters." });
+    expect((await signIn("changer@example.com", "correct horse")).status).toBe(200); // nothing changed yet
+    expect(await run("action", "auth:changePassword", { current: "correct horse", next: "battery staple" }, here)).toBe("changed");
+
+    expect(await ask("auth:whoami", here)).toBe(userId); // still signed in where the password was changed
+    expect((await ask("auth:whoami", elsewhere)).error).toContain("signed out");
+    expect((await signIn("changer@example.com", "correct horse")).status).toBe(401);
+    expect((await signIn("changer@example.com", "battery staple")).body.userId).toBe(userId);
+    expect(await run("action", "auth:changePassword", { current: "x", next: "battery staple" })).toEqual({ error: "Sign in first." });
+  });
+
+  test("ctx.auth.setPassword: an admin's reset ends every session and the lockout; users made by code get a password", async () => {
+    const { userId, token } = (await signUp("forgetful@example.com")).body;
+    for (let i = 0; i < 11; i++) await signIn("forgetful@example.com", "nope nope");
+    expect((await signIn("forgetful@example.com", "correct horse")).status).toBe(429);
+    expect(await run("action", "auth:adminSetPassword", { id: userId, password: "temporary one" })).toBeNull();
+    expect((await ask("auth:whoami", token)).error).toContain("signed out"); // nobody asked as this user, so no session is kept
+    expect((await signIn("forgetful@example.com", "correct horse")).status).toBe(401);
+    expect((await signIn("forgetful@example.com", "temporary one")).body.userId).toBe(userId);
+
+    // A user your own code created has no password until one is set; then they sign in with their email.
+    const made = await run("mutation", "auth:createUser", { email: "Hired@Example.com", name: "Hired" });
+    expect(await run("action", "auth:checkPassword", { id: made, password: "first password" })).toBe(false);
+    expect(await run("action", "auth:adminSetPassword", { id: made, password: "first password" })).toBeNull();
+    expect((await signIn("hired@example.com", "first password")).body.userId).toBe(made);
+    expect(await run("action", "auth:checkPassword", { id: made, password: "first password" })).toBe(true);
+
+    const noEmail = await run("mutation", "auth:createUser", { name: "No email" });
+    expect((await run("action", "auth:adminSetPassword", { id: noEmail, password: "first password" })).error).toContain("no email address to sign in with");
+    const twin = await run("mutation", "auth:createUser", { email: "hired@example.com" });
+    expect((await run("action", "auth:adminSetPassword", { id: twin, password: "first password" })).error).toContain("another user already signs in with hired@example.com");
+    const key = await app.runtime.runMutation("auth:addKey", { key: "not-a-user", owner: "x" });
+    expect((await run("action", "auth:adminSetPassword", { id: key, password: "first password" })).error).toContain("no user with that id");
+    expect((await run("mutation", "auth:hashInMutation", { id: made })).error).toContain("Call it from an action");
+  });
+
+  test("ctx.auth.verifyPassword: wrong answers are counted per user, and a right one starts the count again", async () => {
+    const { userId } = (await signUp("guessed@example.com")).body;
+    const check = (password: string) => run("action", "auth:checkPassword", { id: userId, password });
+    for (let i = 0; i < 9; i++) expect(await check("nope nope")).toBe(false);
+    expect(await check("correct horse")).toBe(true);
+    for (let i = 0; i < 10; i++) expect(await check("nope nope")).toBe(false);
+    expect((await check("correct horse")).error).toContain("Too many wrong passwords");
+    expect((await signIn("guessed@example.com", "correct horse")).status).toBe(200); // sign-in keeps its own count
+    await app.runtime.runAction("auth:adminSetPassword", { id: userId, password: "brand new one" });
+    expect(await check("brand new one")).toBe(true); // a new password is a fresh start
+  });
+
+  test("ctx.auth.endSessions signs a user out everywhere, with the mutation's other writes or not at all", async () => {
+    const { userId, token: t1 } = (await signUp("leaver@example.com")).body;
+    const t2 = (await signIn("leaver@example.com", "correct horse")).body.token;
+    const storage = memoryStorage();
+    const client = new OnebaseClient(base, { authStorage: storage });
+    await client.signIn("password", { flow: "signIn", email: "leaver@example.com", password: "correct horse" });
+    const seen: (string | null)[] = [];
+    client.onUpdate("auth:whoami", {}, (v) => seen.push(v));
+    for (let i = 0; i < 100 && seen.at(-1) !== userId; i++) await Bun.sleep(20);
+
+    // A mutation that fails, on its own or inside another that carries on, signs nobody out.
+    expect(await run("mutation", "auth:disable", { id: userId, fail: true })).toEqual({ error: "changed my mind" });
+    expect(await run("mutation", "auth:disableNested", { id: userId })).toBe("kept");
+    await Bun.sleep(100);
+    expect(await ask("auth:whoami", t1)).toBe(userId);
+    expect(seen.at(-1)).toBe(userId);
+    expect(client.authState.isAuthenticated).toBe(true);
+
+    expect(await run("mutation", "auth:disable", { id: userId })).toBeNull();
+    expect((await ask("auth:whoami", t1)).error).toContain("signed out");
+    expect((await ask("auth:whoami", t2)).error).toContain("signed out");
+    for (let i = 0; i < 100 && seen.at(-1) !== null; i++) await Bun.sleep(20);
+    expect(seen.at(-1)).toBeNull(); // the open connection was signed out at once
+    expect(client.authState.isAuthenticated).toBe(false);
+    client.close();
+
+    // From an action too; the password still works, so it's for the app to refuse a disabled user.
+    const t3 = (await signIn("leaver@example.com", "correct horse")).body.token;
+    expect(await run("action", "auth:signOutEverywhere", { id: userId })).toBeNull();
+    expect((await ask("auth:whoami", t3)).error).toContain("signed out");
   });
 
   test("sessions expire, and end with their user", async () => {
@@ -688,6 +813,51 @@ for (const DB of DATABASES) describe(`${DB.name}: lockouts are per network, so n
     // From the same network as the attacker, the lockout does apply.
     const accomplice = await withIp({ provider: "password", params: { flow: "signIn", email: "victim@example.com", password: "correct horse" } }, "203.0.113.9");
     expect(accomplice.status).toBe(429);
+  });
+});
+
+describe("closed sign-up", () => {
+  const modules = {
+    admin: {
+      invite: mutation({ args: { email: v.string() }, handler: (ctx, { email }) => ctx.db.insert("users", { email }) }),
+      setPassword: action({ args: { id: v.id("users"), password: v.string() }, handler: (ctx, { id, password }) => ctx.auth.setPassword(id, password) }),
+    },
+  };
+  let app: Awaited<ReturnType<typeof startApp>>;
+  let base: string;
+  let dataDir: string;
+
+  beforeAll(async () => {
+    dataDir = mkdtempSync(join(tmpdir(), "onebase-auth-closed-"));
+    app = await startApp({ schema: defineSchema({ ...authTables }), modules, dataDir, port: 0, hostname: "127.0.0.1", dev: false, quiet: true, auth: { methods: [password({ signUp: false })] } });
+    base = `http://127.0.0.1:${app.server.port}`;
+  });
+  afterAll(async () => {
+    await app.close();
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  test("password({ signUp: false }): the server refuses sign-up, and accounts made by your code sign in", async () => {
+    const flow = (flow: string, email: string, pw: string) => postTo(base, "signin", { provider: "password", params: { flow, email, password: pw } });
+    expect(await flow("signUp", "walk-in@example.com", "correct horse")).toEqual({ status: 403, body: { error: "Sign-up is closed. Ask an administrator for an account." } });
+    expect(await app.runtime.adminRead((db) => db.query("users").collect())).toEqual([]);
+    expect(await (await fetch(`${base}/api/auth/methods`)).json()).toEqual({ methods: [{ id: "password", kind: "password", name: "Password", signUp: false }] });
+
+    const id = await app.runtime.runMutation("admin:invite", { email: "invited@example.com" });
+    await app.runtime.runAction("admin:setPassword", { id, password: "temporary one" });
+    expect((await flow("signIn", "invited@example.com", "temporary one")).body.userId).toBe(id);
+    // Sign-up of an address that has an account is refused like any other: it says nothing about the address.
+    expect((await flow("signUp", "invited@example.com", "temporary one")).status).toBe(403);
+  });
+
+  test("ctx.auth's password and session calls need built-in sign-in", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "onebase-auth-none-"));
+    const rt = new Runtime({ driver: createDriver(join(dir, "db.sqlite")), schema: defineSchema({ ...authTables }), modules, log: quiet });
+    await rt.init();
+    const id = await rt.runMutation("admin:invite", { email: "a@example.com" });
+    await expect(rt.runAction("admin:setPassword", { id, password: "temporary one" })).rejects.toThrow("needs built-in sign-in");
+    rt.stop();
+    rmSync(dir, { recursive: true, force: true });
   });
 });
 

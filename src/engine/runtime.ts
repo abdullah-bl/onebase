@@ -1327,6 +1327,37 @@ export class Runtime {
     };
   }
 
+  private builtInAuth(call: string): AuthService {
+    if (!this.auth) throw new OnebaseError(`ctx.auth.${call} needs built-in sign-in: add methods: [password(), ...] to auth.config.ts.`);
+    return this.auth;
+  }
+
+  /**
+   * What ctx.auth has in the app's own mutations besides who is calling: signing a user out
+   * everywhere, in the mutation's transaction, so it commits with the mutation's writes.
+   */
+  private authInMutation(state: TxState) {
+    const actionsOnly = (call: string) => async () => {
+      throw new OnebaseError(`ctx.auth.${call} hashes a password, which is too slow for a mutation. Call it from an action.`);
+    };
+    return {
+      endSessions: async (userId: string) => this.builtInAuth("endSessions").endSessions(userId, { tx: state.tx, revoke: (ids) => void state.revoked.push(...ids) }),
+      setPassword: actionsOnly("setPassword"),
+      verifyPassword: actionsOnly("verifyPassword"),
+    };
+  }
+
+  /** And in its actions: also setting and checking passwords, each call its own transaction. */
+  private authInAction(identity: UserIdentity | null) {
+    return {
+      endSessions: async (userId: string) => this.builtInAuth("endSessions").endSessions(userId),
+      // Someone changing their own password stays signed in where they did it; every other session ends.
+      setPassword: async (userId: string, newPassword: string) =>
+        this.builtInAuth("setPassword").setPassword(userId, newPassword, identity?.tokenIdentifier === `onebase|${userId}` ? (identity.sessionId as string | undefined) : undefined),
+      verifyPassword: async (userId: string, password: string) => this.builtInAuth("verifyPassword").verifyPassword(userId, password),
+    };
+  }
+
   private warn = (message: string) => this.log.warn(message);
 
   private newDb(tx: Exec, extra: { readSet?: ReadSet; writes?: Write[]; budget?: CallBudget; revokeSessions?: (ids: string[]) => void }, scope = TableScope.app) {
@@ -1656,7 +1687,7 @@ export class Runtime {
     if (mount) return { db, ...this.componentBase(mount, id, state.tx), scheduler, runQuery, runMutation };
     return {
       db,
-      auth: this.authFor(id),
+      auth: { ...this.authFor(id), ...this.authInMutation(state) },
       storage: this.storageWriter(state),
       scheduler,
       runQuery,
@@ -1669,11 +1700,13 @@ export class Runtime {
   private async nestedMutation(state: TxState, name: string, fn: RegisteredFunction, identity: UserIdentity | null, mount: MountRuntime | null, args: unknown) {
     const mark = state.writes.length;
     const commitMark = state.afterCommit.length;
+    const revokedMark = state.revoked.length;
     try {
       return await savepoint(state.tx, () => this.invoke(name, fn, this.mutationCtx(state, identity, mount), args));
     } catch (err) {
       state.writes.length = mark;
       state.afterCommit.length = commitMark;
+      state.revoked.length = revokedMark; // those sessions are back, so nobody is signed out
       // Hooks that saw writes now rolled back saw them inside this savepoint, so their own writes went too.
       for (const [key, cursor] of state.hookCursors) if (cursor > mark) state.hookCursors.set(key, mark);
       throw err;
@@ -1723,7 +1756,7 @@ export class Runtime {
     const ctx: Record<string, unknown> = mount
       ? { ...this.componentBase(mount, id, null), scheduler: guardAll(this.schedulerFor(null, mount)), runQuery, runMutation, runAction, vectorSearch }
       : {
-          auth: this.authFor(id),
+          auth: { ...this.authFor(id), ...guardAll(this.authInAction(id)) },
           storage: guardAll(this.storageForActions()),
           scheduler: guardAll(this.schedulerFor(null)),
           runQuery,

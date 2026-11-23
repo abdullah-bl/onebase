@@ -238,6 +238,31 @@ export interface Auth {
   getUserIdentity(): Promise<UserIdentity | null>;
 }
 
+/** `ctx.auth` in a mutation (built-in auth). */
+export interface MutationAuth extends Auth {
+  /**
+   * Signs a user out everywhere, at once: every session ends (open connections too), and so do
+   * their MCP connections and API keys. In a mutation it commits with the mutation's writes, so
+   * disabling an account and signing it out are one step.
+   */
+  endSessions(userId: GenericId<"users">): Promise<void>;
+}
+
+/** `ctx.auth` in an action (built-in auth). Hashing a password is slow, so passwords are set and checked here. */
+export interface ActionAuth extends MutationAuth {
+  /**
+   * Gives a user a new password. A user without one (created by your code, or signing in another
+   * way) gets one for their `email`. Their other sessions end; someone changing their own password
+   * stays signed in where they did it. Who may call this is up to you: check the caller first.
+   */
+  setPassword(userId: GenericId<"users">, newPassword: string): Promise<void>;
+  /**
+   * Whether this is the user's password, e.g. to confirm the current one before changing it.
+   * After 10 wrong answers for a user in an hour it throws "Too many wrong passwords" instead.
+   */
+  verifyPassword(userId: GenericId<"users">, password: string): Promise<boolean>;
+}
+
 /**
  * Tables for built-in auth: `defineSchema({ ...authTables, ... })`. To add your own user fields,
  * define `users` yourself and keep these fields (they must stay optional).
@@ -298,7 +323,7 @@ export interface QueryCtx<DM = AnyDataModel, C = {}> {
 
 export interface MutationCtx<DM = AnyDataModel, C = {}> {
   db: DatabaseWriter<DM>;
-  auth: Auth;
+  auth: MutationAuth;
   storage: StorageWriter;
   scheduler: Scheduler;
   runQuery: Call<"query">;
@@ -325,7 +350,7 @@ export type VectorSearchQuery<Doc, Index extends VectorIndexConfig> = {
 };
 
 export interface ActionCtx<DM = AnyDataModel, C = {}> {
-  auth: Auth;
+  auth: ActionAuth;
   /** The components mounted in components.ts; each call is its own transaction. */
   components: ComponentsCtx<C, "action">;
   storage: StorageActionWriter;

@@ -182,6 +182,75 @@ Users are ordinary documents, so you can read them, add fields and show them in 
 
 Don't let your own mutations change `email` or `emailVerificationTime`. An OAuth sign-in joins the user whose verified email matches, so a user who could set their email to someone else's would get that person's account. If users can change their email, clear `emailVerificationTime` in the same mutation and confirm the new address with a code. (`profile` can't set `emailVerificationTime`.)
 
+### Passwords and sessions from your functions
+
+Three calls on `ctx.auth` let your own code manage passwords and sessions. onebase doesn't know about roles: each call does what it's asked for any user, so check who is calling first.
+
+| | |
+|---|---|
+| `await ctx.auth.setPassword(userId, newPassword)` | actions only. Sets the user's password and ends their other sessions |
+| `await ctx.auth.verifyPassword(userId, password)` | actions only. `true` or `false` |
+| `await ctx.auth.endSessions(userId)` | mutations and actions. Signs the user out everywhere, at once |
+
+Hashing a password takes a moment and memory, which is why the first two are for actions; in a mutation they throw.
+
+**Changing your own password** checks the current one first:
+
+```ts
+export const changePassword = action({
+  args: { current: v.string(), next: v.string() },
+  handler: async (ctx, { current, next }) => {
+    const userId = await getAuthUserId(ctx);
+    if (!userId) throw new OneBaseError("Sign in first.");
+    if (!(await ctx.auth.verifyPassword(userId, current))) throw new OneBaseError("That isn't your current password.");
+    await ctx.auth.setPassword(userId, next);
+  },
+});
+```
+
+The session the password was changed from stays signed in. Every other session of that user ends, and so do their [MCP connections and API keys](./mcp.md#connected-agents-and-api-keys), as after a password reset. When someone else sets the password (an admin's reset, a scheduled job), all of the user's sessions end.
+
+**An admin's reset** is the same call after your own check:
+
+```ts
+export const resetPassword = action({
+  args: { userId: v.id("users"), temporary: v.string() },
+  handler: async (ctx, { userId, temporary }) => {
+    if (!(await ctx.runQuery(internal.members.isAdmin, {}))) throw new OneBaseError("Admins only.");
+    await ctx.auth.setPassword(userId, temporary);
+  },
+});
+```
+
+`setPassword` applies `minLength` and clears the user's failed sign-in counts, so someone locked out by wrong guesses can sign in with the new password. A user who has no password yet (your code inserted them, or they sign in with Google) gets one for the address in `users.email`; it throws if they have no email or another user already signs in with it. It doesn't mark the email verified.
+
+`verifyPassword` counts wrong answers per user: after 10 in an hour it throws "Too many wrong passwords. Try again in N minutes." instead of answering, so a stolen session can't be used to guess the password behind it. A right answer or a new password starts the count again. This count is separate from sign-in's.
+
+**Disabling an account** should also sign it out. In a mutation, `endSessions` commits with the mutation's other writes:
+
+```ts
+export const disable = mutation({
+  args: { userId: v.id("users") },
+  handler: async (ctx, { userId }) => {
+    // ...check the caller is an admin
+    await ctx.db.patch(userId, { disabled: true });
+    await ctx.auth.endSessions(userId); // open connections are signed out at once, on every server instance
+  },
+});
+```
+
+The user can still sign in again afterwards, so refuse disabled users in your functions too. (Deleting the user ends their sign-ins for good.)
+
+These calls need built-in sign-in, and the two password calls need `password()` in `methods`. Components don't get them.
+
+### Closing sign-up
+
+```ts
+password({ signUp: false })
+```
+
+The server then refuses `flow: "signUp"` with a 403 ("Sign-up is closed. Ask an administrator for an account."), whatever the page shows. Accounts come from your own code: insert the user with their `email` in a mutation, then call `ctx.auth.setPassword(userId, temporaryPassword)` in an action. Sign-in, password reset and other sign-in methods work as before; an OAuth or email-code method in `methods` still creates a user on first sign-in. `GET /api/auth/methods` reports `signUp: false` on the password method, so a sign-in page can hide its sign-up form.
+
 ### OAuth
 
 1. Register an OAuth app with the provider. Its callback URL is `<your public URL>/api/auth/callback/<method>`, e.g. `https://api.example.com/api/auth/callback/github`.
@@ -347,7 +416,7 @@ await client.device.approve({ code, approve: true });
 
 ### Sessions and security
 
-- **Sessions** last 30 days from their last use (`sessionDays` in `auth.config.ts`). Signing out ends the session at once, including for open WebSocket connections on every server instance. Open connections also re-check their identity about once a minute, so a session that expires (or whose user is deleted) signs its connection out without waiting for a reconnect. `POST /api/auth/signout` with `{ "everywhere": true }` ends all of a user's sessions, and their [MCP connections and API keys](./mcp.md#connected-agents-and-api-keys). So does a password reset.
+- **Sessions** last 30 days from their last use (`sessionDays` in `auth.config.ts`). Signing out ends the session at once, including for open WebSocket connections on every server instance. Open connections also re-check their identity about once a minute, so a session that expires (or whose user is deleted) signs its connection out without waiting for a reconnect. `POST /api/auth/signout` with `{ "everywhere": true }` ends all of a user's sessions, and their [MCP connections and API keys](./mcp.md#connected-agents-and-api-keys). So does a password reset, and [`ctx.auth.endSessions(userId)`](#passwords-and-sessions-from-your-functions) from your own functions.
 - **Passwords** are hashed with argon2id and must be at least 8 characters (`password({ minLength })`). After 10 failed attempts for an email from one network in an hour, sign-in for that email is blocked from that network for the rest of the hour; after 100 from all networks together, it's blocked everywhere until the hour is up or the password is reset. `--rate-limit` also applies to sign-in requests.
 - **Tokens and codes** are stored only as SHA-256 hashes. OAuth uses PKCE, and the one-time code the provider's redirect brings back only works with a verifier kept by the browser that started the sign-in.
 - **Stored separately:** password hashes, OAuth links, sessions and email codes are in system tables that functions and the dashboard can't read.

@@ -1026,6 +1026,7 @@ export class DatabaseImpl {
       await this.tx.run("DELETE FROM _mcp_tokens WHERE connection_id = ?", [c.id]);
     }
     await this.tx.run("DELETE FROM _mcp_connections WHERE user_id = ?", [userId]);
+    await this.tx.run('DELETE FROM _auth_attempts WHERE "key" = ?', [`verify:${userId}`]);
     const email = typeof doc.email === "string" ? doc.email.toLowerCase() : "";
     if (email) {
       for (const purpose of ["verify", "reset", "signin"]) await this.tx.run("DELETE FROM _auth_codes WHERE kind = ?", [`${purpose}:${email}`]);

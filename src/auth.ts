@@ -42,6 +42,8 @@ export type PasswordMethod = {
   sendCode?: SendCode;
   /** New accounts must confirm their email with a code before they can sign in. */
   verifyEmail: boolean;
+  /** Whether anyone can create an account with `flow: "signUp"`. */
+  signUp: boolean;
 };
 
 /** What the provider sent back to the callback besides the code, e.g. Apple's `user` on first sign-in. */
@@ -121,9 +123,13 @@ export type AuthMethod = PasswordMethod | OAuthMethod | IdTokenMethod | EmailCod
  * `"reset-verification"`), and `verifyEmail: true` makes new accounts confirm their address
  * (`flow: "email-verification"` with the code and the password they signed up with) before they
  * can sign in.
+ *
+ * `signUp: false` closes sign-up: the server refuses `flow: "signUp"`, and accounts come from your
+ * own code (insert the user, then `ctx.auth.setPassword(userId, password)` in an action) or from
+ * another sign-in method.
  */
 export function password(
-  options: { minLength?: number; profile?: PasswordMethod["profile"]; sendCode?: SendCode; verifyEmail?: boolean } = {},
+  options: { minLength?: number; profile?: PasswordMethod["profile"]; sendCode?: SendCode; verifyEmail?: boolean; signUp?: boolean } = {},
 ): PasswordMethod {
   if (options.verifyEmail && typeof options.sendCode !== "function") {
     throw new Error("password({ verifyEmail: true }) needs a sendCode function to email the codes.");
@@ -135,6 +141,7 @@ export function password(
     profile: options.profile,
     sendCode: options.sendCode,
     verifyEmail: options.verifyEmail ?? false,
+    signUp: options.signUp ?? true,
   };
 }
 

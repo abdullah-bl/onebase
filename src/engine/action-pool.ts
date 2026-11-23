@@ -56,7 +56,7 @@ type Job = ActionTarget & {
 };
 
 /** ctx members a worker may call. */
-const CTX_CALLS = new Set(["runQuery", "runMutation", "runAction", "vectorSearch", "scheduler", "storage", "hooks", "components"]);
+const CTX_CALLS = new Set(["runQuery", "runMutation", "runAction", "vectorSearch", "scheduler", "storage", "hooks", "components", "auth"]);
 
 let nextJob = 1;
 let nextPing = 1;
